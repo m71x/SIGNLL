@@ -73,3 +73,4 @@ print(f"Raw logits: {logits.cpu().numpy()}")
 print("\n[CLS] token first 5 dims for each layer:")
 for i, rep in enumerate(cls_reps):
     print(f"Layer {i}: {rep[:5]}")
+
