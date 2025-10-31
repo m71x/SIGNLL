@@ -3,7 +3,7 @@ from google.cloud import storage
 
 # === CONFIGURATION ===
 # Replace with your GCS bucket name (no "gs://")
-BUCKET_NAME = "your-tpu-bucket-name"  # e.g. "my-tpu-bucket"
+BUCKET_NAME = "kaggle_dataset_twitter_sentiment"  # e.g. "my-tpu-bucket"
 LOCAL_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "training_data",
