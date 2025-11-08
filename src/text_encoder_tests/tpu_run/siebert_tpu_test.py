@@ -2,13 +2,13 @@ import os
 import torch
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
-from transformers import AutoModelForCausalLM, GenerationConfig, GemmaTokenizer
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from google.cloud import storage
 
 # --- GCS + Local paths ---
-BUCKET_NAME = "startup-scripts-gemma3"
-GCS_PREFIX = "gemma3-4b/gemma-3-4b-it"
-LOCAL_MODEL_PATH = "/home/mikexi/gemma_model/gemma-3-4b-it"
+BUCKET_NAME = "encoder-models"   # change if your bucket name differs
+GCS_PREFIX = "siebert"    # your Siebert model path in GCS
+LOCAL_MODEL_PATH = "/home/mikexi/siebert_model"
 
 # --- Function: download model from GCS ---
 def download_model_from_gcs(bucket_name, prefix, local_dir):
@@ -47,41 +47,31 @@ def _mp_fn(index):
     xm.rendezvous("model_download_done")
 
     # --- Load tokenizer ---
-    vocab_file = os.path.join(LOCAL_MODEL_PATH, "tokenizer.model")
-    if not os.path.exists(vocab_file):
-        raise ValueError(f"tokenizer.model not found in {LOCAL_MODEL_PATH}")
-
-    tokenizer = GemmaTokenizer(vocab_file=vocab_file)
+    tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH)
     if xm.is_master_ordinal():
         print("[Core 0] Tokenizer loaded.", flush=True)
 
     # --- Load model ---
-    model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_PATH, torch_dtype=torch.bfloat16)
+    model = AutoModelForSequenceClassification.from_pretrained(LOCAL_MODEL_PATH, torch_dtype=torch.bfloat16)
     model.to(device)
+    model.eval()
     if xm.is_master_ordinal():
         print("[Core 0] Model loaded successfully.", flush=True)
 
-    # --- Run inference only on core 0 ---
-    if xm.is_master_ordinal():
-        prompt = "In the future, artificial intelligence will"
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    # --- Run sample inference on all workers ---
+    sample_text = "I really love this product. It works great and exceeded my expectations!"
+    inputs = tokenizer(sample_text, return_tensors="pt").to(device)
 
-        print("[Core 0] Running inference on TPU...", flush=True)
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=30,
-                return_dict_in_generate=True,
-                output_scores=True,
-                use_cache=False
-            )
+    with torch.no_grad():
+        outputs = model(**inputs)
+        logits = outputs.logits
+        probabilities = torch.nn.functional.softmax(logits, dim=-1)
+        predicted_class = torch.argmax(probabilities, dim=-1).item()
 
-        generated_text = tokenizer.decode(outputs.sequences[0], skip_special_tokens=True)
-        print("\n--- Model Output ---", flush=True)
-        print(generated_text, flush=True)
+    print(f"[Core {index}] Classification result: {predicted_class} (probabilities: {probabilities.tolist()})", flush=True)
 
     xm.rendezvous("done")
 
 # --- Entry point ---
 if __name__ == "__main__":
-    xmp.spawn(_mp_fn, args=(), nprocs=8, start_method="fork")
+    xmp.spawn(_mp_fn, args=())

@@ -15,3 +15,18 @@ sudo apt-get update
 sudo apt-get install libopenblas-dev -y
 pip install numpy
 pip install torch==2.8.0 'torch_xla[tpu]==2.8.0'
+
+
+#install google cloud storage api on each worker:
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="pip install --user google-cloud-storage"
+
+#install sentencepiece on each worker:
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="pip install --user sentencepiece"

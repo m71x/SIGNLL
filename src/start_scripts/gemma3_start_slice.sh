@@ -1,5 +1,5 @@
 export PROJECT_ID=early-exit-transformer-network
-export TPU_NAME=node-2
+export TPU_NAME=node-4
 export ZONE=europe-west4-b
 export ACCELERATOR_TYPE=v5litepod-16
 export RUNTIME_VERSION=v2-alpha-tpuv5-lite
@@ -35,14 +35,24 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
 
 
 #upload script to all workers
-gcloud compute tpus tpu-vm scp /home/mikexi/projects/signll_code/src/gemma_test/gemma_3_tpu_test.py ${TPU_NAME}:~ \
+gcloud compute tpus tpu-vm scp /home/mikexi/projects/signll_code/src/tpu_parallel_tests/check_amount_cores.py ${TPU_NAME}:~ \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all
 
+#https://cloud.google.com/tpu/docs/pytorch-pods
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+    --zone=${ZONE} \
+    --project=${PROJECT_ID} \
+    --worker=all \
+    --command="pip install torch~=2.6.0 torch_xla[tpu]~=2.6.0 torchvision -f https://storage.googleapis.com/libtpu-releases/index.html"
 #run script
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="PJRT_DEVICE=TPU python3 ~/gemma_3_tpu_test.py"
+  --command="PJRT_DEVICE=TPU python3 ~/check_amount_cores.py"
+
+  
+
+
