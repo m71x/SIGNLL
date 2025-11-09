@@ -33,14 +33,20 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all \
   --command="python3 -m pip install --upgrade pip && python3 -m pip install --user transformers"
 
+#install huggingface datasets library on all workers
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+    --zone=${ZONE} \
+    --project=${PROJECT_ID} \
+    --worker=all \
+    --command="pip install --upgrade datasets"
 
 #upload script to all workers
-gcloud compute tpus tpu-vm scp /home/mikexi/projects/signll_code/src/tpu_parallel_tests/check_amount_cores.py ${TPU_NAME}:~ \
+gcloud compute tpus tpu-vm scp /home/mikexi/projects/signll_code/src/gcs/twitter_100m_upload_shard.py ${TPU_NAME}:~ \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all
 
-#https://cloud.google.com/tpu/docs/pytorch-pods
+#https://cloud.google.com/tpu/docs/pytorch-pods - gcp documentation says use 2.5.0, but use 2.6.0 because there was a vulnerability in torch.load
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
@@ -50,8 +56,8 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
-  --worker=all \
-  --command="PJRT_DEVICE=TPU python3 ~/check_amount_cores.py"
+  --worker=0 \
+  --command="PJRT_DEVICE=TPU python3 ~/twitter_100m_upload_shard.py"
 
   
 
