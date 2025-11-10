@@ -41,7 +41,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --command="pip install --upgrade datasets"
 
 #upload script to all workers
-gcloud compute tpus tpu-vm scp /home/mikexi/projects/signll_code/src/gcs/twitter_100m_upload_shard.py ${TPU_NAME}:~ \
+gcloud compute tpus tpu-vm scp /home/mikexi/projects/signll_code/src/final_tests/training_data_download_test.py ${TPU_NAME}:~ \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all
@@ -56,9 +56,28 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
-  --worker=0 \
-  --command="PJRT_DEVICE=TPU python3 ~/twitter_100m_upload_shard.py"
+  --worker=all \
+  --command="PJRT_DEVICE=TPU python3 ~/training_data_download_test.py"
 
-  
+  #kill all user run processes: pkill -f -u mikexi python3
 
+#install fasttext on all tpu workers
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="pip install fasttext"
 
+#install requests on all tpu workers
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="pip install requests"
+
+#install pycld3
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="pip install pycld3"

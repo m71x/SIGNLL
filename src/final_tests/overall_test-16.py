@@ -1,0 +1,1 @@
+#TODO: put all the code from the files together and test a batch to download the input prompts, run, store data to gcloud, and update checkpoints

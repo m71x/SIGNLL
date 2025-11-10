@@ -17,7 +17,7 @@ model.to(device)
 model.eval()
 
 # Example input
-text = "I hate"
+text = "Fuck you"
 
 # ------------- Start timing -------------
 start_time = time.time()

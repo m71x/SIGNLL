@@ -5,6 +5,7 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from google.cloud import storage
 
+#NOTE: RUN WITH --worker = ALL, not --worker = 0
 # --- GCS + Local paths ---
 BUCKET_NAME = "encoder-models"   # change if your bucket name differs
 GCS_PREFIX = "siebert"    # your Siebert model path in GCS
