@@ -8,7 +8,7 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 
 # --- Configuration ---
-BUCKET_NAME = "encoder-models"
+BUCKET_NAME = "encoder-models-2"
 GCS_DATA_PREFIX = "twitter-100m"
 GCS_CHECKPOINT_PREFIX = "tensorcore-checkpoints-v2-init"
 CHECKPOINT_FILENAME = "progress.json"

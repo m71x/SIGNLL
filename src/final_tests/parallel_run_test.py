@@ -10,7 +10,7 @@ import time
 
 # THIS CODE EXTRACTS THE CLS TOKEN EMBEDDING FROM EVERY LAYER AND THE FINAL PREDICTION.
 # --- Configuration (Added Efficiency Parameters) ---
-BUCKET_NAME = "encoder-models"
+BUCKET_NAME = "encoder-models-2"
 MODEL_PREFIX = "siebert"
 LOCAL_MODEL_PATH = "/home/mikexi/siebert_model"
 UPLOAD_PREFIX = "siebert-data/siebert-data-test"

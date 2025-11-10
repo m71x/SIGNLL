@@ -6,7 +6,7 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 
 # --- Configuration ---
-BUCKET_NAME = "encoder-models"
+BUCKET_NAME = "encoder-models-2"
 CHECKPOINT_FILENAME = "progress.json"
 
 # Phase 1: Existing checkpoint path (Read/Modify/Write test)

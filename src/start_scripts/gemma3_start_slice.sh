@@ -61,7 +61,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
 
   #kill all user run processes: pkill -f -u mikexi python3
 
-#install fasttext on all tpu workers
+#install fasttext on all tpu workers (DO NOT USE ANYMORE)
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
@@ -75,9 +75,18 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all \
   --command="pip install requests"
 
-#install pycld3
+#install protobuf compiler on all TPUs (if you really need it, often it is default loaded)
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="pip install pycld3"
+  --command="sudo apt-get update && sudo apt-get install -y protobuf-compiler"
+
+#install gcld3
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="pip install gcld3"
+
+

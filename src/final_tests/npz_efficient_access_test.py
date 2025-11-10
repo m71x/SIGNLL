@@ -10,7 +10,7 @@ import time
 
 #THIS CODE CHECKS THAT A MASSIVE AMOUNT OF COLLECTIONS OF ALL HIDDEN STATE VECTORS CAN BE UPLOADED TO GCS. IN PRACTICE, YOU ONLY NEED THE CLS TOKEN
 # --- Configuration (Added Efficiency Parameters) ---
-BUCKET_NAME = "encoder-models"
+BUCKET_NAME = "encoder-models-2"
 MODEL_PREFIX = "siebert"
 LOCAL_MODEL_PATH = "/home/mikexi/siebert_model"
 UPLOAD_PREFIX = "siebert-data/siebert-data-test"

@@ -9,7 +9,7 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 
 # --- Configuration ---
-BUCKET_NAME = "encoder-models"
+BUCKET_NAME = "encoder-models-2"
 MODEL_PREFIX = "siebert"
 LOCAL_MODEL_PATH = "/home/mikexi/siebert_model"
 UPLOAD_PREFIX = "siebert-data/siebert-data-test"
