@@ -1,8 +1,8 @@
 export PROJECT_ID=early-exit-transformer-network
-export TPU_NAME=node-4
-export ZONE=europe-west4-b
-export ACCELERATOR_TYPE=v5litepod-16
-export RUNTIME_VERSION=v2-alpha-tpuv5-lite
+export TPU_NAME=node-5
+export ZONE=us-central2-b
+export ACCELERATOR_TYPE=v4-64
+export RUNTIME_VERSION=tpu-ubuntu2204-base
 
 gcloud compute tpus tpu-vm create ${TPU_NAME} \
     --zone=${ZONE} \
@@ -41,7 +41,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --command="pip install --upgrade datasets"
 
 #upload script to all workers
-gcloud compute tpus tpu-vm scp /home/mikexi/projects/signll_code/src/final_tests/training_data_download_test.py ${TPU_NAME}:~ \
+gcloud compute tpus tpu-vm scp /home/mikexi/projects/signll_code/src/final_tests/checkpoint_access_only_test.py ${TPU_NAME}:~ \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all
@@ -57,7 +57,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="PJRT_DEVICE=TPU python3 ~/training_data_download_test.py"
+  --command="PJRT_DEVICE=TPU python3 ~/checkpoint_access_only_test.py"
 
   #kill all user run processes: pkill -f -u mikexi python3
 

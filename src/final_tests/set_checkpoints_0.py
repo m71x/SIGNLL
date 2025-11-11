@@ -187,7 +187,7 @@ def _mp_fn(index):
     
     # Synchronize all cores before starting the final verification
     xm.rendezvous("phase_1_complete")
-
+    
     # --- 2. PHASE 2: FINAL VERIFICATION OF RESET STATE ---
     run_phase_2_final_verification(core_id, total_cores, local_dir)
     
