@@ -124,10 +124,20 @@ def main_worker(index, local_base):
         return # Terminate worker if the model test fails
     
     # 2. Get Starting Checkpoint
-    start_index = checkpoint_access.load_checkpoint(core_id, local_dir="/tmp/checkpoints", gcs_prefix=CHECKPOINT_PREFIX, filename=CHECKPOINT_FILENAME)
-    if start_index is None:
+    checkpoint_data = checkpoint_access.load_checkpoint(core_id, local_dir="/tmp/checkpoints", gcs_prefix=CHECKPOINT_PREFIX, filename=CHECKPOINT_FILENAME)
+
+    if checkpoint_data is None:
+    # If loading failed completely (e.g., bad JSON, unhandled exception)
         start_index = 0
-        log(core_id, "No valid checkpoint found. Starting from index 0.")
+        log(core_id, "FATAL: Checkpoint load failed. Starting from index 0.")
+    else:
+    # Extract the samples_seen value from the dictionary
+        start_index = checkpoint_data.get("samples_seen", 0)
+        
+    if start_index == 0:
+        log(core_id, "No valid checkpoint found or samples_seen is 0. Starting from index 0.")
+    else:
+        log(core_id, f"Resuming from checkpoint index: {start_index}.")
     
     # 3. Download and Load Data Shard
     local_shard_path = training_dataset_access.get_shard_path(core_id)
