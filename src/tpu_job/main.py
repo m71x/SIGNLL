@@ -236,7 +236,7 @@ def main_worker(index, local_base):
                 
                 # Update Checkpoint with total processed samples read from the parquet file
                 total_processed = current_index
-                checkpoint_access.save_checkpoint_index(core_id, total_processed, local_dir="/tmp/checkpoints", gcs_prefix=CHECKPOINT_PREFIX, filename=CHECKPOINT_FILENAME)
+                checkpoint_access.save_checkpoint(core_id, total_processed, local_dir="/tmp/checkpoints", gcs_prefix=CHECKPOINT_PREFIX, filename=CHECKPOINT_FILENAME)
 
                 # Reset buffers and count for the next chunk
                 accumulated_cls = []
