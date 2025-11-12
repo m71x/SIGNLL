@@ -271,15 +271,15 @@ def main_worker(index, local_base):
 
 if __name__ == '__main__':
     # Mock local_base path for local testing structure
-    MOCK_LOCAL_BASE = "/tmp/siebert_inference_data"
-    os.makedirs(MOCK_LOCAL_BASE, exist_ok=True)
+    LOCAL_BASE = "/tmp/siebert_inference_data"
+    os.makedirs(LOCAL_BASE, exist_ok=True)
     
-    log(0, f"Starting multiprocess execution with base directory: {MOCK_LOCAL_BASE}")
+    #log(0, f"Starting multiprocess execution with base directory: {MOCK_LOCAL_BASE}")
     
     # In a real TPU environment, this would be:
-    xmp.spawn(main_worker, args=(MOCK_LOCAL_BASE,), nprocs=xm.xrt_world_size()) 
+    xmp.spawn(main_worker, args=(LOCAL_BASE,), nprocs=xm.xrt_world_size()) 
     
     # For local testing simulation:
     # main_worker(0, MOCK_LOCAL_BASE) 
     
-    //log(0, "Mock execution complete.")
+    #log(0, "Mock execution complete.")
