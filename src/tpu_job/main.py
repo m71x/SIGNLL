@@ -114,7 +114,7 @@ def main_worker(index, local_base):
     log(core_id, f"Model path assumed to be ready at: {LOCAL_MODEL_PATH}")
     
     # --- Setup Inference Model (part of pre-flight checks) ---
-    device = xm.xla_device()
+    device = xm.torch_xla.device()
     log(core_id, f"Initializing model on device: {device}")
     model, tokenizer = inference.initialize_model(LOCAL_MODEL_PATH, device)
     
@@ -193,21 +193,40 @@ def main_worker(index, local_base):
         
         # Filter the batch_texts to only include English and reliable samples
         filtered_texts = [batch_texts[i] for i in english_indices]
-        
+        filtered_count = len(filtered_texts) # Store the actual count
+
         # Total samples read from the file (used for checkpointing)
         # Advance the checkpoint index regardless of filtering outcome
         current_index += batch_size
-        
+
         # Only run inference if there's data to process after filtering
         if filtered_texts:
-            log(core_id, f"Processing batch of {batch_size} (Filtered to {len(filtered_texts)} English samples)...")
+            # CRITICAL FIX: Pad the input texts to the fixed batch size (64)
+            padding_needed = INFERENCE_BATCH_SIZE - filtered_count
+            
+            if padding_needed > 0:
+                # Use a minimal dummy text for padding. These results will be discarded.
+                dummy_text = ["<PAD>"] * padding_needed 
+                texts_to_process = filtered_texts + dummy_text
+            else:
+                # Should only happen if all 64 were English/reliable
+                texts_to_process = filtered_texts
+                
+            log(core_id, f"Processing batch of {batch_size} (Filtered to {filtered_count} English samples, Padded to {len(texts_to_process)} for TPU)...")
 
-            # 7. Run Inference (Passes the filtered batch)
+            # 7. Run Inference (Passes the fixed-size batch)
             try:
                 # Returns 3D CLS tokens and 1D classification indices (0/1)
                 cls_np, classifications_np = inference.run_inference_and_store_cls_tokens(
-                    model, tokenizer, filtered_texts, device
+                    model, tokenizer, texts_to_process, device
                 )
+                
+                # CRITICAL: Slice the results back down to the original filtered count
+                cls_np = cls_np[:filtered_count]
+                classifications_np = classifications_np[:filtered_count]
+                
+                # Accumulate the results
+                # ... (rest of accumulation logic is the same)
 
                 # Accumulate the results
                 accumulated_cls.append(cls_np)

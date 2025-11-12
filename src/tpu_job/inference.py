@@ -109,28 +109,27 @@ def run_inference_and_store_cls_tokens(model, tokenizer, texts, device):
     with torch.no_grad():
         # CRITICAL: Request hidden states to get all layer outputs
         outputs = model(**inputs, output_hidden_states=True)
-        
         # Get logits (shape [B, 2])
         logits = outputs.logits 
         
         # Get hidden states (tuple of Tensors, one for each layer + embedding)
         hidden_states = outputs.hidden_states 
         
-        # 3. Process Hidden States (All-layer CLS Tokens)
-        # Select the [CLS] token vector from the hidden states of each layer (index 0).
-        all_cls_tokens = []
-        for state in hidden_states:
-            # state[ : , 0, : ] is the [CLS] token for the whole batch at this layer
-            all_cls_tokens.append(state[:, 0, :].cpu().numpy())
-            
-        # Stack them into one 3D array: [B, L+1, D] (L+1 = embedding + 12 layers)
-        cls_np = np.stack(all_cls_tokens, axis=1)
+        # 3. Optimized Processing: All-layer CLS Tokens
+        # Stack the CLS token (index 0) from all hidden states (25 layers)
+        # using PyTorch on the TPU, then transfer the final tensor once.
+        all_cls_tokens_tensor = torch.stack(
+            [state[:, 0, :] for state in hidden_states], # Select CLS token (index 0) from each layer
+            dim=1 # Stack along the layer dimension to get [B, L+1, D]
+        )
+        
+        # Convert the final stacked tensor to NumPy on the CPU
+        cls_np = all_cls_tokens_tensor.cpu().numpy()
 
-        # 4. Process Logits (Classification Indices)
-        # Apply argmax to get the final classification (0 or 1)
-        logits_np = logits.cpu().numpy()
-        # Find the index of the max logit (the predicted class)
-        classifications_np = np.argmax(logits_np, axis=1) # Shape [B]
+        # 4. Optimized Processing: Classification Indices
+        # Use torch.argmax on the TPU, then transfer the result once.
+        classifications_tensor = torch.argmax(logits, dim=1)
+        classifications_np = classifications_tensor.cpu().numpy()
 
     # Use xm.mark_step() to synchronize execution on the TPU core
     xm.torch_xla.sync()
