@@ -129,6 +129,8 @@ def main_worker(index, local_base):
     if checkpoint_data is None:
         start_index = 0
         log(core_id, "FATAL: Checkpoint load failed. Starting from index 0.")
+    elif isinstance(checkpoint_data, int):
+        start_index = checkpoint_data
     else:
         start_index = checkpoint_data.get("samples_seen", 0)
 
