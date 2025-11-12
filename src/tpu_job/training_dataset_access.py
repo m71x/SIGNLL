@@ -104,7 +104,7 @@ def get_shard_path(core_id, local_dir="/tmp/data"):
     local_path = os.path.join(local_dir, filename)
     return local_path
 
-def download_data_shard(core_id, local_dir, bucket_name=BUCKET_NAME, gcs_prefix= GCS_DATA_PREFIX, parquet_format = PARQUET_FILE_FORMAT):
+def download_data_shard(core_id, local_file_path, bucket_name=BUCKET_NAME, gcs_prefix= GCS_DATA_PREFIX, parquet_format = PARQUET_FILE_FORMAT):
     """
     Downloads the data shard for a given core, processes it to add the 
     language column, and returns the local path to the processed file.
@@ -112,7 +112,7 @@ def download_data_shard(core_id, local_dir, bucket_name=BUCKET_NAME, gcs_prefix=
     core_id_log = get_core_ordinal()
     shard_filename = parquet_format.format(shard_index=core_id)
     gcs_blob_path = f"{gcs_prefix}/{shard_filename}"
-    local_path = os.path.join(local_dir, shard_filename)
+    local_path = local_file_path
 
     # 1. Download the file from GCS
     print(f"[Core {core_id_log}] Attempting to download data shard {shard_filename} to {local_path}...", flush=True)
@@ -134,7 +134,7 @@ def download_data_shard(core_id, local_dir, bucket_name=BUCKET_NAME, gcs_prefix=
     try:
         # Apply the language check function to all 'text' rows in parallel
         with ThreadPoolExecutor(max_workers=NUM_CPU_WORKERS) as executor: 
-            is_english_results = list(executor.map(check_language, df['text'].tolist()))
+            is_english_results = list(executor.map(check_language, df['tweet'].tolist()))
         
         elapsed = time.time() - start_time
         english_count = sum(is_english_results)
