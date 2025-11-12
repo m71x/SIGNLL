@@ -94,13 +94,15 @@ def run_inference_and_store_cls_tokens(model, tokenizer, texts, device):
     core_id = get_core_ordinal()
     
     # 1. Tokenization and Input Creation
+    FIXED_MAX_LENGTH = 128
     inputs = tokenizer(
         texts,
         return_tensors="pt",
-        padding=True,
+        padding='max_length',
         truncation=True,
-        max_length=128
+        max_length=FIXED_MAX_LENGTH
     )
+
     
     # Move inputs to the XLA device
     inputs = {name: tensor.to(device) for name, tensor in inputs.items()}
