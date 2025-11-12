@@ -271,7 +271,7 @@ def main_worker(index, local_base):
     # Final checkpoint update: set to the total index read
     if current_index > start_index:
         try:
-            checkpoint_access.save_checkpoint_index(core_id, current_index, local_dir="/tmp/checkpoints", gcs_prefix=CHECKPOINT_PREFIX, filename=CHECKPOINT_FILENAME)
+            checkpoint_access.save_checkpoint(core_id, current_index, local_dir="/tmp/checkpoints", gcs_prefix=CHECKPOINT_PREFIX, filename=CHECKPOINT_FILENAME)
             log(core_id, f"Final checkpoint update: samples_seen set to {current_index} (End of Shard).")
         except Exception as e:
             log(core_id, f"Final checkpoint upload failed: {e}")

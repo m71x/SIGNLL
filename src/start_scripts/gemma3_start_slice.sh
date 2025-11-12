@@ -24,6 +24,10 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --worker=all \
     --command="git clone https://github.com/m71x/SIGNLL"
 
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+    --zone=${ZONE} \
+    --project=${PROJECT_ID} \
+    --worker=1
 #run inference
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
@@ -60,7 +64,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --command="pip install --upgrade datasets"
 
 #upload script to all workers
-gcloud compute tpus tpu-vm scp /home/mikexi/projects/signll_code/src/final_tests/checkpoint_access_only_test.py ${TPU_NAME}:~ \
+gcloud compute tpus tpu-vm scp /home/mikexi/projects/signll_code/src/tpu_job/tpu_core_count.py ${TPU_NAME}:~ \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all
@@ -76,7 +80,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="PJRT_DEVICE=TPU python3 ~/checkpoint_access_only_test.py"
+  --command="PJRT_DEVICE=TPU python3 ~/tpu_core_count.py"
 
   #kill all user run processes: pkill -f -u mikexi python3
 
