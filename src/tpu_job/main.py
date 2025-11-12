@@ -133,7 +133,7 @@ def main_worker(index, local_base):
     else:
     # Extract the samples_seen value from the dictionary
         start_index = checkpoint_data.get("samples_seen", 0)
-        
+
     if start_index == 0:
         log(core_id, "No valid checkpoint found or samples_seen is 0. Starting from index 0.")
     else:
@@ -178,7 +178,7 @@ def main_worker(index, local_base):
         batch_size = len(batch_df)
         
         # 6. Language Detection and Filtering (Per batch for efficiency)
-        batch_texts = batch_df['text'].tolist()
+        batch_texts = batch_df['tweet'].tolist()
         
         detector = gcld3.NNetLanguageIdentifier(min_num_bytes=0, max_num_bytes=1000)
         
