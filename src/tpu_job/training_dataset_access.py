@@ -104,7 +104,7 @@ def get_shard_path(core_id, local_dir="/tmp/data"):
     local_path = os.path.join(local_dir, filename)
     return local_path
 
-def download_data_shard(core_id, local_dir, bucket_name, gcs_prefix, parquet_format):
+def download_data_shard(core_id, local_dir, bucket_name=BUCKET_NAME, gcs_prefix= GCS_DATA_PREFIX, parquet_format = PARQUET_FILE_FORMAT):
     """
     Downloads the data shard for a given core, processes it to add the 
     language column, and returns the local path to the processed file.
