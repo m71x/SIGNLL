@@ -124,7 +124,7 @@ def main_worker(index, local_base):
         return # Terminate worker if the model test fails
     
     # 2. Get Starting Checkpoint
-    start_index = checkpoint_access.read_checkpoint_index(core_id, local_dir="/tmp/checkpoints", gcs_prefix=CHECKPOINT_PREFIX, filename=CHECKPOINT_FILENAME)
+    start_index = checkpoint_access.load_checkpoint(core_id, local_dir="/tmp/checkpoints", gcs_prefix=CHECKPOINT_PREFIX, filename=CHECKPOINT_FILENAME)
     if start_index is None:
         start_index = 0
         log(core_id, "No valid checkpoint found. Starting from index 0.")
