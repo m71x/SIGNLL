@@ -24,11 +24,12 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --worker=all \
     --command="git clone https://github.com/m71x/SIGNLL"
 
+#run inference
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="tmux new -s signll 'cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/tpu_job/main.py'"
+  --command="tmux new -d -s signll 'cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/tpu_job/main.py'"
 
 #pull changes from git repo
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \

@@ -40,7 +40,7 @@ IO_ACCUMULATION_THRESHOLD = inference.IO_ACCUMULATION_THRESHOLD
 # Expected number of hidden states (layers) for CLS token extraction
 # (e.g., 24 layers + 1 embedding layer = 25 states is common for BERT-large)
 # We will use 24 as requested by the user for the test.
-EXPECTED_CLS_COUNT = 24
+EXPECTED_CLS_COUNT = 25
 
 
 # --- Logging Helper ---
