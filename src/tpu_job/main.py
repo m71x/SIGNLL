@@ -20,7 +20,7 @@ import json
 import math
 import numpy as np
 import pandas as pd
-import gcld3
+
 
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
@@ -110,7 +110,6 @@ def main_worker(index, local_base):
     log(core_id, "Starting worker...")
     
     # 1. Initialization and Model Download (Master only logic omitted here, assuming success)
-    # The actual steps 1-5 from the TODO list would happen here.
     log(core_id, f"Model path assumed to be ready at: {LOCAL_MODEL_PATH}")
     
     # --- Setup Inference Model (part of pre-flight checks) ---
@@ -127,11 +126,9 @@ def main_worker(index, local_base):
     checkpoint_data = checkpoint_access.load_checkpoint(core_id, local_dir="/tmp/checkpoints", gcs_prefix=CHECKPOINT_PREFIX, filename=CHECKPOINT_FILENAME)
 
     if checkpoint_data is None:
-    # If loading failed completely (e.g., bad JSON, unhandled exception)
         start_index = 0
         log(core_id, "FATAL: Checkpoint load failed. Starting from index 0.")
     else:
-    # Extract the samples_seen value from the dictionary
         start_index = checkpoint_data.get("samples_seen", 0)
 
     if start_index == 0:
@@ -142,11 +139,13 @@ def main_worker(index, local_base):
     # 3. Download and Load Data Shard
     local_shard_path = training_dataset_access.get_shard_path(core_id)
     if not training_dataset_access.download_data_shard(core_id, local_shard_path):
-        log(core_id, "FATAL: Failed to download data shard. Exiting.")
+        log(core_id, "FATAL: Failed to download and pre-process data shard. Exiting.")
         return
 
-    log(core_id, f"Loading parquet file from {local_shard_path}...")
+    # CRITICAL CHANGE: The DataFrame now loads the **pre-processed** file
+    log(core_id, f"Loading pre-processed parquet file from {local_shard_path}...")
     try:
+        # Load the full shard into memory. It contains the 'is_english_reliable' column.
         df = pd.read_parquet(local_shard_path)
         total_samples = len(df)
         log(core_id, f"Shard loaded successfully. Total samples: {total_samples}")
@@ -162,41 +161,33 @@ def main_worker(index, local_base):
     # --- Main Processing Loop ---
     current_index = start_index
     processed_since_last_save = 0
-    chunk_index = 0 # Sequential index for the uploaded chunk files
+    chunk_index = 0
     
     # CRITICAL: List to hold 3D CLS token arrays: [B, L, D]
-    accumulated_cls = []  
+    accumulated_cls = [] 
     # CRITICAL: List to hold 1D classification index arrays: [B] 
-    accumulated_classifications = []  
+    accumulated_classifications = [] 
 
     log(core_id, f"Starting inference from row index {current_index}...")
 
     # Iterate in batches
     while current_index < total_samples:
+        # 1. Get the current batch chunk from the full DataFrame
         end_index = min(current_index + INFERENCE_BATCH_SIZE, total_samples)
-        batch_df = df.iloc[current_index:end_index]
-        batch_size = len(batch_df)
+        batch_df = df.iloc[current_index:end_index].copy()
+        batch_size = len(batch_df) # This is usually INFERENCE_BATCH_SIZE (64)
         
-        # 6. Language Detection and Filtering (Per batch for efficiency)
-        batch_texts = batch_df['tweet'].tolist()
+        # 2. **FAST FILTERING (Replaces the slow gcld3 loop)**
+        # Filter the batch using the pre-computed 'is_english_reliable' column (where 1=English)
+        filtered_df = batch_df[batch_df['is_english_reliable'] == 1]
         
-        detector = gcld3.NNetLanguageIdentifier(min_num_bytes=0, max_num_bytes=1000)
-        
-        # Indices of tweets that are English and reliable
-        english_indices = []
-        
-        for i, text in enumerate(batch_texts):
-            result = detector.FindLanguage(text=text)
-            # Check for English and high reliability (is_reliable check is built-in to the result)
-            if result.language == 'en' and result.is_reliable:
-                english_indices.append(i)
-        
-        # Filter the batch_texts to only include English and reliable samples
-        filtered_texts = [batch_texts[i] for i in english_indices]
-        filtered_count = len(filtered_texts) # Store the actual count
+        # Extract the final texts and count
+        # Note: Assuming 'tweet' is the correct text column name in your Parquet file.
+        filtered_texts = filtered_df['tweet'].tolist()
+        filtered_count = len(filtered_texts) 
 
-        # Total samples read from the file (used for checkpointing)
-        # Advance the checkpoint index regardless of filtering outcome
+        # 3. Advance the checkpoint index
+        # IMPORTANT: Advance the index by the full batch size read, regardless of filtering outcome.
         current_index += batch_size
 
         # Only run inference if there's data to process after filtering
@@ -205,16 +196,14 @@ def main_worker(index, local_base):
             padding_needed = INFERENCE_BATCH_SIZE - filtered_count
             
             if padding_needed > 0:
-                # Use a minimal dummy text for padding. These results will be discarded.
                 dummy_text = ["<PAD>"] * padding_needed 
                 texts_to_process = filtered_texts + dummy_text
             else:
-                # Should only happen if all 64 were English/reliable
                 texts_to_process = filtered_texts
                 
             log(core_id, f"Processing batch of {batch_size} (Filtered to {filtered_count} English samples, Padded to {len(texts_to_process)} for TPU)...")
 
-            # 7. Run Inference (Passes the fixed-size batch)
+            # 4. Run Inference (Passes the fixed-size batch)
             try:
                 # Returns 3D CLS tokens and 1D classification indices (0/1)
                 cls_np, classifications_np = inference.run_inference_and_store_cls_tokens(
@@ -225,9 +214,6 @@ def main_worker(index, local_base):
                 cls_np = cls_np[:filtered_count]
                 classifications_np = classifications_np[:filtered_count]
                 
-                # Accumulate the results
-                # ... (rest of accumulation logic is the same)
-
                 # Accumulate the results
                 accumulated_cls.append(cls_np)
                 accumulated_classifications.append(classifications_np)
@@ -240,7 +226,7 @@ def main_worker(index, local_base):
         else:
             log(core_id, f"Skipped batch of {batch_size} (No English/reliable samples).")
 
-        # 8. Check I/O Threshold
+        # 5. Check I/O Threshold (Remains unchanged)
         if processed_since_last_save >= IO_ACCUMULATION_THRESHOLD:
             log(core_id, f"I/O threshold reached. Writing chunk {chunk_index}...")
             try:
@@ -262,7 +248,7 @@ def main_worker(index, local_base):
 
             except Exception as e:
                 log(core_id, f"FATAL: I/O or Checkpoint update failed: {e}. Attempting graceful exit.")
-                return # Attempt to stop the worker on critical failure
+                return 
 
         # Simple progress report
         if current_index % (INFERENCE_BATCH_SIZE * 100) == 0:
@@ -270,10 +256,10 @@ def main_worker(index, local_base):
         
     log(core_id, f"Shard processing complete. Final index read: {current_index}")
 
-    # --- Final I/O and Checkpoint Update ---
+    # --- Final I/O and Checkpoint Update (Remains unchanged) ---
     if accumulated_cls:
         log(core_id, "Final chunk remaining. Uploading...")
-        chunk_index += 1 # Use the next chunk index
+        chunk_index += 1 
         try:
             inference.write_and_upload_chunk(
                 core_id, accumulated_cls, accumulated_classifications, chunk_index, local_base
@@ -283,7 +269,7 @@ def main_worker(index, local_base):
             log(core_id, f"Failed final upload: {e}")
 
     # Final checkpoint update: set to the total index read
-    if current_index > start_index: # Only update if we actually read data
+    if current_index > start_index:
         try:
             checkpoint_access.save_checkpoint_index(core_id, current_index, local_dir="/tmp/checkpoints", gcs_prefix=CHECKPOINT_PREFIX, filename=CHECKPOINT_FILENAME)
             log(core_id, f"Final checkpoint update: samples_seen set to {current_index} (End of Shard).")

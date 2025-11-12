@@ -1,6 +1,11 @@
 import os
 import json
 from google.cloud import storage
+import gcld3
+import time
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor # New import for parallel CPU work
+
 
 # Attempt to import XLA for distributed logging. Use a fallback if not available.
 try:
@@ -22,7 +27,22 @@ CHECKPOINT_FILENAME = "progress.json"
 # The core ID (0-63 for a v3-64 pod) is used directly as the shard_index
 PARQUET_FILE_FORMAT = "tweets-{shard_index:02d}-of-64.parquet"
 
+GC_DETECTOR = gcld3.NNetLanguageIdentifier(min_num_bytes=0, max_num_bytes=1000)
+# Define the number of CPU workers for parallel pre-processing (tune this based on your machine's CPU cores)
+NUM_CPU_WORKERS = 8 
 
+def check_language(text):
+    """Returns 1 if English and reliable, 0 otherwise."""
+    if not isinstance(text, str):
+        return 0
+    try:
+        # NOTE: Using the global GC_DETECTOR
+        result = GC_DETECTOR.FindLanguage(text=text)
+        # 1 for English/reliable, 0 otherwise
+        return 1 if result.is_reliable and result.language == 'en' else 0
+    except Exception:
+        # Catch any exceptions during language check
+        return 0
 # --- GCS Helper Functions ---
 
 def _get_gcs_client_and_blob(bucket_name, gcs_blob_path):
@@ -84,29 +104,56 @@ def get_shard_path(core_id, local_dir="/tmp/data"):
     local_path = os.path.join(local_dir, filename)
     return local_path
 
-def download_data_shard(core_id, local_shard_path):
+def download_data_shard(core_id, local_dir, bucket_name, gcs_prefix, parquet_format):
     """
-    Downloads the data shard corresponding to the core ID from GCS to 
-    the specified local path.
-
-    Args:
-        core_id (int): The ID of the current TPU core.
-        local_shard_path (str): The determined local path to save the shard.
-
-    Returns:
-        bool: True if the shard was downloaded successfully, False otherwise.
+    Downloads the data shard for a given core, processes it to add the 
+    language column, and returns the local path to the processed file.
     """
-    core_id_log = get_core_ordinal() 
+    core_id_log = get_core_ordinal()
+    shard_filename = parquet_format.format(shard_index=core_id)
+    gcs_blob_path = f"{gcs_prefix}/{shard_filename}"
+    local_path = os.path.join(local_dir, shard_filename)
 
-    # 1. Determine GCS path
-    # Parquet filename format uses the core_id directly as the shard_index
-    filename = PARQUET_FILE_FORMAT.format(shard_index=core_id)
-    gcs_blob_path = os.path.join(GCS_DATA_PREFIX, filename)
+    # 1. Download the file from GCS
+    print(f"[Core {core_id_log}] Attempting to download data shard {shard_filename} to {local_path}...", flush=True)
+    if not download_file_from_gcs(local_path, bucket_name, gcs_blob_path):
+        return None # Return None if download failed
+
+    # --- NEW: Process the file with Parallel Language Detection ---
+    print(f"[Core {core_id_log}] Loading parquet file from {local_path}...", flush=True)
+    try:
+        df = pd.read_parquet(local_path)
+    except Exception as e:
+        print(f"[Core {core_id_log}] ❌ Error loading parquet file: {e}. Cannot proceed with pre-processing.", flush=True)
+        return None
+
+    # Use ThreadPoolExecutor for parallel CPU-bound language detection
+    start_time = time.time()
+    print(f"[Core {core_id_log}] Starting parallel gcld3 processing on {len(df)} samples with {NUM_CPU_WORKERS} workers...", flush=True)
     
-    print(f"[Core {core_id_log}] Attempting to download data shard {filename} to {local_shard_path}...", flush=True)
+    try:
+        # Apply the language check function to all 'text' rows in parallel
+        with ThreadPoolExecutor(max_workers=NUM_CPU_WORKERS) as executor: 
+            is_english_results = list(executor.map(check_language, df['text'].tolist()))
+        
+        elapsed = time.time() - start_time
+        english_count = sum(is_english_results)
+        print(f"[Core {core_id_log}] ✅ gcld3 processing complete in {elapsed:.2f} seconds. Found {english_count} English samples.", flush=True)
+        
+        # 2. Add the new column
+        df['is_english_reliable'] = is_english_results
 
-    # 2. Use existing GCS helper function
-    return download_file_from_gcs(local_shard_path, BUCKET_NAME, gcs_blob_path)
+        # 3. Overwrite the local file with the new, processed version
+        df.to_parquet(local_path, index=False)
+        print(f"[Core {core_id_log}] ✅ Saved processed shard over local file. Filtering is now pre-computed.", flush=True)
+        
+    except Exception as e:
+        # Log the error, but since the core cannot proceed without filtering, we should return None.
+        print(f"[Core {core_id_log}] ❌ CRITICAL Error during gcld3 processing: {e}. Returning None.", flush=True)
+        return None
+
+    # 4. Return the local path to the PROCESSED file
+    return local_path
 
 
 # --- Checkpoint Access Function (Existing) ---
