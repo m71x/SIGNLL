@@ -30,6 +30,12 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all \
   --command="tmux new -s signll 'cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/tpu_job/main.py'"
 
+#pull changes from git repo
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="cd ~/SIGNLL && git fetch origin && git reset --hard origin/main"
 
 #clone xla onto all workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \

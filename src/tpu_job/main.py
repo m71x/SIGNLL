@@ -277,9 +277,9 @@ if __name__ == '__main__':
     log(0, f"Starting multiprocess execution with base directory: {MOCK_LOCAL_BASE}")
     
     # In a real TPU environment, this would be:
-    # xmp.spawn(main_worker, args=(MOCK_LOCAL_BASE,), nprocs=xm.xrt_world_size()) 
+    xmp.spawn(main_worker, args=(MOCK_LOCAL_BASE,), nprocs=xm.xrt_world_size()) 
     
     # For local testing simulation:
     # main_worker(0, MOCK_LOCAL_BASE) 
     
-    log(0, "Mock execution complete.")
+    //log(0, "Mock execution complete.")
