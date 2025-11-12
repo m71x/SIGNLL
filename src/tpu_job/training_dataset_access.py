@@ -29,7 +29,7 @@ PARQUET_FILE_FORMAT = "tweets-{shard_index:02d}-of-64.parquet"
 
 GC_DETECTOR = gcld3.NNetLanguageIdentifier(min_num_bytes=0, max_num_bytes=1000)
 # Define the number of CPU workers for parallel pre-processing (tune this based on your machine's CPU cores)
-NUM_CPU_WORKERS = 1 
+NUM_CPU_WORKERS = 8 
 
 def check_language(text):
     """Returns 1 if English and reliable, 0 otherwise."""

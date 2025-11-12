@@ -106,7 +106,8 @@ def test_model_inference(model, tokenizer, device, core_id):
 
 # --- Core Worker Function ---
 def main_worker(index, local_base):
-    core_id = index
+    global_core = xm.get_ordinal()
+    core_id = global_core    # use one name everywhere if you like
     log(core_id, "Starting worker...")
     
     # 1. Initialization and Model Download (Master only logic omitted here, assuming success)
