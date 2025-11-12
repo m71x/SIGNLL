@@ -17,6 +17,18 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --worker=all \
     --command="pip install torch~=2.5.0 torch_xla[tpu]~=2.5.0 torchvision -f https://storage.googleapis.com/libtpu-releases/index.html"
 
+#clone project repo onto all workers
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+    --zone=${ZONE} \
+    --project=${PROJECT_ID} \
+    --worker=all \
+    --command="git clone https://github.com/m71x/SIGNLL"
+
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="tmux new -s signll 'cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/tpu_job/main.py'"
 
 
 #clone xla onto all workers
