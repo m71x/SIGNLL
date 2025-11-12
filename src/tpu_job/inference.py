@@ -7,19 +7,21 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 import gcld3
+# Import the REAL GCS function
+from gcs_access import upload_file_to_gcs
 
-# --- Configuration Constants (Mirroring File 1) ---
+# --- Configuration Constants (Updated for ALL-LAYER extraction) ---
 LOCAL_MODEL_PATH = "/home/mikexi/siebert_model"
-UPLOAD_PREFIX = "siebert-data/siebert-data-cls-only"
+# CRITICAL: Changing the output prefix because the data structure is now 3D.
+UPLOAD_PREFIX = "siebert-data/siebert-actual-data" 
 BUCKET_NAME = "encoder-models-2"
 
 # Efficiency Parameters
 INFERENCE_BATCH_SIZE = 64
-IO_ACCUMULATION_THRESHOLD = 5000 
+IO_ACCUMULATION_THRESHOLD = 20000 
 
 
-# --- Utility Functions (Simulated External Dependencies) ---
-
+# --- Utility Functions ---
 def get_core_ordinal():
     """Returns the XLA core ID for distributed logging."""
     try:
@@ -27,19 +29,7 @@ def get_core_ordinal():
     except Exception:
         return 0
 
-def upload_file_to_gcs(bucket_name, local_path, gcs_blob_path):
-    """
-    [Placeholder function for GCS upload]
-    In a real pipeline, this would be imported from a utility module.
-    """
-    core_id = get_core_ordinal()
-    print(f"[Core {core_id}] [MOCK GCS UPLOAD] Simulating upload of {local_path} to gs://{bucket_name}/{gcs_blob_path}...", flush=True)
-    # Simulate success
-    return True
-
-
-# --- gcld3 Check Function (Based on File 2's logic) ---
-
+# --- gcld3 Check Function ---
 def check_gcld3_functionality():
     """
     Performs a simple language detection test using gcld3 to ensure the 
@@ -49,134 +39,146 @@ def check_gcld3_functionality():
     print(f"[Core {core_id}] Starting gcld3 functionality check...", flush=True)
     try:
         detector = gcld3.NNetLanguageIdentifier(min_num_bytes=0, max_num_bytes=1000)
-        test_text = "This is a test sentence in English, the language should be 'en'."
+        test_text = "This is a test of the gcld3 library."
         result = detector.FindLanguage(text=test_text)
-        
         if result.language == 'en' and result.is_reliable:
-            print(f"[Core {core_id}] ✅ gcld3 check passed: Detected '{result.language}' with confidence {result.probability:.2f}.", flush=True)
+            print(f"[Core {core_id}] ✅ gcld3 check SUCCESS: '{test_text}' detected as '{result.language}' (Reliable: {result.is_reliable}).", flush=True)
             return True
         else:
-            print(f"[Core {core_id}] ❌ gcld3 check failed: Expected 'en', got '{result.language}'.", flush=True)
+            print(f"[Core {core_id}] ❌ gcld3 check FAILED: Incorrectly detected as '{result.language}'.", flush=True)
             return False
     except Exception as e:
-        print(f"[Core {core_id}] ❌ gcld3 check failed with error: {e}", flush=True)
+        print(f"[Core {core_id}] ❌ gcld3 check FAILED with error: {e}", flush=True)
         return False
 
 
-# --- Model Setup Function ---
+# --- Inference Setup ---
 
-def setup_model_and_tokenizer(local_model_path, device):
+def initialize_model(model_path, device):
     """
-    Initializes the tokenizer and model, loading it to the XLA device.
-    Assumes the model is already downloaded locally.
-
-    Returns:
-        tuple: (tokenizer, model, max_seq_length)
+    Loads the tokenizer and the sequence classification model onto the specified device (TPU).
     """
     core_id = get_core_ordinal()
+    print(f"[Core {core_id}] Initializing model from {model_path}...", flush=True)
     
-    tokenizer = AutoTokenizer.from_pretrained(local_model_path)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        local_model_path,
-        # Use dtype for performance, ensure output_hidden_states is True
-        dtype=torch.bfloat16, 
-        output_hidden_states=True
-    ).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    
+    # Load the model weights and move to the XLA device
+    model = AutoModelForSequenceClassification.from_pretrained(model_path).to(device)
+    
+    # Put the model into evaluation mode
     model.eval()
     
-    # Determine the effective max sequence length
-    MAX_SEQ_LENGTH = tokenizer.model_max_length if tokenizer.model_max_length > 0 and tokenizer.model_max_length <= 512 else 512
-    
-    print(f"[Core {core_id}] Model setup complete. Max seq length: {MAX_SEQ_LENGTH}", flush=True)
-    
-    return tokenizer, model, MAX_SEQ_LENGTH
+    print(f"[Core {core_id}] ✅ Model initialization successful.", flush=True)
+    return model, tokenizer
 
+# --- Inference Execution ---
 
-# --- Core Inference and Output Function ---
-
-def run_inference_and_store_cls_tokens(model, tokenizer, device, sample_texts, max_seq_length):
+def run_inference_and_store_cls_tokens(model, tokenizer, texts, device):
     """
-    Runs inference on a batch of text, extracts the CLS token and logits, 
-    and returns them as NumPy arrays.
+    Tokenizes a list of texts, runs inference on the Siebert model, extracts 
+    the all-layer CLS tokens, and calculates the final classification index.
 
     Args:
-        model (PreTrainedModel): The loaded Siebert model.
-        tokenizer (PreTrainedTokenizer): The loaded tokenizer.
+        model (PreTrainedModel): The Siebert model.
+        tokenizer (PreTrainedTokenizer): The model's tokenizer.
+        texts (list[str]): The batch of text strings (max 64).
         device (torch.device): The XLA device to run on.
-        sample_texts (list[str]): Batch of text samples.
-        max_seq_length (int): The maximum sequence length for padding/truncation.
 
     Returns:
-        tuple: (cls_tokens_np, logits_np)
+        tuple[np.ndarray, np.ndarray]:
+            1. All-layer CLS tokens (3D: [B, L+1, D])
+            2. Classification indices (1D: [B])
     """
+    
     core_id = get_core_ordinal()
     
-    # 1. Tokenization and Transfer
+    # 1. Tokenization and Input Creation
     inputs = tokenizer(
-        sample_texts, 
-        padding='max_length',
+        texts,
+        return_tensors="pt",
+        padding=True,
         truncation=True,
-        max_length=max_seq_length,
-        return_tensors="pt"
-    ).to(device)
-
-    # 2. Inference
+        max_length=128
+    )
+    
+    # Move inputs to the XLA device
+    inputs = {name: tensor.to(device) for name, tensor in inputs.items()}
+    
+    # 2. Inference and Output Extraction
     with torch.no_grad():
-        outputs = model(**inputs)
+        # CRITICAL: Request hidden states to get all layer outputs
+        outputs = model(**inputs, output_hidden_states=True)
         
-    # 3. Data Transfer and Extraction (CLS token and Logits)
-    
-    # Extract the last layer hidden states (Batch, Sequence Length, Hidden Dim)
-    last_hidden_state = outputs.hidden_states[-1] 
-    
-    # Extract the CLS token, which is the first token in the sequence dimension (index 0)
-    # Shape: (Batch Size, Hidden Dim)
-    cls_tokens = last_hidden_state[:, 0, :]
-    
-    # Transfer to CPU and convert to float32 NumPy arrays
-    cls_tokens_np = cls_tokens.to(torch.float32).cpu().numpy()
-    logits_np = outputs.logits.to(torch.float32).cpu().numpy()
-    
-    print(f"[Core {core_id}] Ran inference on batch size {len(sample_texts)}. CLS tokens extracted.", flush=True)
-    
-    # Returns 2D arrays (Batch, Hidden_Dim) and (Batch, Logit_Dim)
-    return cls_tokens_np, logits_np
+        # Get logits (shape [B, 2])
+        logits = outputs.logits 
+        
+        # Get hidden states (tuple of Tensors, one for each layer + embedding)
+        hidden_states = outputs.hidden_states 
+        
+        # 3. Process Hidden States (All-layer CLS Tokens)
+        # Select the [CLS] token vector from the hidden states of each layer (index 0).
+        all_cls_tokens = []
+        for state in hidden_states:
+            # state[ : , 0, : ] is the [CLS] token for the whole batch at this layer
+            all_cls_tokens.append(state[:, 0, :].cpu().numpy())
+            
+        # Stack them into one 3D array: [B, L+1, D] (L+1 = embedding + 12 layers)
+        cls_np = np.stack(all_cls_tokens, axis=1)
 
+        # 4. Process Logits (Classification Indices)
+        # Apply argmax to get the final classification (0 or 1)
+        logits_np = logits.cpu().numpy()
+        # Find the index of the max logit (the predicted class)
+        classifications_np = np.argmax(logits_np, axis=1) # Shape [B]
 
-# --- I/O Handling Function ---
+    # Use xm.mark_step() to synchronize execution on the TPU core
+    xm.torch_xla.sync()
+    
+    print(f"[Core {core_id}] Inference complete. All-layer CLS shape: {cls_np.shape}", flush=True)
 
-def save_and_upload_outputs(core_id, accumulated_cls_tokens, accumulated_logits, chunk_index, local_dir):
+    return cls_np, classifications_np
+
+# --- I/O Operations ---
+
+def write_and_upload_chunk(core_id, accumulated_all_layer_cls_tokens, accumulated_classifications, chunk_index, local_dir):
     """
-    Concatenates accumulated outputs, saves them to a compressed NumPy file 
-    locally, and uploads the file to GCS.
-
+    Concatenates accumulated outputs (CLS Tokens and Classifications), 
+    saves them to a compressed NumPy file locally, and uploads the file to GCS.
+    
     Args:
         core_id (int): The ID of the current core.
-        accumulated_cls_tokens (list[np.ndarray]): List of CLS token batches.
-        accumulated_logits (list[np.ndarray]): List of logit batches.
+        accumulated_all_layer_cls_tokens (list[np.ndarray]): List of 3D CLS token batches.
+        accumulated_classifications (list[np.ndarray]): List of 1D classification index batches (0/1).
         chunk_index (int): The current sequential index for the chunk file name.
         local_dir (str): Temporary local directory for saving.
     """
     
-    print(f"[Core {core_id}] 🔥 I/O THRESHOLD REACHED. Writing chunk {chunk_index}...", flush=True)
+    print(f"[Core {core_id}] 🔥 I/O THRESHOLD REACHED. Writing chunk {chunk_index}... (Target: {IO_ACCUMULATION_THRESHOLD})", flush=True)
 
     # 1. Concatenate all accumulated arrays
-    all_cls_tokens = np.concatenate(accumulated_cls_tokens, axis=0)
-    all_logits = np.concatenate(accumulated_logits, axis=0)
+    # This concatenates the 3D arrays along the batch dimension (axis=0)
+    all_cls_tokens = np.concatenate(accumulated_all_layer_cls_tokens, axis=0)
+    # The classification indices are 1D arrays
+    all_classifications = np.concatenate(accumulated_classifications, axis=0)
 
     # 2. Save locally using NumPy
-    local_path = os.path.join(local_dir, f"cls_tokens_chunk_{chunk_index}.npz")
+    local_path = os.path.join(local_dir, f"embeddings_chunk_{chunk_index}.npz")
     
-    # Save the CLS token vectors and logits together
-    np.savez_compressed(local_path, cls_tokens=all_cls_tokens, logits=all_logits)
+    # Save the 3D CLS token vectors and the final classifications together.
+    np.savez_compressed(local_path, 
+                        # Key 1: 3D CLS data (N_samples, N_layers, N_dim)
+                        all_layer_cls_tokens=all_cls_tokens, 
+                        # Key 2: 1D Classification Index (0 or 1)
+                        classifications=all_classifications.astype(np.uint8))
     
-    print(f"[Core {core_id}] Saved {all_cls_tokens.shape[0]} samples locally to {local_path}", flush=True)
+    print(f"[Core {core_id}] Saved {all_cls_tokens.shape[0]} samples locally to {local_path}. Data shape: {all_cls_tokens.shape}", flush=True)
 
     # 3. Upload file to GCS
-    gcs_blob_path = f"{UPLOAD_PREFIX}/core_{core_id}/cls_tokens_chunk_{chunk_index}.npz"
+    gcs_blob_path = f"{UPLOAD_PREFIX}/core_{core_id}/embeddings_chunk_{chunk_index}.npz"
     upload_file_to_gcs(BUCKET_NAME, local_path, gcs_blob_path)
     
-    # 4. Clean up the local file immediately after upload
-    os.remove(local_path)
-    
-    print(f"[Core {core_id}] Chunk {chunk_index} upload complete.", flush=True)
+    # 4. Cleanup
+    if os.path.exists(local_path):
+        os.remove(local_path)
+        print(f"[Core {core_id}] Cleaned up local file: {local_path}", flush=True)
