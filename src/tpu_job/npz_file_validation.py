@@ -55,7 +55,7 @@ def validate_uploaded_chunk(core_id: int, chunk_index: int, expected_samples: in
             return False
         
         # 2. Shape Check (N, L, D) -> (N, 25, 768)
-        if cls_tokens.ndim != 3 or cls_tokens.shape[1] != 25 or cls_tokens.shape[2] != 768:
+        if cls_tokens.ndim != 3 or cls_tokens.shape[1] != 25 or cls_tokens.shape[2] != 1024:
             print(f"❌ VALIDATION FAILED: CLS token shape is incorrect: {cls_tokens.shape}. Expected (N, 25, 1024).")
             return False
 
