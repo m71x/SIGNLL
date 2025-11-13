@@ -13,8 +13,8 @@ except ImportError as e:
 
 # --- Configuration for Validation ---
 # You need to adjust these values to check the file you just uploaded from inference.py
-VALIDATION_CORE_ID = 10     # The TPU Core ID that saved the file (e.g., core_10)
-VALIDATION_CHUNK_INDEX = 1  # The chunk index of the file you want to validate (e.g., embeddings_chunk_1.npz)
+VALIDATION_CORE_ID = 0     # The TPU Core ID that saved the file (e.g., core_10)
+VALIDATION_CHUNK_INDEX = 0  # The chunk index of the file you want to validate (e.g., embeddings_chunk_1.npz)
 # N_SAMPLES_EXPECTED is the minimum number of samples you expect this chunk to have.
 N_SAMPLES_EXPECTED = 1000   
 

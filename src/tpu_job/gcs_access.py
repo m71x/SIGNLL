@@ -12,29 +12,54 @@ UPLOAD_PREFIX = "siebert-data/siebert-data-test"
 
 
 # --- Helper: Upload file to GCS ---
-def upload_file_to_gcs(bucket_name, local_path, gcs_blob_path):
+def upload_file_to_gcs(bucket_name, local_path, gcs_blob_path, max_retries=3):
     """
-    Uploads a file from local storage to a GCS blob.
+    Uploads a file from local storage to a GCS blob with retry logic and verification.
+    """
+    import time
     
-    Args:
-        bucket_name (str): The name of the GCS bucket.
-        local_path (str): The local path of the file to upload.
-        gcs_blob_path (str): The destination path/name in the bucket.
-        
-    Returns:
-        bool: True if upload was successful, False otherwise.
-    """
-    try:
-        # Note: GCS client is initialized inside the function for independence
-        client = storage.Client()
-        bucket = client.bucket(bucket_name)
-        blob = bucket.blob(gcs_blob_path)
-        blob.upload_from_filename(local_path)
-        print(f"✅ Uploaded: {local_path} → gs://{bucket_name}/{gcs_blob_path}", flush=True)
-        return True
-    except Exception as e:
-        print(f"❌ Upload failed for {local_path}: {e}", flush=True)
-        return False
+    for attempt in range(max_retries):
+        try:
+            # Get local file size for verification
+            local_size = os.path.getsize(local_path)
+            
+            client = storage.Client()
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(gcs_blob_path)
+            
+            # Upload with a timeout
+            blob.upload_from_filename(local_path, timeout=300)
+            
+            # CRITICAL: Reload and verify
+            blob.reload()
+            
+            # Verify size match
+            if blob.size != local_size:
+                print(f"❌ Attempt {attempt+1}: Size mismatch! Local: {local_size}, GCS: {blob.size}", flush=True)
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                    continue
+                return False
+            
+            # Verify blob exists and is readable
+            if not blob.exists():
+                print(f"❌ Attempt {attempt+1}: Blob does not exist after upload!", flush=True)
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                return False
+                
+            print(f"✅ Uploaded: {local_path} → gs://{bucket_name}/{gcs_blob_path} ({blob.size} bytes)", flush=True)
+            return True
+            
+        except Exception as e:
+            print(f"❌ Attempt {attempt+1} failed for {local_path}: {e}", flush=True)
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff
+            else:
+                return False
+    
+    return False
 
 
 # --- Helper: Download file from GCS ---

@@ -160,29 +160,27 @@ def write_and_upload_chunk(core_id, accumulated_all_layer_cls_tokens, accumulate
     print(f"[Core {core_id}] 🔥 I/O THRESHOLD REACHED. Writing chunk {chunk_index}... (Target: {IO_ACCUMULATION_THRESHOLD})", flush=True)
 
     # 1. Concatenate all accumulated arrays
-    # This concatenates the 3D arrays along the batch dimension (axis=0)
     all_cls_tokens = np.concatenate(accumulated_all_layer_cls_tokens, axis=0)
-    # The classification indices are 1D arrays
     all_classifications = np.concatenate(accumulated_classifications, axis=0)
 
-    # 2. Save locally using NumPy
+    # 2. Save locally using NumPy with explicit file handling
     local_path = os.path.join(local_dir, f"embeddings_chunk_{chunk_index}.npz")
     
     try:
-        # Save the 3D CLS token vectors and the final classifications together.
-        # Note: The classification array is already uint8 from run_inference_and_store_cls_tokens.
-        np.savez_compressed(local_path, 
-                            # Key 1: 3D CLS data (N_samples, N_layers, N_dim)
-                            all_layer_cls_tokens=all_cls_tokens, 
-                            # Key 2: 1D Classification Index (0 or 1)
-                            classifications=all_classifications) # No extra cast needed here
+        # Use context manager to ensure file is properly closed
+        with open(local_path, 'wb') as f:
+            np.savez_compressed(f, 
+                                all_layer_cls_tokens=all_cls_tokens, 
+                                classifications=all_classifications)
+        # File is now guaranteed to be closed and flushed
+        
     except Exception as e:
         print(f"[Core {core_id}] ❌ CRITICAL: Failed to save local NPZ file! Error: {e}", flush=True)
-        return # Stop processing this chunk if local save failed
+        return
 
     print(f"[Core {core_id}] Saved {all_cls_tokens.shape[0]} samples locally to {local_path}. Data shape: {all_cls_tokens.shape}", flush=True)
 
-    # 3. Upload file to GCS
+    # 3. Upload file to GCS (file is now fully written)
     gcs_blob_path = f"{UPLOAD_PREFIX}/core_{core_id}/embeddings_chunk_{chunk_index}.npz"
     
     upload_success = False
