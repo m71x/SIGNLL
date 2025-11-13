@@ -1,6 +1,3 @@
-#handles downloading training data
-#have a function that downloads a sample chunk npz data and verifies things like the dimension of the CLS token and the CLS token and the classification can be seen
-
 import numpy as np
 import os
 import io
@@ -60,16 +57,27 @@ def load_npz_from_gcs(core_id: int, filename: str) -> dict:
             return None
 
         # Create an in-memory binary stream (BytesIO)
-        # This prevents writing the large file to disk.
         buffer = io.BytesIO()
         blob.download_to_file(buffer)
         buffer.seek(0) # Rewind the buffer to the beginning for NumPy to read it
         
-        print("✅ GCS Download successful. Data loaded into memory buffer.")
+        # --- NEW: Check buffer size immediately after download ---
+        buffer_size = buffer.getbuffer().nbytes
+        if buffer_size == 0:
+            print(f"❌ CRITICAL ERROR: Downloaded file is EMPTY (0 bytes).")
+            print("  Root Cause: Check your 'inference.py' logic to ensure data is correctly written/uploaded.")
+            return None
+        
+        # A valid NPZ is at least a few hundred bytes.
+        if buffer_size < 1024:
+             print(f"⚠️ WARNING: Downloaded file size is suspiciously small ({buffer_size} bytes).")
+        
+        print(f"✅ GCS Download successful. Data loaded into memory buffer ({buffer_size} bytes).")
+
 
         # 3. Load NPZ data from the memory buffer
-        # The 'allow_pickle=False' is a security precaution for loading external data.
-        # The data is expected to be {'all_layer_cls_tokens': ..., 'classifications': ...}
+        # This is where the original "File is not a zip file" error occurred.
+        # It's now handled by the try-except block below.
         npz_data = np.load(buffer, allow_pickle=False)
 
         # 4. Inspect and return the content
@@ -91,8 +99,17 @@ def load_npz_from_gcs(core_id: int, filename: str) -> dict:
 
         return dict(npz_data)
 
+    except KeyError as e:
+        print(f"\nFATAL ERROR: Missing expected key {e} in NPZ file. Check if 'all_layer_cls_tokens' or 'classifications' were saved correctly.")
+        return None
+    except OSError as e:
+        # This specifically catches the "File is not a zip file" error
+        print(f"\nFATAL ERROR processing NPZ file: {e}")
+        print("  Root Cause: The file content is likely corrupted or not a valid NPZ/ZIP format.")
+        print("  Action: Verify the output of `np.savez_compressed` in your `inference.py`.")
+        return None
     except Exception as e:
-        print(f"\nFATAL ERROR processing GCS or NPZ file: {e}")
+        print(f"\nFATAL ERROR during GCS communication: {e}")
         return None
 
 
