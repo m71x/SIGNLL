@@ -309,7 +309,7 @@ def main_worker(index, local_base):
     if os.path.exists(local_shard_path):
         os.remove(local_shard_path)
         log(core_id, f"Cleaned up local shard file: {local_shard_path}")
-
+    
     # *** TEST MODE: Summary ***
     if TEST_MODE_SINGLE_CHUNK:
         if chunk_uploaded:

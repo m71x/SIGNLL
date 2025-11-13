@@ -164,7 +164,10 @@ def write_and_upload_chunk(core_id, accumulated_all_layer_cls_tokens, accumulate
     all_classifications = np.concatenate(accumulated_classifications, axis=0)
 
     # 2. Save locally using NumPy with explicit file handling
-    local_path = os.path.join(local_dir, f"embeddings_chunk_{chunk_index}.npz")
+    core_local_dir = os.path.join(local_dir, f"core_{core_id}")
+    os.makedirs(core_local_dir, exist_ok=True)
+    
+    local_path = os.path.join(core_local_dir, f"embeddings_chunk_{chunk_index}.npz")
     
     try:
         # Use context manager to ensure file is properly closed
