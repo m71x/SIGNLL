@@ -131,7 +131,9 @@ def run_inference_and_store_cls_tokens(model, tokenizer, texts, device):
         # 4. Optimized Processing: Classification Indices
         # Use torch.argmax on the TPU, then transfer the result once.
         classifications_tensor = torch.argmax(logits, dim=1)
-        classifications_np = classifications_tensor.cpu().numpy()
+        
+        # *** BEST PRACTICE IMPROVEMENT: Cast to uint8 here, not after concatenation ***
+        classifications_np = classifications_tensor.cpu().numpy().astype(np.uint8)
 
     # Use xm.mark_step() to synchronize execution on the TPU core
     xm.torch_xla.sync()
@@ -166,20 +168,35 @@ def write_and_upload_chunk(core_id, accumulated_all_layer_cls_tokens, accumulate
     # 2. Save locally using NumPy
     local_path = os.path.join(local_dir, f"embeddings_chunk_{chunk_index}.npz")
     
-    # Save the 3D CLS token vectors and the final classifications together.
-    np.savez_compressed(local_path, 
-                        # Key 1: 3D CLS data (N_samples, N_layers, N_dim)
-                        all_layer_cls_tokens=all_cls_tokens, 
-                        # Key 2: 1D Classification Index (0 or 1)
-                        classifications=all_classifications.astype(np.uint8))
-    
+    try:
+        # Save the 3D CLS token vectors and the final classifications together.
+        # Note: The classification array is already uint8 from run_inference_and_store_cls_tokens.
+        np.savez_compressed(local_path, 
+                            # Key 1: 3D CLS data (N_samples, N_layers, N_dim)
+                            all_layer_cls_tokens=all_cls_tokens, 
+                            # Key 2: 1D Classification Index (0 or 1)
+                            classifications=all_classifications) # No extra cast needed here
+    except Exception as e:
+        print(f"[Core {core_id}] ❌ CRITICAL: Failed to save local NPZ file! Error: {e}", flush=True)
+        return # Stop processing this chunk if local save failed
+
     print(f"[Core {core_id}] Saved {all_cls_tokens.shape[0]} samples locally to {local_path}. Data shape: {all_cls_tokens.shape}", flush=True)
 
     # 3. Upload file to GCS
     gcs_blob_path = f"{UPLOAD_PREFIX}/core_{core_id}/embeddings_chunk_{chunk_index}.npz"
-    upload_file_to_gcs(BUCKET_NAME, local_path, gcs_blob_path)
     
-    # 4. Cleanup
-    if os.path.exists(local_path):
-        os.remove(local_path)
-        print(f"[Core {core_id}] Cleaned up local file: {local_path}", flush=True)
+    upload_success = False
+    try:
+        # CRITICAL FIX: Ensure upload_file_to_gcs is wrapped and returns success status
+        upload_success = upload_file_to_gcs(BUCKET_NAME, local_path, gcs_blob_path)
+    except Exception as e:
+        print(f"[Core {core_id}] ❌ CRITICAL: GCS upload failed for {gcs_blob_path}. Error: {e}", flush=True)
+        upload_success = False # Redundant, but safe
+
+    # 4. Conditional Cleanup (Only clean up if the upload succeeded)
+    if upload_success:
+        if os.path.exists(local_path):
+            os.remove(local_path)
+            print(f"[Core {core_id}] ✅ Cleaned up local file: {local_path}", flush=True)
+    else:
+        print(f"[Core {core_id}] ⚠️ WARNING: Upload failed. Local file {local_path} NOT cleaned up. Manual review needed.", flush=True)
