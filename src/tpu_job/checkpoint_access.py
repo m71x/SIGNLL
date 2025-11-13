@@ -151,7 +151,10 @@ def reset_checkpoint_samples(core_id, local_dir="/tmp/checkpoints", gcs_prefix=D
         print(f"[Core {core_id_log}] ❌ Reset FAILED: Could not load or initialize checkpoint data for Core {core_id}.", flush=True)
         return False
 
-    original_samples = progress.get("samples_seen", "N/A")
+    if isinstance(progress, int):
+        original_samples = progress
+    else:
+        original_samples = progress.get("samples_seen", "N/A")
     
     # 2. Modify / FORCE RESET
     progress["samples_seen"] = 0
