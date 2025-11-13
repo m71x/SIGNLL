@@ -173,6 +173,9 @@ def write_and_upload_chunk(core_id, accumulated_all_layer_cls_tokens, accumulate
                                 all_layer_cls_tokens=all_cls_tokens, 
                                 classifications=all_classifications)
         # File is now guaranteed to be closed and flushed
+        import subprocess
+        subprocess.run(['sync'], check=False)  # Force filesystem flush
+        time.sleep(0.5)  # Brief pause to ensure OS buffers are flushed
         
     except Exception as e:
         print(f"[Core {core_id}] ❌ CRITICAL: Failed to save local NPZ file! Error: {e}", flush=True)

@@ -20,8 +20,14 @@ def upload_file_to_gcs(bucket_name, local_path, gcs_blob_path, max_retries=3):
     
     for attempt in range(max_retries):
         try:
+            # CRITICAL: Check if file still exists before retry
+            if not os.path.exists(local_path):
+                print(f"❌ Attempt {attempt+1}: Local file no longer exists: {local_path}", flush=True)
+                return False
+            
             # Get local file size for verification
             local_size = os.path.getsize(local_path)
+            print(f"🔄 Attempt {attempt+1}: Uploading {local_size:,} bytes from {local_path}", flush=True)
             
             client = storage.Client()
             bucket = client.bucket(bucket_name)
@@ -37,7 +43,8 @@ def upload_file_to_gcs(bucket_name, local_path, gcs_blob_path, max_retries=3):
             if blob.size != local_size:
                 print(f"❌ Attempt {attempt+1}: Size mismatch! Local: {local_size}, GCS: {blob.size}", flush=True)
                 if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
+                    print(f"⏳ Waiting {2**attempt} seconds before retry...", flush=True)
+                    time.sleep(2 ** attempt)
                     continue
                 return False
             
@@ -45,17 +52,27 @@ def upload_file_to_gcs(bucket_name, local_path, gcs_blob_path, max_retries=3):
             if not blob.exists():
                 print(f"❌ Attempt {attempt+1}: Blob does not exist after upload!", flush=True)
                 if attempt < max_retries - 1:
+                    print(f"⏳ Waiting {2**attempt} seconds before retry...", flush=True)
                     time.sleep(2 ** attempt)
                     continue
                 return False
                 
-            print(f"✅ Uploaded: {local_path} → gs://{bucket_name}/{gcs_blob_path} ({blob.size} bytes)", flush=True)
+            print(f"✅ Uploaded & Verified: {local_path} → gs://{bucket_name}/{gcs_blob_path} ({blob.size:,} bytes)", flush=True)
             return True
             
         except Exception as e:
             print(f"❌ Attempt {attempt+1} failed for {local_path}: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # Exponential backoff
+                # Check if file still exists before retrying
+                if os.path.exists(local_path):
+                    print(f"⏳ File still exists. Waiting {2**attempt} seconds before retry...", flush=True)
+                    time.sleep(2 ** attempt)
+                else:
+                    print(f"❌ File disappeared! Cannot retry.", flush=True)
+                    return False
             else:
                 return False
     
