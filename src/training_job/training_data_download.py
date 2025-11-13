@@ -21,7 +21,6 @@ except ImportError:
     sys.exit(1)
 except Exception as e:
     print(f"ERROR: Failed to initialize Google Cloud Storage client: {e}")
-    # In a real pipeline, you might want to retry initialization or handle specific auth errors.
     sys.exit(1)
 
 
@@ -66,7 +65,6 @@ def load_npz_from_gcs(core_id: int, filename: str) -> dict:
 
         if buffer_size == 0:
             print(f"❌ CRITICAL ERROR: Downloaded file is EMPTY (0 bytes).")
-            print("  Action: Check 'inference.py' upload step for errors.")
             return None
         
         if buffer_size < 1024:
@@ -74,21 +72,16 @@ def load_npz_from_gcs(core_id: int, filename: str) -> dict:
 
 
         # 3. Load NPZ data from the memory buffer
-        # This is the line that throws the error.
         npz_data = np.load(buffer, allow_pickle=False)
 
         # 4. Inspect and return the content
-        
-        # Keys check
         print(f"\n--- NPZ Content Check (Keys) ---")
         print(f"Keys found: {list(npz_data.keys())}")
         
-        # CLS Tokens data
         cls_tokens = npz_data['all_layer_cls_tokens']
-        print(f"\n'all_layer_cls_tokens' shape: {cls_tokens.shape}, Dtype: {cls_tokens.dtype}")
-        
-        # Classification data
         classifications = npz_data['classifications']
+        
+        print(f"\n'all_layer_cls_tokens' shape: {cls_tokens.shape}, Dtype: {cls_tokens.dtype}")
         print(f"'classifications' shape: {classifications.shape}, Dtype: {classifications.dtype}")
         
         if cls_tokens.shape[0] != classifications.shape[0]:
@@ -98,42 +91,103 @@ def load_npz_from_gcs(core_id: int, filename: str) -> dict:
 
     except KeyError as e:
         print(f"\nFATAL ERROR: Missing expected key {e} in NPZ file.")
-        print("  Action: Confirm keys 'all_layer_cls_tokens' and 'classifications' were used in np.savez_compressed.")
         return None
     except OSError as e:
-        # This catches the 'File is not a zip file' error from np.load
         print(f"\nFATAL ERROR processing NPZ file: {e}")
-        print("  Root Cause: File content is corrupted or malformed (not a valid NPZ/ZIP structure).")
-        print("  *** NEXT STEP: Local Test Required ***")
-        print("  Action: Run `inference.py` locally and check if the *locally saved* .npz file can be loaded.")
-        print("          If the local file loads, the issue is with the GCS upload/download.")
         return None
     except Exception as e:
         print(f"\nFATAL ERROR during GCS communication or other unexpected issue: {e}")
         return None
 
+# --- NEW FUNCTION FOR TRAINING DATA PREP ---
+
+def training_data_download(core_id: int, filename: str, max_entries: int) -> dict:
+    """
+    Downloads NPZ data from GCS, selects the first N entries (for speed), 
+    and then shuffles the data before returning it.
+
+    Args:
+        core_id: The TPU core index.
+        filename: The name of the NPZ file.
+        max_entries: The maximum number of entries to return.
+
+    Returns:
+        A dictionary containing the shuffled and sliced NumPy arrays, or None on failure.
+    """
+    # 1. Load the data
+    data = load_npz_from_gcs(core_id, filename)
+    if data is None:
+        return None
+
+    cls_tokens = data['all_layer_cls_tokens']
+    classifications = data['classifications']
+    
+    total_samples = cls_tokens.shape[0]
+
+    # 2. Determine the slice size for speed/testing
+    N = min(total_samples, max_entries)
+    
+    print(f"\n--- Data Preparation ---")
+    print(f"Total samples found: {total_samples}")
+    print(f"Samples selected (N): {N} (max_entries={max_entries})")
+
+    if N == 0:
+        print("❌ Data slice resulted in 0 samples.")
+        return None
+    
+    # 3. Create a shuffle index (0 to N-1)
+    # We only create indices up to N, which performs the slice implicitly
+    indices = np.arange(total_samples)
+    
+    # Create a random permutation of all available indices
+    np.random.shuffle(indices)
+    
+    # Select the first N shuffled indices to achieve both shuffle and slice
+    # This is more efficient than slicing first, then shuffling.
+    shuffled_and_sliced_indices = indices[:N]
+
+    # 4. Apply the shuffle and slice to the arrays
+    shuffled_cls_tokens = cls_tokens[shuffled_and_sliced_indices]
+    shuffled_classifications = classifications[shuffled_and_sliced_indices]
+    
+    print(f"✅ Data successfully shuffled and sliced. Final samples: {shuffled_cls_tokens.shape[0]}")
+    
+    # 5. Return the shuffled data
+    return {
+        'all_layer_cls_tokens': shuffled_cls_tokens,
+        'classifications': shuffled_classifications
+    }
+
 
 if __name__ == '__main__':
-    # --- Example Usage ---
+    # --- Example Usage for Training Data ---
     
-    # Choose a specific core and chunk to test (based on your folder structure)
+    # Configuration to test
     TEST_CORE_ID = 10
     TEST_CHUNK_FILENAME = "embeddings_chunk_1.npz"
+    # User-defined limit for the number of entries
+    SAMPLES_TO_LOAD = 19500 
 
-    data = load_npz_from_gcs(TEST_CORE_ID, TEST_CHUNK_FILENAME)
+    # Call the new function
+    training_data = training_data_download(
+        core_id=TEST_CORE_ID, 
+        filename=TEST_CHUNK_FILENAME, 
+        max_entries=SAMPLES_TO_LOAD
+    )
 
-    if data:
-        print("\n--- Summary of Loaded Data ---")
+    if training_data:
+        print("\n--- Summary of Prepared Training Data ---")
+        
         # Access the arrays by key
-        cls_tokens_array = data['all_layer_cls_tokens']
-        classifications_array = data['classifications']
+        cls_tokens_array = training_data['all_layer_cls_tokens']
+        classifications_array = training_data['classifications']
         
-        print(f"Total samples loaded: {cls_tokens_array.shape[0]}")
+        print(f"Total samples returned: {cls_tokens_array.shape[0]}")
         
-        # Display the first few classifications
-        print(f"First 10 classification indices: {classifications_array[:10]}")
+        # Check that the data is shuffled (first 10 classifications should be random)
+        print(f"First 10 classification indices (Shuffled): {classifications_array[:10]}")
         
         # Display summary stats for the embedding vectors
         print(f"Mean of first embedding vector: {cls_tokens_array[0, 0, :].mean():.4f}")
     else:
-        print("\nFailed to load data from GCS.")
+        print("\nFailed to load and prepare training data.")
