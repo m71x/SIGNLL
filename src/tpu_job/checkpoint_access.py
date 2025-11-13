@@ -138,34 +138,41 @@ def save_checkpoint(core_id, checkpoint_data, local_dir="/tmp/checkpoints", gcs_
 
 def reset_checkpoint_samples(core_id, local_dir="/tmp/checkpoints", gcs_prefix=DEFAULT_GCS_PREFIX, filename=DEFAULT_FILENAME):
     """
-    NEW FUNCTION: Downloads a checkpoint, sets 'samples_seen' to 0, 
-    updates the last reset time, and uploads the modified checkpoint.
+    Downloads a checkpoint (stored as an integer), resets its value to 0,
+    adds a timestamp for logging, and uploads the new value.
     """
     core_id_log = get_core_ordinal()
     print(f"[Core {core_id_log}] Attempting to RESET samples_seen for Checkpoint {core_id}...", flush=True)
 
-    # 1. Load existing checkpoint (or get default if it doesn't exist)
+    # 1. Load the existing checkpoint integer
     progress = load_checkpoint(core_id, local_dir, gcs_prefix, filename)
 
     if progress is None:
-        print(f"[Core {core_id_log}] ❌ Reset FAILED: Could not load or initialize checkpoint data for Core {core_id}.", flush=True)
+        print(f"[Core {core_id_log}] ❌ Reset FAILED: Could not load checkpoint for Core {core_id}.", flush=True)
         return False
 
-    if isinstance(progress, int):
-        original_samples = progress
-    else:
-        original_samples = progress.get("samples_seen", "N/A")
-    
-    # 2. Modify / FORCE RESET
-    progress["samples_seen"] = 0
-    progress["last_reset_time"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+    if not isinstance(progress, int):
+        print(f"[Core {core_id_log}] ⚠️ Unexpected checkpoint type {type(progress)}; attempting conversion.", flush=True)
+        try:
+            progress = int(progress)
+        except Exception:
+            print(f"[Core {core_id_log}] ❌ Failed to convert checkpoint to integer. Aborting reset.", flush=True)
+            return False
 
-    # 3. Save and upload the modified checkpoint
-    save_success = save_checkpoint(core_id, progress, local_dir, gcs_prefix, filename)
+    original_samples = progress
+
+    # 2. Reset the counter
+    new_progress = 0
+
+    # 3. Save and upload the updated checkpoint
+    save_success = save_checkpoint(core_id, new_progress, local_dir, gcs_prefix, filename)
 
     if save_success:
         print(f"[Core {core_id_log}] ✅ RESET SUCCESS for Core {core_id}. Samples forced from {original_samples} to 0.", flush=True)
     else:
         print(f"[Core {core_id_log}] ❌ Reset FAILED for Core {core_id}.", flush=True)
+
+    # (Optional) Log reset time to console only — no need to store in checkpoint file
+    print(f"[Core {core_id_log}] 🕓 Reset completed at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}", flush=True)
 
     return save_success
