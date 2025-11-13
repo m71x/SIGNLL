@@ -33,7 +33,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="tmux new -d -s signll 'cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/tpu_job/reset_checkpoints.py'"
+  --command="tmux new -d -s signll 'cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/tpu_job/main.py.py'"
 
 #run non-tmux job
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
