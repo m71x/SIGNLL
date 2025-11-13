@@ -12,17 +12,16 @@ BUCKET_NAME = "encoder-models-2"
 GCS_BASE_PREFIX = "siebert-data/siebert-actual-data" 
 
 # --- GCS Client Setup (IMPORTANT) ---
-# You need to uncomment and use the actual library here.
 try:
     from google.cloud import storage
     # Initialize the client. This typically handles authentication automatically
-    # based on the environment (e.g., service account key or Colab/GCE context).
     GCS_CLIENT = storage.Client()
 except ImportError:
     print("ERROR: 'google-cloud-storage' library not found. Please install it.")
     sys.exit(1)
 except Exception as e:
     print(f"ERROR: Failed to initialize Google Cloud Storage client: {e}")
+    # In a real pipeline, you might want to retry initialization or handle specific auth errors.
     sys.exit(1)
 
 
@@ -61,23 +60,21 @@ def load_npz_from_gcs(core_id: int, filename: str) -> dict:
         blob.download_to_file(buffer)
         buffer.seek(0) # Rewind the buffer to the beginning for NumPy to read it
         
-        # --- NEW: Check buffer size immediately after download ---
+        # --- CRITICAL CHECK: Buffer size and header ---
         buffer_size = buffer.getbuffer().nbytes
+        print(f"✅ GCS Download successful. Data loaded into memory buffer ({buffer_size} bytes).")
+
         if buffer_size == 0:
             print(f"❌ CRITICAL ERROR: Downloaded file is EMPTY (0 bytes).")
-            print("  Root Cause: Check your 'inference.py' logic to ensure data is correctly written/uploaded.")
+            print("  Action: Check 'inference.py' upload step for errors.")
             return None
         
-        # A valid NPZ is at least a few hundred bytes.
         if buffer_size < 1024:
-             print(f"⚠️ WARNING: Downloaded file size is suspiciously small ({buffer_size} bytes).")
-        
-        print(f"✅ GCS Download successful. Data loaded into memory buffer ({buffer_size} bytes).")
+             print(f"⚠️ WARNING: Downloaded file size is suspiciously small.")
 
 
         # 3. Load NPZ data from the memory buffer
-        # This is where the original "File is not a zip file" error occurred.
-        # It's now handled by the try-except block below.
+        # This is the line that throws the error.
         npz_data = np.load(buffer, allow_pickle=False)
 
         # 4. Inspect and return the content
@@ -100,16 +97,19 @@ def load_npz_from_gcs(core_id: int, filename: str) -> dict:
         return dict(npz_data)
 
     except KeyError as e:
-        print(f"\nFATAL ERROR: Missing expected key {e} in NPZ file. Check if 'all_layer_cls_tokens' or 'classifications' were saved correctly.")
+        print(f"\nFATAL ERROR: Missing expected key {e} in NPZ file.")
+        print("  Action: Confirm keys 'all_layer_cls_tokens' and 'classifications' were used in np.savez_compressed.")
         return None
     except OSError as e:
-        # This specifically catches the "File is not a zip file" error
+        # This catches the 'File is not a zip file' error from np.load
         print(f"\nFATAL ERROR processing NPZ file: {e}")
-        print("  Root Cause: The file content is likely corrupted or not a valid NPZ/ZIP format.")
-        print("  Action: Verify the output of `np.savez_compressed` in your `inference.py`.")
+        print("  Root Cause: File content is corrupted or malformed (not a valid NPZ/ZIP structure).")
+        print("  *** NEXT STEP: Local Test Required ***")
+        print("  Action: Run `inference.py` locally and check if the *locally saved* .npz file can be loaded.")
+        print("          If the local file loads, the issue is with the GCS upload/download.")
         return None
     except Exception as e:
-        print(f"\nFATAL ERROR during GCS communication: {e}")
+        print(f"\nFATAL ERROR during GCS communication or other unexpected issue: {e}")
         return None
 
 
@@ -118,7 +118,7 @@ if __name__ == '__main__':
     
     # Choose a specific core and chunk to test (based on your folder structure)
     TEST_CORE_ID = 10
-    TEST_CHUNK_FILENAME = "embeddings_chunk_1.npz" # Use a small index for common chunks
+    TEST_CHUNK_FILENAME = "embeddings_chunk_1.npz"
 
     data = load_npz_from_gcs(TEST_CORE_ID, TEST_CHUNK_FILENAME)
 
