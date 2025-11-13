@@ -39,7 +39,7 @@ INFERENCE_BATCH_SIZE = inference.INFERENCE_BATCH_SIZE
 IO_ACCUMULATION_THRESHOLD = inference.IO_ACCUMULATION_THRESHOLD
 
 # *** TEST MODE: Only process one chunk per core ***
-TEST_MODE_SINGLE_CHUNK = True  # Set to False to run full processing
+TEST_MODE_SINGLE_CHUNK = False  # Set to False to run full processing
 
 # Expected number of hidden states (layers) for CLS token extraction
 # (e.g., 24 layers + 1 embedding layer = 25 states is common for BERT-large)
@@ -309,7 +309,7 @@ def main_worker(index, local_base):
     if os.path.exists(local_shard_path):
         os.remove(local_shard_path)
         log(core_id, f"Cleaned up local shard file: {local_shard_path}")
-    
+
     # *** TEST MODE: Summary ***
     if TEST_MODE_SINGLE_CHUNK:
         if chunk_uploaded:
