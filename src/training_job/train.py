@@ -70,7 +70,7 @@ def train_loop(rank, flags):
     batch_size = flags["batch_size"]
     
     # Calculate number of batches per epoch
-    num_batches = (num_samples + batch_size - 1) // batch_size
+    num_batches = (num_samples) // batch_size
     
     if rank == 0:
         print(f"[Core {rank}] Training config: {num_epochs} epochs, {num_batches} batches/epoch, batch_size={batch_size}")
