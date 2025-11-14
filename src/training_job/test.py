@@ -184,8 +184,7 @@ if __name__ == "__main__":
     # Launch the test function on multiple cores
     xmp.spawn(
         test_controller_mp_fn, 
-        args=(TEST_CONFIG,), 
-        nprocs=TEST_CONFIG["num_cores_to_test"]
+        args=(TEST_CONFIG,)
     )
     
     xm.master_print("\n--- All Architectural Verification Tests Completed Successfully! ---")
