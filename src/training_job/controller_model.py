@@ -64,13 +64,14 @@ class Controller(nn.Module):
             class_logits: [B, L, num_classes]
             z: [B, L, d_ctrl]
         """
+        teacher_cls = teacher_cls[:, 1:25, :]   # now shape becomes [B, 24, D]
         B, L, D = teacher_cls.shape
         xm.master_print(f"[DEBUG] forward() received shape: B={B}, L={L}, D={D}")
         xm.master_print(f"[DEBUG] Model expects L={self.L}, D={self.d_teacher}")
 
         assert L == self.L and D == self.d_teacher, \
             f"Shape mismatch! got (L={L}, D={D}) but model expects (L={self.L}, D={self.d_teacher})"
-        assert L == self.L and D == self.d_teacher
+        
         
         # 1. Controller Body Computation (Same as before)
         x = self.proj(teacher_cls)
