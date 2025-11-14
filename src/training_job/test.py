@@ -145,7 +145,7 @@ def test_inference_and_loss_step(model: Controller, teacher_cls: torch.Tensor, t
     # Convert local loss to a single-item tensor for all-reduce
     loss_local = torch.tensor([loss.item()], dtype=torch.float32, device=xm.torch_xla.device())
     loss_cls_local = torch.tensor([loss_cls.item()], dtype=torch.float32, device=xm.torch_xla.device())
-    loss_halt_local = torch.tensor([loss_halt.item()], dtype=torch.float32, device=xm.torch_xladevice())
+    loss_halt_local = torch.tensor([loss_halt.item()], dtype=torch.float32, device=xm.torch_xla.device())
 
     # All-reduce to get the sum of losses across all cores
     loss_global_sum = xm.all_reduce(xm.REDUCE_SUM, loss_local)
