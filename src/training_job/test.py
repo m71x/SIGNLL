@@ -86,6 +86,7 @@ def test_inference_and_loss_step(model: Controller, teacher_cls: torch.Tensor, t
     Runs inference and calculates a single loss step, addressing original test items #1 and #2.
     """
     rank = xm.get_ordinal()
+    #teacher_cls = teacher_cls[:, 1:25, :]   # now shape becomes [B, 24, D]
     B, L, D_teacher = teacher_cls.shape
     num_classes = config["num_classes"]
     lambda_target = config["halting_lambda_target"]
@@ -171,6 +172,7 @@ def test_controller_mp_fn(rank, config):
     """
     try:
         model, teacher_cls, teacher_label = load_data_and_model(rank, config)
+        teacher_cls = teacher_cls[:, 1:25, :]   # now shape becomes [B, 24, D]
         test_inference_and_loss_step(model, teacher_cls, teacher_label, config)
     except Exception as e:
         xm.master_print(f"FATAL ERROR on core {rank}: {e}")
