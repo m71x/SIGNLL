@@ -166,6 +166,73 @@ def test_inference_and_loss_step(model: Controller, teacher_cls: torch.Tensor, t
         xm.master_print(f"  Total Loss (L_total): {global_loss_mean:.6f}")
         xm.master_print("-" * 60)
 
+def test_update_step(model, teacher_cls, teacher_label, config):
+
+    rank = xm.get_ordinal()
+    device = xm.torch_xla.device()
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+    bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none")
+    lambda_target = config["halting_lambda_target"]
+
+    # ---------- Forward ----------
+    model.train()
+    halting_logits, class_logits, z = model(teacher_cls)
+
+    h = torch.sigmoid(halting_logits)
+    q = compute_q_from_h(h)
+
+    B, L, _ = teacher_cls.shape
+    labels = teacher_label.float().unsqueeze(1).expand(-1, L)
+    class_logits_positive = class_logits[:, :, 1]
+
+    ce = bce_loss_fn(class_logits_positive, labels)
+    loss_cls = (q * ce).sum(dim=1).mean()
+
+    depths = torch.arange(1, L + 1, device=device).unsqueeze(0)
+    loss_halt = lambda_target * ((depths * (1 - h)).sum(dim=1).mean())
+
+    loss = loss_cls + loss_halt
+
+    xm.master_print(f"[core {rank}] BEFORE update: loss = {loss.item():.6f}")
+
+    # ---------- All-reduce BEFORE update ----------
+    l_local = torch.tensor([loss.item()], device=device)
+    l_sum = xm.all_reduce(xm.REDUCE_SUM, l_local)
+    if rank == 0:
+        xm.master_print(f"[core 0] BEFORE update global_loss = {l_sum.item()/xm.xrt_world_size():.6f}")
+
+    # ---------- Backprop ----------
+    optimizer.zero_grad()
+    loss.backward()
+
+    # ---------- Optimizer step (sync gradients) ----------
+    xm.optimizer_step(optimizer)
+
+    # ---------- Recompute loss AFTER update ----------
+    with torch.no_grad():
+        halting_logits2, class_logits2, _ = model(teacher_cls)
+
+    h2 = torch.sigmoid(halting_logits2)
+    q2 = compute_q_from_h(h2)
+
+    ce2 = bce_loss_fn(class_logits2[:, :, 1], labels)
+    loss_after = (q2 * ce2).sum(dim=1).mean()
+
+    xm.master_print(f"[core {rank}] AFTER update: loss = {loss_after.item():.6f}")
+
+    # ---------- All-reduce AFTER update ----------
+    l2_local = torch.tensor([loss_after.item()], device=device)
+    l2_sum = xm.all_reduce(xm.REDUCE_SUM, l2_local)
+
+    if rank == 0:
+        xm.master_print(f"[core 0] AFTER update global_loss = {l2_sum.item()/xm.xrt_world_size():.6f}")
+
+        # Save checkpoint ONCE
+        xm.master_print("[core 0] Saving checkpoint (placeholder path)")
+        # torch.save(model.state_dict(), "/tmp/controller_checkpoint.pt")
+
 def test_controller_mp_fn(rank, config):
     """
     The main test function launched by xmp.spawn.
@@ -174,6 +241,7 @@ def test_controller_mp_fn(rank, config):
         model, teacher_cls, teacher_label = load_data_and_model(rank, config)
         teacher_cls = teacher_cls[:, 1:25, :]   # now shape becomes [B, 24, D]
         test_inference_and_loss_step(model, teacher_cls, teacher_label, config)
+        test_update_step(model, teacher_cls, teacher_label, config)
     except Exception as e:
         xm.master_print(f"FATAL ERROR on core {rank}: {e}")
         # Re-raise the exception to stop the test process
