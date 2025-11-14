@@ -155,6 +155,8 @@ def train_loop(rank, flags):
         depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
         halt_penalty = (depths * (1 - h)).sum(dim=1)
         progress = 0.0  # First epoch
+        #lambda_start should not start at 0, because that would set the whole loss_halt to zero. Start at a small number >= 0, then increase 
+        #to first learn the classification task, then worry about exiting early
         lambda_now = lambda_start
         loss_halt = lambda_now * halt_penalty.mean()
         
@@ -280,7 +282,7 @@ if __name__ == "__main__":
         "batch_size": 64,  # Smaller batch size for 19500 samples
         
         # Halting loss schedule
-        "lambda_start": 0.0,
+        "lambda_start": 0.01,
         "lambda_target": 0.01,
         
         # Training
