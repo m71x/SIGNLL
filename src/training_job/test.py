@@ -43,7 +43,7 @@ def load_data_and_model(rank: int, config: Dict[str, Any]) -> Tuple[Controller, 
     """
     Downloads data shard corresponding to the core rank and initializes the model.
     """
-    device = xm.xla_device()
+    device = xm.torch_xla.device()
     xm.master_print(f"[{rank}] Initializing on device: {device}")
     
     # 1. Load Data
@@ -62,6 +62,10 @@ def load_data_and_model(rank: int, config: Dict[str, Any]) -> Tuple[Controller, 
     # Convert NumPy arrays to PyTorch Tensors and move to XLA device
     teacher_cls = torch.from_numpy(data['all_layer_cls_tokens']).float().to(device)
     teacher_label = torch.from_numpy(data['classifications']).long().to(device)
+    xm.master_print(f"[{rank}] Loaded teacher_cls shape (numpy): {data['all_layer_cls_tokens'].shape}")
+    xm.master_print(f"[{rank}] Converted teacher_cls shape (torch): {teacher_cls.shape}")
+    xm.master_print(f"[{rank}] Expected (L, d_teacher) from config: ({config['L']}, {config['d_teacher']})")
+
 
     # 2. Initialize Model
     model = Controller(
