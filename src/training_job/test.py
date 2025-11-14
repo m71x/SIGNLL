@@ -131,7 +131,7 @@ def test_inference_and_loss_step(model: Controller, teacher_cls: torch.Tensor, t
     loss_cls = loss_cls_per_sample.mean()
     
     # 4. Halting Loss (Loss_halt) (Part of Test Item #2)
-    depths = torch.arange(1, L + 1, device=xm.torch_xla.device()).float().unsqueeze(0) # [1, L]
+    depths = torch.arange(1, L + 1, device=xm.xla_device()).float().unsqueeze(0) # [1, L]
     halt_penalty = (depths * (1 - h)).sum(dim=1) # [B]
     loss_halt = lambda_target * halt_penalty.mean()
     
@@ -143,9 +143,9 @@ def test_inference_and_loss_step(model: Controller, teacher_cls: torch.Tensor, t
     # for a global check (simulating global loss calculation).
     
     # Convert local loss to a single-item tensor for all-reduce
-    loss_local = torch.tensor([loss.item()], dtype=torch.float32, device=xm.torch_xla.device())
-    loss_cls_local = torch.tensor([loss_cls.item()], dtype=torch.float32, device=xm.torch_xla.device())
-    loss_halt_local = torch.tensor([loss_halt.item()], dtype=torch.float32, device=xm.torch_xla.device())
+    loss_local = torch.tensor([loss.item()], dtype=torch.float32, device=xm.xla_device())
+    loss_cls_local = torch.tensor([loss_cls.item()], dtype=torch.float32, device=xm.xla_device())
+    loss_halt_local = torch.tensor([loss_halt.item()], dtype=torch.float32, device=xm.xla_device())
 
     # All-reduce to get the sum of losses across all cores
     loss_global_sum = xm.all_reduce(xm.REDUCE_SUM, loss_local)
@@ -166,7 +166,6 @@ def test_inference_and_loss_step(model: Controller, teacher_cls: torch.Tensor, t
         xm.master_print(f"  Total Loss (L_total): {global_loss_mean:.6f}")
         xm.master_print("-" * 60)
 
-
 def test_controller_mp_fn(rank, config):
     """
     The main test function launched by xmp.spawn.
@@ -175,7 +174,6 @@ def test_controller_mp_fn(rank, config):
         model, teacher_cls, teacher_label = load_data_and_model(rank, config)
         teacher_cls = teacher_cls[:, 1:25, :]   # now shape becomes [B, 24, D]
         test_inference_and_loss_step(model, teacher_cls, teacher_label, config)
-        #test_update_step(model, teacher_cls, teacher_label, config)
     except Exception as e:
         xm.master_print(f"FATAL ERROR on core {rank}: {e}")
         # Re-raise the exception to stop the test process

@@ -62,6 +62,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --worker=all \
     --command="git clone https://github.com/pytorch/xla.git"
 
+
 #install transformers on all workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
