@@ -92,58 +92,59 @@ def train_loop(rank, flags):
         
         model.train()
         
-        
+        for batch_idx in range(num_batches):
+            global_step += 1
             
-        # Get batch slice
-        start_idx = 1 * batch_size
-        end_idx = min(start_idx + batch_size, num_samples)
+            # Get batch slice
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, num_samples)
             
-        teacher_cls = teacher_cls_full[start_idx:end_idx]
-        teacher_label = teacher_label_full[start_idx:end_idx]
+            teacher_cls = teacher_cls_full[start_idx:end_idx]
+            teacher_label = teacher_label_full[start_idx:end_idx]
             
-        # Forward pass
-        halting_logits, class_logits, _ = model(teacher_cls)
-        print(halting_logits)
-        h = torch.sigmoid(halting_logits)
-        q = compute_q_from_h(h)
+            # Forward pass
+            halting_logits, class_logits, _ = model(teacher_cls)
+            print(halting_logits)
+            h = torch.sigmoid(halting_logits)
+            q = compute_q_from_h(h)
             
-        # Classification loss
-        B_actual = teacher_cls.shape[0]
-        labels = teacher_label.float().unsqueeze(1).expand(-1, L)
+            # Classification loss
+            B_actual = teacher_cls.shape[0]
+            labels = teacher_label.float().unsqueeze(1).expand(-1, L)
             
-        # Handle binary classification (take positive class logit)
-        if class_logits.size(-1) == 2:
-            class_logits_positive = class_logits[:, :, 1]
-        else:
-            class_logits_positive = class_logits.squeeze(-1)
+            # Handle binary classification (take positive class logit)
+            if class_logits.size(-1) == 2:
+                class_logits_positive = class_logits[:, :, 1]
+            else:
+                class_logits_positive = class_logits.squeeze(-1)
             
-        ce_per_layer = bce_loss_fn(class_logits_positive, labels)
-        loss_cls = (q * ce_per_layer).sum(dim=1).mean()
+            ce_per_layer = bce_loss_fn(class_logits_positive, labels)
+            loss_cls = (q * ce_per_layer).sum(dim=1).mean()
             
-        # Halting loss with linear warmup
-        depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
-        halt_penalty = (depths * (1 - h)).sum(dim=1)
-        progress = min(1.0, epoch / max(1.0, num_epochs - 1))
-        lambda_now = lambda_start + (lambda_target - lambda_start) * progress
-        loss_halt = lambda_now * halt_penalty.mean()
+            # Halting loss with linear warmup
+            depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
+            halt_penalty = (depths * (1 - h)).sum(dim=1)
+            progress = min(1.0, epoch / max(1.0, num_epochs - 1))
+            lambda_now = lambda_start + (lambda_target - lambda_start) * progress
+            loss_halt = lambda_now * halt_penalty.mean()
             
-        # Total loss
-        loss = loss_cls + loss_halt
+            # Total loss
+            loss = loss_cls + loss_halt
             
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        xm.optimizer_step(optimizer)
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            xm.optimizer_step(optimizer)
             
-        # Log every N steps (avoid .item() calls inside tight loop)
-        if global_step % flags["log_interval"] == 0 and rank == 0:
-            # Only call .item() when we actually need to print
-            xm.master_print(
-                f"[Epoch {epoch+1}/{num_epochs}] [Step {global_step}] [Batch {1}/{num_batches}] "
-                f"loss={loss.item():.4f} cls={loss_cls.item():.4f} halt={loss_halt.item():.4f} "
-                f"mean_h={h.mean().item():.4f} lambda={lambda_now:.6f}"
-            )
+            # Log every N steps (avoid .item() calls inside tight loop)
+            if global_step % flags["log_interval"] == 0 and rank == 0:
+                # Only call .item() when we actually need to print
+                xm.master_print(
+                    f"[Epoch {epoch+1}/{num_epochs}] [Step {global_step}] [Batch {batch_idx+1}/{num_batches}] "
+                    f"loss={loss.item():.4f} cls={loss_cls.item():.4f} halt={loss_halt.item():.4f} "
+                    f"mean_h={h.mean().item():.4f} lambda={lambda_now:.6f}"
+                )
         
         # End of epoch logging - collect statistics across all batches
         if rank == 0:
