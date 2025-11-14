@@ -165,6 +165,7 @@ def test_inference_and_loss_step(model: Controller, teacher_cls: torch.Tensor, t
         xm.master_print(f"  Halting Loss (L_halt): {global_loss_halt_mean:.6f}")
         xm.master_print(f"  Total Loss (L_total): {global_loss_mean:.6f}")
         xm.master_print("-" * 60)
+
 """
 def test_update_step(model, teacher_cls, teacher_label, config):
 
