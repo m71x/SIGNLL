@@ -91,49 +91,148 @@ def train_loop(rank, flags):
         
         
             
-    # Get batch slice
-    start_idx = 1 * batch_size
-    end_idx = min(start_idx + batch_size, num_samples)
-            
-    teacher_cls = teacher_cls_full[start_idx:end_idx]
-    teacher_label = teacher_label_full[start_idx:end_idx]
-            
-    # Forward pass
-    halting_logits, class_logits, _ = model(teacher_cls)
-    print(halting_logits)
-    h = torch.sigmoid(halting_logits)
-    q = compute_q_from_h(h)
-            
-    # Classification loss
-    B_actual = teacher_cls.shape[0]
-    labels = teacher_label.float().unsqueeze(1).expand(-1, L)
-            
-    # Handle binary classification (take positive class logit)
-    if class_logits.size(-1) == 2:
-        class_logits_positive = class_logits[:, :, 1]
-    else:
-        class_logits_positive = class_logits.squeeze(-1)
-            
-    ce_per_layer = bce_loss_fn(class_logits_positive, labels)
-    loss_cls = (q * ce_per_layer).sum(dim=1).mean()
-            
-    # Halting loss with linear warmup
-    depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
-    halt_penalty = (depths * (1 - h)).sum(dim=1)
-    progress = min(1.0, 1 / max(1.0, num_epochs - 1))
-    lambda_now = lambda_start + (lambda_target - lambda_start) * progress
-    loss_halt = lambda_now * halt_penalty.mean()
+    for epoch in range(1):  # Just 1 epoch
+        print(f"[Core {rank}] Starting single test epoch...")
+    
+        model.train()
         
-    # Total loss
-    loss = loss_cls + loss_halt
-    print(loss)
+        # Just do ONE batch
+        batch_idx = 0
+        global_step = 1
+        
+        # Get first batch
+        start_idx = 0
+        end_idx = min(batch_size, num_samples)
+        
+        print(f"[Core {rank}] Getting batch slice [{start_idx}:{end_idx}]")
+        teacher_cls = teacher_cls_full[start_idx:end_idx]
+        teacher_label = teacher_label_full[start_idx:end_idx]
+        
+        print(f"[Core {rank}] Batch shapes: cls={teacher_cls.shape}, label={teacher_label.shape}")
+        
+        # Forward pass
+        print(f"[Core {rank}] Starting forward pass...")
+        halting_logits, class_logits, _ = model(teacher_cls)
+        
+        print(f"[Core {rank}] Forward complete. Output shapes:")
+        print(f"  halting_logits: {halting_logits.shape}")
+        print(f"  class_logits: {class_logits.shape}")
+        
+        h = torch.sigmoid(halting_logits)
+        q = compute_q_from_h(h)
+        
+        print(f"[Core {rank}] Computed h and q")
+        
+        # Classification loss
+        B_actual = teacher_cls.shape[0]
+        labels = teacher_label.float().unsqueeze(1).expand(-1, L)
+        
+        # Handle binary classification (take positive class logit)
+        if class_logits.size(-1) == 2:
+            class_logits_positive = class_logits[:, :, 1]
+        else:
+            class_logits_positive = class_logits.squeeze(-1)
+        
+        print(f"[Core {rank}] Computing classification loss...")
+        ce_per_layer = bce_loss_fn(class_logits_positive, labels)
+        loss_cls = (q * ce_per_layer).sum(dim=1).mean()
+        
+        # Halting loss
+        print(f"[Core {rank}] Computing halting loss...")
+        depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
+        halt_penalty = (depths * (1 - h)).sum(dim=1)
+        progress = 0.0  # First epoch
+        lambda_now = lambda_start
+        loss_halt = lambda_now * halt_penalty.mean()
+        
+        # Total loss
+        loss = loss_cls + loss_halt
+        
+        print(f"[Core {rank}] Loss computed. About to do all_reduce...")
+        
+        # All-reduce losses BEFORE backward (to see initial state)
+        loss_sum_before = xm.all_reduce(xm.REDUCE_SUM, loss)
+        loss_cls_sum_before = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
+        loss_halt_sum_before = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
+        h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
+        
+        num_cores = xm.xrt_world_size()
+        
+        if rank == 0:
+            xm.master_print("=" * 80)
+            xm.master_print("BEFORE BACKWARD PASS")
+            xm.master_print("=" * 80)
+            xm.master_print(f"Global Loss (avg): {loss_sum_before / num_cores}")
+            xm.master_print(f"Global Cls Loss (avg): {loss_cls_sum_before / num_cores}")
+            xm.master_print(f"Global Halt Loss (avg): {loss_halt_sum_before / num_cores}")
+            xm.master_print(f"Global Mean h (avg): {h_mean / num_cores}")
+            xm.master_print(f"Lambda: {lambda_now}")
+            xm.master_print("=" * 80)
+        
+        print(f"[Core {rank}] Starting backward pass...")
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        
+        print(f"[Core {rank}] Backward complete. Clipping gradients...")
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        
+        print(f"[Core {rank}] Calling optimizer step...")
+        xm.optimizer_step(optimizer)
+        
+        print(f"[Core {rank}] Optimizer step complete. Computing loss AFTER update...")
+        
+        # Recompute loss AFTER update
+        with torch.no_grad():
+            halting_logits2, class_logits2, _ = model(teacher_cls)
+            h2 = torch.sigmoid(halting_logits2)
+            q2 = compute_q_from_h(h2)
             
-    # Backward pass
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    xm.optimizer_step(optimizer)
-    print("done")
+            labels2 = teacher_label.float().unsqueeze(1).expand(-1, L)
+            if class_logits2.size(-1) == 2:
+                class_logits_positive2 = class_logits2[:, :, 1]
+            else:
+                class_logits_positive2 = class_logits2.squeeze(-1)
+            
+            ce2 = bce_loss_fn(class_logits_positive2, labels2)
+            loss_cls2 = (q2 * ce2).sum(dim=1).mean()
+            
+            halt_penalty2 = (depths * (1 - h2)).sum(dim=1)
+            loss_halt2 = lambda_now * halt_penalty2.mean()
+            loss2 = loss_cls2 + loss_halt2
+        
+        print(f"[Core {rank}] Recomputed loss. Doing all_reduce AFTER update...")
+        
+        # All-reduce losses AFTER update
+        loss_sum_after = xm.all_reduce(xm.REDUCE_SUM, loss2)
+        loss_cls_sum_after = xm.all_reduce(xm.REDUCE_SUM, loss_cls2)
+        loss_halt_sum_after = xm.all_reduce(xm.REDUCE_SUM, loss_halt2)
+        h_mean_after = xm.all_reduce(xm.REDUCE_SUM, h2.mean())
+        
+        if rank == 0:
+            xm.master_print("=" * 80)
+            xm.master_print("AFTER BACKWARD PASS")
+            xm.master_print("=" * 80)
+            xm.master_print(f"Global Loss (avg): {loss_sum_after / num_cores}")
+            xm.master_print(f"Global Cls Loss (avg): {loss_cls_sum_after / num_cores}")
+            xm.master_print(f"Global Halt Loss (avg): {loss_halt_sum_after / num_cores}")
+            xm.master_print(f"Global Mean h (avg): {h_mean_after / num_cores}")
+            xm.master_print("=" * 80)
+            xm.master_print("LOSS CHANGE")
+            xm.master_print("=" * 80)
+            loss_delta = (loss_sum_after - loss_sum_before) / num_cores
+            xm.master_print(f"Delta Loss: {loss_delta}")
+            # Note: Can't do if/else on XLA tensors without .item(), just print the delta
+            xm.master_print("(Check if negative = loss decreased)")
+            xm.master_print("=" * 80)
+        
+        print(f"[Core {rank}] Single step test complete!")
+
+    # End after one step
+    if rank == 0:
+        xm.master_print("\n✅ SINGLE STEP TEST COMPLETED SUCCESSFULLY")
+        xm.master_print("If you see this message, the training loop is working correctly!")
             
 
 
