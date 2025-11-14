@@ -125,6 +125,7 @@ def train_loop(rank, flags):
         # Forward pass
         print(f"[Core {rank}] Starting forward pass...")
         halting_logits, class_logits, _ = model(teacher_cls)
+        print(f"[Core {rank}] halting_logits [{halting_logits}]")
         
         print(f"[Core {rank}] Forward complete. Output shapes:")
         print(f"  halting_logits: {halting_logits.shape}")
