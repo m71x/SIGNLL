@@ -31,8 +31,11 @@ def train_loop(rank, flags):
         raise RuntimeError(f"[Core {rank}] Failed to load training data")
     
     # Convert to torch tensors and move to XLA device
+    print(f"[Core {rank}] Converting to torch tensors...")
     teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float().to(device)
     teacher_label_full = torch.from_numpy(data['classifications']).long().to(device)
+    
+    print(f"[Core {rank}] Tensors moved to device")
     
     # Handle layer slicing if needed (remove layer 0 if data has 25 layers)
     if teacher_cls_full.shape[1] == 25:
@@ -42,10 +45,11 @@ def train_loop(rank, flags):
     
     num_samples = teacher_cls_full.shape[0]
     
+    print(f"[Core {rank}] Data shape verified: {num_samples} samples")
+    
     if rank == 0:
-        print(f"[Core {rank}] Data loaded: {num_samples} samples")
-        print(f"[Core {rank}] CLS tokens shape: {teacher_cls_full.shape}")
-        print(f"[Core {rank}] Labels shape: {teacher_label_full.shape}")
+        xm.master_print(f"CLS tokens shape: {teacher_cls_full.shape}")
+        xm.master_print(f"Labels shape: {teacher_label_full.shape}")
     
     # --- Initialize Model ---
     L = 24
@@ -132,51 +136,20 @@ def train_loop(rank, flags):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             xm.optimizer_step(optimizer)
             
-            # Accumulate epoch statistics
-            epoch_loss += loss.item()
-            epoch_cls_loss += loss_cls.item()
-            epoch_halt_loss += loss_halt.item()
-            
-            # Log every N steps
+            # Log every N steps (avoid .item() calls inside tight loop)
             if global_step % flags["log_interval"] == 0 and rank == 0:
-                # Calculate accuracy on this batch
-                with torch.no_grad():
-                    # Get predicted class (argmax over exit points weighted by q)
-                    if class_logits.size(-1) == 2:
-                        # Binary classification
-                        probs = torch.softmax(class_logits, dim=-1)  # [B, L, 2]
-                        weighted_probs = (q.unsqueeze(-1) * probs).sum(dim=1)  # [B, 2]
-                        preds = weighted_probs.argmax(dim=-1)
-                    else:
-                        preds = (class_logits.squeeze(-1) > 0).long()
-                    
-                    acc = (preds == teacher_label).float().mean().item()
-                    mean_depth = (q * depths).sum(dim=1).mean().item()
-                
+                # Only call .item() when we actually need to print
                 xm.master_print(
                     f"[Epoch {epoch+1}/{num_epochs}] [Step {global_step}] [Batch {batch_idx+1}/{num_batches}] "
                     f"loss={loss.item():.4f} cls={loss_cls.item():.4f} halt={loss_halt.item():.4f} "
-                    f"acc={acc:.4f} mean_h={h.mean().item():.4f} mean_depth={mean_depth:.2f} lambda={lambda_now:.6f}"
+                    f"mean_h={h.mean().item():.4f} lambda={lambda_now:.6f}"
                 )
         
-        # End of epoch logging
-        avg_loss = epoch_loss / num_batches
-        avg_cls_loss = epoch_cls_loss / num_batches
-        avg_halt_loss = epoch_halt_loss / num_batches
-        
-        # Global reduce for multi-core statistics
-        loss_tensor = torch.tensor([avg_loss, avg_cls_loss, avg_halt_loss], device=device)
-        loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss_tensor)
-        num_cores = xm.xrt_world_size()
-        global_avg_loss, global_avg_cls, global_avg_halt = (loss_sum / num_cores).tolist()
-        
+        # End of epoch logging - collect statistics across all batches
         if rank == 0:
             elapsed = time.time() - start_time
             xm.master_print("-" * 80)
             xm.master_print(f"EPOCH {epoch+1}/{num_epochs} COMPLETED")
-            xm.master_print(f"  Global Avg Loss: {global_avg_loss:.4f}")
-            xm.master_print(f"  Global Avg Cls Loss: {global_avg_cls:.4f}")
-            xm.master_print(f"  Global Avg Halt Loss: {global_avg_halt:.4f}")
             xm.master_print(f"  Elapsed Time: {elapsed:.1f}s")
             xm.master_print("-" * 80)
         
@@ -187,7 +160,6 @@ def train_loop(rank, flags):
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': global_avg_loss,
             }, checkpoint_path)
             xm.master_print(f"✅ Checkpoint saved: {checkpoint_path}")
     
