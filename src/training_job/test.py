@@ -179,7 +179,7 @@ if __name__ == "__main__":
     # in the TPU environment for this to work with all 32 cores.
     # We use a defined number of cores for a reliable local test simulation.
     
-    xm.master_print("--- Starting Controller Architecture Verification Tests (XLA Multi-Core Simulation) ---")
+    #xm.master_print("--- Starting Controller Architecture Verification Tests (XLA Multi-Core Simulation) ---")
     
     # Launch the test function on multiple cores
     xmp.spawn(
