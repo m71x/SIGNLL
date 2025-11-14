@@ -10,12 +10,15 @@ from controller_model import Controller, compute_q_from_h
 from training_data_download import training_data_download
 
 #summary of existing issues:
-# .item()
-# trying to shuffle data through some weird function even though it is already shuffled
+# .item() -> fixed
+# trying to shuffle data through some weird function even though it is already shuffled -> fixed
 #memory overusage
-#worker 3 always failing
+#worker 3 always failing ->fixed
 #speed
-#deadlock with master_print, make sure synchronization through rendevous and mark step
+#deadlock with master_print, make sure synchronization through rendevous and mark step -> fixed
+#halt loss is not computing correctly, it seems like it is always 0
+#implement weight averaging after update: gradients are reduced (summed or averaged) across all replicas, and then all replicas update their model parameters identically.
+
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
     
@@ -115,6 +118,7 @@ def train_loop(rank, flags):
         print(f"[Core {rank}] Getting batch slice [{start_idx}:{end_idx}]")
         teacher_cls = teacher_cls_full[start_idx:end_idx]
         teacher_label = teacher_label_full[start_idx:end_idx]
+        print(f"[Core {rank}] teacher_label [{teacher_label}]")
         
         print(f"[Core {rank}] Batch shapes: cls={teacher_cls.shape}, label={teacher_label.shape}")
         
