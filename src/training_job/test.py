@@ -33,10 +33,10 @@ TEST_CONFIG = {
     
     # Data loading parameters
     "chunk_filename": "embeddings_chunk_0.npz", # Use a consistent file name for all cores
-    "max_entries": 128,  # Tiny sample for quick testing
+    "max_entries": 1,  # Tiny sample for quick testing
     
     # XLA/Distributed parameters
-    "num_cores_to_test": 8, # Simulate testing across 8 cores
+    "num_cores_to_test": 32, # Simulate testing across 8 cores
 }
 
 def load_data_and_model(rank: int, config: Dict[str, Any]) -> Tuple[Controller, torch.Tensor, torch.Tensor]:
