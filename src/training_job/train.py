@@ -282,7 +282,7 @@ if __name__ == "__main__":
         "batch_size": 64,  # Smaller batch size for 19500 samples
         
         # Halting loss schedule
-        "lambda_start": 0.01,
+        "lambda_start": 0.0001,
         "lambda_target": 0.01,
         
         # Training
