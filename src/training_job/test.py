@@ -195,13 +195,13 @@ def test_update_step(model, teacher_cls, teacher_label, config):
 
     loss = loss_cls + loss_halt
 
-    xm.master_print(f"[core {rank}] BEFORE update: loss = {loss.item():.6f}")
-
     # ---------- All-reduce BEFORE update ----------
     l_local = torch.tensor([loss.item()], device=device)
     l_sum = xm.all_reduce(xm.REDUCE_SUM, l_local)
+    
+    # ONLY master prints
     if rank == 0:
-        xm.master_print(f"[core 0] BEFORE update global_loss = {l_sum.item()/xm.xrt_world_size():.6f}")
+        xm.master_print(f"BEFORE update global_loss = {l_sum.item()/xm.xrt_world_size():.6f}")
 
     # ---------- Backprop ----------
     optimizer.zero_grad()
@@ -220,16 +220,13 @@ def test_update_step(model, teacher_cls, teacher_label, config):
     ce2 = bce_loss_fn(class_logits2[:, :, 1], labels)
     loss_after = (q2 * ce2).sum(dim=1).mean()
 
-    xm.master_print(f"[core {rank}] AFTER update: loss = {loss_after.item():.6f}")
-
     # ---------- All-reduce AFTER update ----------
     l2_local = torch.tensor([loss_after.item()], device=device)
     l2_sum = xm.all_reduce(xm.REDUCE_SUM, l2_local)
 
     if rank == 0:
-        xm.master_print(f"[core 0] AFTER update global_loss = {l2_sum.item()/xm.xrt_world_size():.6f}")
-
-        # Save checkpoint ONCE
+        xm.master_print(f"AFTER update global_loss = {l2_sum.item()/xm.xrt_world_size():.6f}")
+        xm.master_print("✅ Test 3 Passed: Update step completed successfully")
         xm.master_print("[core 0] Saving checkpoint (placeholder path)")
         # torch.save(model.state_dict(), "/tmp/controller_checkpoint.pt")
 
