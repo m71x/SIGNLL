@@ -10,7 +10,7 @@ from controller_model import Controller, compute_q_from_h
 from training_data_download import training_data_download
 
 def train_loop(rank, flags):
-    device = xm.xla_device()
+    device = xm.torch_xla.device()
     
     if rank == 0:
         print(f"[Core {rank}] Using device: {device}")
@@ -81,7 +81,8 @@ def train_loop(rank, flags):
         epoch_halt_loss = 0.0
         
         # Shuffle data at the start of each epoch
-        perm = torch.randperm(num_samples, device=device)
+        # IMPORTANT: Create permutation on CPU then move to device (TPU doesn't support int64 RNG)
+        perm = torch.randperm(num_samples).to(device)
         teacher_cls_shuffled = teacher_cls_full[perm]
         teacher_label_shuffled = teacher_label_full[perm]
         
