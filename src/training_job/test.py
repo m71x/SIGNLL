@@ -169,7 +169,7 @@ def test_inference_and_loss_step(model: Controller, teacher_cls: torch.Tensor, t
 def test_update_step(model, teacher_cls, teacher_label, config):
 
     rank = xm.get_ordinal()
-    device = xm.xla_model.device()  # Use xm.xla_model.device() for clarity
+    device = xm.torch_xla.device()  # Use xm.xla_model.device() for clarity
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
