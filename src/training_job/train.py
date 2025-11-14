@@ -9,6 +9,13 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 from controller_model import Controller, compute_q_from_h
 from training_data_download import training_data_download
 
+#summary of existing issues:
+# .item()
+# trying to shuffle data through some weird function even though it is already shuffled
+#memory overusage
+#worker 3 always failing
+#speed
+#deadlock with master_print, make sure synchronization through rendevous and mark step
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
     
@@ -91,9 +98,10 @@ def train_loop(rank, flags):
         
         
             
+    # Single step test - just one forward/backward pass with detailed logging
     for epoch in range(1):  # Just 1 epoch
         print(f"[Core {rank}] Starting single test epoch...")
-    
+        
         model.train()
         
         # Just do ONE batch
@@ -156,18 +164,25 @@ def train_loop(rank, flags):
         loss_halt_sum_before = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
         h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
         
+        # Force synchronization before printing
+        xm.torch_xla.sync()
+        
         num_cores = xm.xrt_world_size()
         
         if rank == 0:
+            # Only on master, materialize the values
             xm.master_print("=" * 80)
             xm.master_print("BEFORE BACKWARD PASS")
             xm.master_print("=" * 80)
-            xm.master_print(f"Global Loss (avg): {loss_sum_before / num_cores}")
-            xm.master_print(f"Global Cls Loss (avg): {loss_cls_sum_before / num_cores}")
-            xm.master_print(f"Global Halt Loss (avg): {loss_halt_sum_before / num_cores}")
-            xm.master_print(f"Global Mean h (avg): {h_mean / num_cores}")
-            xm.master_print(f"Lambda: {lambda_now}")
+            xm.master_print(f"Global Loss (avg): {(loss_sum_before / num_cores).item():.6f}")
+            xm.master_print(f"Global Cls Loss (avg): {(loss_cls_sum_before / num_cores).item():.6f}")
+            xm.master_print(f"Global Halt Loss (avg): {(loss_halt_sum_before / num_cores).item():.6f}")
+            xm.master_print(f"Global Mean h (avg): {(h_mean / num_cores).item():.6f}")
+            xm.master_print(f"Lambda: {lambda_now:.6f}")
             xm.master_print("=" * 80)
+        
+        # Barrier to ensure all cores are in sync
+        xm.rendezvous("before_backward")
         
         print(f"[Core {rank}] Starting backward pass...")
         
@@ -210,22 +225,31 @@ def train_loop(rank, flags):
         loss_halt_sum_after = xm.all_reduce(xm.REDUCE_SUM, loss_halt2)
         h_mean_after = xm.all_reduce(xm.REDUCE_SUM, h2.mean())
         
+        # Force synchronization before printing
+        xm.torch_xla.sync()
+        
         if rank == 0:
             xm.master_print("=" * 80)
             xm.master_print("AFTER BACKWARD PASS")
             xm.master_print("=" * 80)
-            xm.master_print(f"Global Loss (avg): {loss_sum_after / num_cores}")
-            xm.master_print(f"Global Cls Loss (avg): {loss_cls_sum_after / num_cores}")
-            xm.master_print(f"Global Halt Loss (avg): {loss_halt_sum_after / num_cores}")
-            xm.master_print(f"Global Mean h (avg): {h_mean_after / num_cores}")
+            avg_loss_after = loss_sum_after / num_cores
+            avg_cls_after = loss_cls_sum_after / num_cores
+            avg_halt_after = loss_halt_sum_after / num_cores
+            avg_h_after = h_mean_after / num_cores
+            xm.master_print(f"Global Loss (avg): {avg_loss_after}")
+            xm.master_print(f"Global Cls Loss (avg): {avg_cls_after}")
+            xm.master_print(f"Global Halt Loss (avg): {avg_halt_after}")
+            xm.master_print(f"Global Mean h (avg): {avg_h_after}")
             xm.master_print("=" * 80)
             xm.master_print("LOSS CHANGE")
             xm.master_print("=" * 80)
-            loss_delta = (loss_sum_after - loss_sum_before) / num_cores
+            loss_delta = avg_loss_after - loss_sum_before / num_cores
             xm.master_print(f"Delta Loss: {loss_delta}")
-            # Note: Can't do if/else on XLA tensors without .item(), just print the delta
             xm.master_print("(Check if negative = loss decreased)")
             xm.master_print("=" * 80)
+        
+        # Final barrier
+        xm.rendezvous("after_update")
         
         print(f"[Core {rank}] Single step test complete!")
 
@@ -233,7 +257,6 @@ def train_loop(rank, flags):
     if rank == 0:
         xm.master_print("\n✅ SINGLE STEP TEST COMPLETED SUCCESSFULLY")
         xm.master_print("If you see this message, the training loop is working correctly!")
-            
 
 
 def _mp_fn(rank, flags):
