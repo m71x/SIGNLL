@@ -75,7 +75,37 @@ def train_loop(rank, flags):
     if rank == 0:
         print(f"[Core {rank}] Training config: {num_epochs} epochs, {num_batches} batches/epoch, batch_size={batch_size}")
     
+    global_step = 0
+    start_time = time.time()
     
+    # --- Training Loop ---
+    for epoch in range(num_epochs):
+        epoch_loss = 0.0
+        epoch_cls_loss = 0.0
+        epoch_halt_loss = 0.0
+        
+        # Shuffle data at the start of each epoch
+        # IMPORTANT: Create permutation on CPU then move to device (TPU doesn't support int64 RNG)
+        #perm = torch.randperm(num_samples).to(device)
+        #teacher_cls_shuffled = teacher_cls_full[perm]
+        #teacher_label_shuffled = teacher_label_full[perm]
+        
+        model.train()
+        
+        for batch_idx in range(num_batches):
+            global_step += 1
+            
+            # Get batch slice
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, num_samples)
+            
+            teacher_cls = teacher_cls_full[start_idx:end_idx]
+            teacher_label = teacher_label_full[start_idx:end_idx]
+            
+            # Forward pass
+            halting_logits, class_logits, _ = model(teacher_cls)
+            print(halting_logits)
+            
 
 
 def _mp_fn(rank, flags):
