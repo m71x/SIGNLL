@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch_xla.core.xla_model as xm
 
 class Controller(nn.Module):
     def __init__(
@@ -64,6 +65,11 @@ class Controller(nn.Module):
             z: [B, L, d_ctrl]
         """
         B, L, D = teacher_cls.shape
+        xm.master_print(f"[DEBUG] forward() received shape: B={B}, L={L}, D={D}")
+        xm.master_print(f"[DEBUG] Model expects L={self.L}, D={self.d_teacher}")
+
+        assert L == self.L and D == self.d_teacher, \
+            f"Shape mismatch! got (L={L}, D={D}) but model expects (L={self.L}, D={self.d_teacher})"
         assert L == self.L and D == self.d_teacher
         
         # 1. Controller Body Computation (Same as before)
