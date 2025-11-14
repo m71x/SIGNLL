@@ -64,6 +64,17 @@ def train_loop(rank, flags):
     optimizer = optim.AdamW(model.parameters(), lr=flags["lr"], weight_decay=1e-2)
     bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none")
     
+    # --- Training Configuration ---
+    num_epochs = flags["epochs"]
+    lambda_start, lambda_target = flags["lambda_start"], flags["lambda_target"]
+    batch_size = flags["batch_size"]
+    
+    # Calculate number of batches per epoch
+    num_batches = (num_samples + batch_size - 1) // batch_size
+    
+    if rank == 0:
+        print(f"[Core {rank}] Training config: {num_epochs} epochs, {num_batches} batches/epoch, batch_size={batch_size}")
+    
     
 
 
