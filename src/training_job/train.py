@@ -11,6 +11,7 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 from controller_model import Controller, compute_q_from_h
 from controller_utils import run_teacher_and_get_cls, inference_once
 
+#only use up to chunk 28, file sizes vary acrss cores for chunks 29-31
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
     print(f"[Core {rank}] Using device:", device)
