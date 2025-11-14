@@ -88,12 +88,12 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --project=${PROJECT_ID} \
     --worker=all \
     --command="pip install torch~=2.6.0 torch_xla[tpu]~=2.6.0 torchvision -f https://storage.googleapis.com/libtpu-releases/index.html"
-#run script
+#kill on all workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="PJRT_DEVICE=TPU python3 ~/tpu_core_count.py"
+  --command="pkill -f -u mikexi python3"
 
   #kill all user run processes: pkill -f -u mikexi python3
 

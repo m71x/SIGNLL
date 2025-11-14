@@ -169,14 +169,14 @@ def test_inference_and_loss_step(model: Controller, teacher_cls: torch.Tensor, t
 def test_update_step(model, teacher_cls, teacher_label, config):
 
     rank = xm.get_ordinal()
-    device = xm.torch_xla.device()
+    device = xm.xla_model.device()  # Use xm.xla_model.device() for clarity
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
     bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none")
     lambda_target = config["halting_lambda_target"]
 
-    # ---------- Forward ----------
+    # ---------- Forward (On Device) ----------
     model.train()
     halting_logits, class_logits, z = model(teacher_cls)
 
@@ -190,28 +190,36 @@ def test_update_step(model, teacher_cls, teacher_label, config):
     ce = bce_loss_fn(class_logits_positive, labels)
     loss_cls = (q * ce).sum(dim=1).mean()
 
+    # depths remains on the device, created once
     depths = torch.arange(1, L + 1, device=device).unsqueeze(0)
     loss_halt = lambda_target * ((depths * (1 - h)).sum(dim=1).mean())
 
     loss = loss_cls + loss_halt
-
-    # ---------- All-reduce BEFORE update ----------
-    l_local = torch.tensor([loss.item()], device=device)
-    l_sum = xm.all_reduce(xm.REDUCE_SUM, l_local)
     
-    # ONLY master prints
+    # ------------------------------------------------------------------
+    # --- FIX 1: Use xm.all_reduce directly on the XLA tensor `loss` ---
+    # --- Avoids CPU synchronization barrier `loss.item()`           ---
+    # ------------------------------------------------------------------
+    
+    # ---------- All-reduce BEFORE update (On Device) ----------
+    # l_local = torch.tensor([loss.item()], device=device) # REMOVED
+    l_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
+    
+    # ONLY master prints (synchronization happens here via .item())
     if rank == 0:
-        xm.master_print(f"BEFORE update global_loss = {l_sum.item()/xm.xrt_world_size():.6f}")
+        global_loss_value = l_sum.item() / xm.xrt_world_size()
+        xm.master_print(f"BEFORE update global_loss = {global_loss_value:.6f}")
 
-    # ---------- Backprop ----------
+    # ---------- Backprop (On Device) ----------
     optimizer.zero_grad()
     loss.backward()
 
-    # ---------- Optimizer step (sync gradients) ----------
+    # ---------- Optimizer step (sync gradients) (On Device) ----------
     xm.optimizer_step(optimizer)
 
-    # ---------- Recompute loss AFTER update ----------
+    # ---------- Recompute loss AFTER update (On Device) ----------
     with torch.no_grad():
+        # NOTE: This forward pass still happens sequentially after the optimizer step.
         halting_logits2, class_logits2, _ = model(teacher_cls)
 
     h2 = torch.sigmoid(halting_logits2)
@@ -220,15 +228,25 @@ def test_update_step(model, teacher_cls, teacher_label, config):
     ce2 = bce_loss_fn(class_logits2[:, :, 1], labels)
     loss_after = (q2 * ce2).sum(dim=1).mean()
 
-    # ---------- All-reduce AFTER update ----------
-    l2_local = torch.tensor([loss_after.item()], device=device)
-    l2_sum = xm.all_reduce(xm.REDUCE_SUM, l2_local)
+    # --------------------------------------------------------------------
+    # --- FIX 2: Use xm.all_reduce directly on the XLA tensor `loss_after` ---
+    # --- Avoids CPU synchronization barrier `loss_after.item()`         ---
+    # --------------------------------------------------------------------
+    
+    # ---------- All-reduce AFTER update (On Device) ----------
+    # l2_local = torch.tensor([loss_after.item()], device=device) # REMOVED
+    l2_sum = xm.all_reduce(xm.REDUCE_SUM, loss_after)
 
+    # ONLY master prints (synchronization happens here via .item())
     if rank == 0:
-        xm.master_print(f"AFTER update global_loss = {l2_sum.item()/xm.xrt_world_size():.6f}")
+        global_loss_after_value = l2_sum.item() / xm.xrt_world_size()
+        xm.master_print(f"AFTER update global_loss = {global_loss_after_value:.6f}")
         xm.master_print("✅ Test 3 Passed: Update step completed successfully")
         xm.master_print("[core 0] Saving checkpoint (placeholder path)")
         # torch.save(model.state_dict(), "/tmp/controller_checkpoint.pt")
+        
+    # In a typical training loop, you would place xm.mark_step() here:
+    xm.mark_step()
 
 def test_controller_mp_fn(rank, config):
     """
