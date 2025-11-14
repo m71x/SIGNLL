@@ -169,7 +169,7 @@ def test_controller_mp_fn(rank, config):
         model, teacher_cls, teacher_label = load_data_and_model(rank, config)
         test_inference_and_loss_step(model, teacher_cls, teacher_label, config)
     except Exception as e:
-        xm.master_print(f"FATAL ERROR on core {rank}: {e}", file=sys.stderr)
+        xm.master_print(f"FATAL ERROR on core {rank}: {e}")
         # Re-raise the exception to stop the test process
         raise
 
