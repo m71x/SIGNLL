@@ -40,34 +40,28 @@ TEST_CONFIG = {
 }
 
 def load_data_and_model(rank: int, config: Dict[str, Any]) -> Tuple[Controller, torch.Tensor, torch.Tensor]:
-    """
-    Downloads data shard corresponding to the core rank and initializes the model.
-    """
     device = xm.torch_xla.device()
     xm.master_print(f"[{rank}] Initializing on device: {device}")
-    
+
     # 1. Load Data
-    # Use the core rank as the core_id for sharded data loading
     xm.master_print(f"[{rank}] Loading data for core_id {rank}...")
-    
+
     data = training_data_download(
-        core_id=rank, # core_id is now the rank
-        filename=config["chunk_filename"], 
+        core_id=rank,
+        filename=config["chunk_filename"],
         max_entries=config["max_entries"]
     )
 
     if data is None:
-        raise RuntimeError(f"[{rank}] Failed to load or generate training data. Cannot proceed with tests.")
+        raise RuntimeError(f"[{rank}] Failed to load or generate training data.")
 
-    # Convert NumPy arrays to PyTorch Tensors and move to XLA device
     teacher_cls = torch.from_numpy(data['all_layer_cls_tokens']).float().to(device)
     teacher_label = torch.from_numpy(data['classifications']).long().to(device)
-    xm.master_print(f"[{rank}] Loaded teacher_cls shape (numpy): {data['all_layer_cls_tokens'].shape}")
-    xm.master_print(f"[{rank}] Converted teacher_cls shape (torch): {teacher_cls.shape}")
-    xm.master_print(f"[{rank}] Expected (L, d_teacher) from config: ({config['L']}, {config['d_teacher']})")
 
+    xm.master_print(f"[{rank}] Loaded teacher_cls shape: {teacher_cls.shape}")
+    xm.master_print(f"[{rank}] Loaded teacher_label shape: {teacher_label.shape}")
 
-    # 2. Initialize Model
+    # 2. Initialize the model
     model = Controller(
         L=config["L"],
         d_teacher=config["d_teacher"],
@@ -75,122 +69,90 @@ def load_data_and_model(rank: int, config: Dict[str, Any]) -> Tuple[Controller, 
         n_layers=config["transformer_layers"],
         num_classes=config["num_classes"]
     ).to(device)
-    
-    xm.master_print(f"[{rank}] Data loaded: CLS Tokens shape: {teacher_cls.shape}, Labels shape: {teacher_label.shape}")
-    xm.master_print(f"[{rank}] Model initialized and moved to XLA device.")
+
+    xm.master_print(f"[{rank}] Model initialized.")
+
+    # 🚨 IMPORTANT: Barrier after data + model before ANY forward/all-reduce
+    xm.rendezvous("after_data_load")
 
     return model, teacher_cls, teacher_label
 
+
+
 def test_inference_and_loss_step(model: Controller, teacher_cls: torch.Tensor, teacher_label: torch.Tensor, config: Dict[str, Any]):
-    """
-    Runs inference and calculates a single loss step, addressing original test items #1 and #2.
-    """
     rank = xm.get_ordinal()
-    #teacher_cls = teacher_cls[:, 1:25, :]   # now shape becomes [B, 24, D]
     B, L, D_teacher = teacher_cls.shape
     num_classes = config["num_classes"]
     lambda_target = config["halting_lambda_target"]
     bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none")
-    
-    # 1. Inference (Test Item #1)
+
+    # 1. Inference
     model.eval()
     with torch.no_grad():
         halting_logits, class_logits, z = model(teacher_cls)
-        
-    # Check output shapes on the master core
+
     if rank == 0:
-        expected_halting_shape = (B, L)
-        expected_class_shape = (B, L, num_classes)
-        expected_z_shape = (B, L, config["d_ctrl"])
+        assert halting_logits.shape == (B, L)
+        assert class_logits.shape == (B, L, num_classes)
+        assert z.shape == (B, L, config["d_ctrl"])
+        xm.master_print("✅ Test 1 Passed: Inference output shapes verified.")
 
-        assert halting_logits.shape == expected_halting_shape, \
-            f"Halting logits shape mismatch: Expected {expected_halting_shape}, got {halting_logits.shape}"
-        assert class_logits.shape == expected_class_shape, \
-            f"Class logits shape mismatch: Expected {expected_class_shape}, got {class_logits.shape}"
-        assert z.shape == expected_z_shape, \
-            f"Controller internal state (z) shape mismatch: Expected {expected_z_shape}, got {z.shape}"
-        xm.master_print("✅ Test 1 Passed: Inference output shapes verified on master core.")
-
-    # 2. Halting Probabilities (h) and Exit Probabilities (q)
+    # 2. Compute h and q
     h = torch.sigmoid(halting_logits)
     q = compute_q_from_h(h)
-    
-    # 3. Classification Loss (Loss_cls) (Part of Test Item #2)
+
+    # 3. Classification loss
     labels_float = teacher_label.float().unsqueeze(1).expand(-1, L)
-    
-    # Take the positive class logit for BCE loss (assuming binary classification)
+
     if class_logits.size(-1) == 2:
         class_logits_positive = class_logits[:, :, 1]
     else:
         class_logits_positive = class_logits.squeeze(-1)
-        
+
     ce_per_layer = bce_loss_fn(class_logits_positive, labels_float)
-        
-    # Weighted classification loss: (q * CE_per_layer) summed over layers, then mean over batch
-    loss_cls_per_sample = (q * ce_per_layer).sum(dim=1)
-    loss_cls = loss_cls_per_sample.mean()
-    
-    # 4. Halting Loss (Loss_halt) (Part of Test Item #2)
-    depths = torch.arange(1, L + 1, device=xm.xla_device()).float().unsqueeze(0) # [1, L]
-    halt_penalty = (depths * (1 - h)).sum(dim=1) # [B]
+    loss_cls = (q * ce_per_layer).sum(dim=1).mean()
+
+    # 4. Halting loss
+    depths = torch.arange(1, L + 1, device=xm.xla_device()).float().unsqueeze(0)
+    halt_penalty = (depths * (1 - h)).sum(dim=1)
     loss_halt = lambda_target * halt_penalty.mean()
-    
-    # 5. Total Loss
+
     loss = loss_cls + loss_halt
 
-    # 6. Global Pooling (Test Item #2)
-    # The losses above are local means. We gather the mean losses from all cores
-    # for a global check (simulating global loss calculation).
-    
-    # Convert local loss to a single-item tensor for all-reduce
+    # 🚨 IMPORTANT: ALL CORES MUST REACH HERE BEFORE ALLREDUCE
+    xm.rendezvous("before_allreduce")
+
+    # 5. Global pooling of losses
     loss_local = torch.tensor([loss.item()], dtype=torch.float32, device=xm.xla_device())
     loss_cls_local = torch.tensor([loss_cls.item()], dtype=torch.float32, device=xm.xla_device())
     loss_halt_local = torch.tensor([loss_halt.item()], dtype=torch.float32, device=xm.xla_device())
 
-    # All-reduce to get the sum of losses across all cores
     loss_global_sum = xm.all_reduce(xm.REDUCE_SUM, loss_local)
     loss_cls_global_sum = xm.all_reduce(xm.REDUCE_SUM, loss_cls_local)
     loss_halt_global_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt_local)
-    
-    # Calculate global mean by dividing by the number of cores
+
     num_cores = xm.xrt_world_size()
-    global_loss_mean = loss_global_sum.item() / num_cores
-    global_loss_cls_mean = loss_cls_global_sum.item() / num_cores
-    global_loss_halt_mean = loss_halt_global_sum.item() / num_cores
 
     if rank == 0:
-        xm.master_print("✅ Test 2 Passed: Loss components calculated and globally pooled successfully.")
-        xm.master_print(f"--- Loss Check (Averages over {num_cores} cores) ---")
-        xm.master_print(f"  Classification Loss (L_cls): {global_loss_cls_mean:.6f}")
-        xm.master_print(f"  Halting Loss (L_halt): {global_loss_halt_mean:.6f}")
-        xm.master_print(f"  Total Loss (L_total): {global_loss_mean:.6f}")
+        xm.master_print("✅ Test 2 Passed: Global loss pooling works.")
+        xm.master_print(f"  Classification Loss: {loss_cls_global_sum.item() / num_cores:.6f}")
+        xm.master_print(f"  Halting Loss:        {loss_halt_global_sum.item() / num_cores:.6f}")
+        xm.master_print(f"  Total Loss:          {loss_global_sum.item() / num_cores:.6f}")
         xm.master_print("-" * 60)
 
+
+
 def test_controller_mp_fn(rank, config):
-    """
-    The main test function launched by xmp.spawn.
-    """
     try:
         model, teacher_cls, teacher_label = load_data_and_model(rank, config)
-        teacher_cls = teacher_cls[:, 1:25, :]   # now shape becomes [B, 24, D]
+        teacher_cls = teacher_cls[:, 1:25, :]
         test_inference_and_loss_step(model, teacher_cls, teacher_label, config)
     except Exception as e:
         xm.master_print(f"FATAL ERROR on core {rank}: {e}")
-        # Re-raise the exception to stop the test process
         raise
 
-# The entry point to run the tests
+
+
 if __name__ == "__main__":
-    # The environment variable XRT_HOST_ORDINAL needs to be set up correctly
-    # in the TPU environment for this to work with all 32 cores.
-    # We use a defined number of cores for a reliable local test simulation.
-    
-    #xm.master_print("--- Starting Controller Architecture Verification Tests (XLA Multi-Core Simulation) ---")
-    
-    # Launch the test function on multiple cores
-    xmp.spawn(
-        test_controller_mp_fn, 
-        args=(TEST_CONFIG,)
-    )
-    
-    xm.master_print("\n--- All Architectural Verification Tests Completed Successfully! ---")
+    xmp.spawn(test_controller_mp_fn, args=(TEST_CONFIG,))
+    xm.master_print("\n--- All Tests Completed Successfully! ---")
