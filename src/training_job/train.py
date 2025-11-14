@@ -27,6 +27,43 @@ def train_loop(rank, flags):
         max_entries=flags["samples_per_shard"]
     )
     
+    if data is None:
+        raise RuntimeError(f"[Core {rank}] Failed to load training data")
+    
+    # Convert to torch tensors and move to XLA device
+    print(f"[Core {rank}] Converting to torch tensors...")
+    teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float().to(device)
+    teacher_label_full = torch.from_numpy(data['classifications']).long().to(device)
+    
+    print(f"[Core {rank}] Tensors moved to device")
+    
+    # Handle layer slicing if needed (remove layer 0 if data has 25 layers)
+    if teacher_cls_full.shape[1] == 25:
+        teacher_cls_full = teacher_cls_full[:, 1:25, :]  # Keep layers 1-24
+    elif teacher_cls_full.shape[1] != 24:
+        raise ValueError(f"Unexpected number of layers: {teacher_cls_full.shape[1]}")
+    
+    num_samples = teacher_cls_full.shape[0]
+    
+    print(f"[Core {rank}] Data shape verified: {num_samples} samples")
+    
+    if rank == 0:
+        xm.master_print(f"CLS tokens shape: {teacher_cls_full.shape}")
+        xm.master_print(f"Labels shape: {teacher_label_full.shape}")
+    
+    # --- Initialize Model ---
+    L = 24
+    model = Controller(
+        L=L,
+        d_teacher=1024,
+        d_ctrl=flags["d_ctrl"],
+        n_layers=flags["transformer_layers"],
+        num_classes=2
+    ).to(device)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=flags["lr"], weight_decay=1e-2)
+    bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none")
+    
     
 
 
