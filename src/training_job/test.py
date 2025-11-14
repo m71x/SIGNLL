@@ -102,6 +102,7 @@ def test_inference_and_loss_step(model, teacher_cls, teacher_label, config):
     l_sum = xm.all_reduce(xm.REDUCE_SUM, l_local)
     lc_sum = xm.all_reduce(xm.REDUCE_SUM, lc_local)
     lh_sum = xm.all_reduce(xm.REDUCE_SUM, lh_local)
+    xm.torch_xla.sync()
 
     N = xm.xrt_world_size()
 
