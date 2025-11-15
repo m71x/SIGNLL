@@ -20,6 +20,7 @@ from training_data_download import training_data_download
 #implement weight averaging after update: gradients are reduced (summed or averaged) across all replicas, and then all replicas update their model parameters identically. ->fixed
 #consider using 6 transformer layers instead of 4 to get more nuance
 #figure out why code is only running on 21/32 cores
+#training_data_download appears to work for 25 cores only
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
     

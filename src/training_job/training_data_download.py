@@ -1,20 +1,38 @@
+# controller_data_prep_xla.py
 import numpy as np
 import os
 import io
 import sys
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.xla_multiprocessing as xmp
+import time
+from typing import Dict, Optional
+import torch
 
 # NOTE: This code requires the 'google-cloud-storage' library to be installed:
 # pip install google-cloud-storage
 
-# --- Configuration Constants (Derived from inference.py) ---
+# --- Configuration Constants ---
 BUCKET_NAME = "encoder-models-2"
 # Base prefix where the core folders (core_0/, core_1/, etc.) reside
 GCS_BASE_PREFIX = "siebert-data/siebert-actual-data" 
+
+# --- Global Data Loading Configuration (Flags) ---
+FLAGS = {
+    # Data loading per core
+    "chunk_filename": "embeddings_chunk_0.npz", 
+    "samples_to_load": 19500, 
+    # Use different filenames for different cores, e.g., in a loop
+    # If the files are sharded by core ID, 'embeddings_chunk_0.npz' might be correct for all.
+}
+
 
 # --- GCS Client Setup (IMPORTANT) ---
 try:
     from google.cloud import storage
     # Initialize the client. This typically handles authentication automatically
+    # NOTE: GCS_CLIENT must be initialized *outside* the xmp.spawn function if possible,
+    # or ensure it's thread/process safe if initialized inside. Here we initialize globally.
     GCS_CLIENT = storage.Client()
 except ImportError:
     print("ERROR: 'google-cloud-storage' library not found. Please install it.")
@@ -24,26 +42,21 @@ except Exception as e:
     sys.exit(1)
 
 
-def load_npz_from_gcs(core_id: int, filename: str) -> dict:
+def load_npz_from_gcs(core_id: int, filename: str) -> Optional[Dict[str, np.ndarray]]:
     """
-    Constructs the GCS path for a sharded NPZ file, downloads its content
-    to a memory buffer, and loads the NumPy arrays from the buffer.
-
-    Args:
-        core_id: The TPU core index (0-31) which maps to the folder name (e.g., core_10).
-        filename: The name of the NPZ file (e.g., embeddings_chunk_0.npz).
-
-    Returns:
-        A dictionary containing the NumPy arrays from the NPZ file, or None on failure.
+    Downloads and loads sharded NPZ file from GCS for a specific core.
     """
     # 1. Construct the full GCS Blob Path
+    # The path is constructed to read from the folder specific to the core ID.
     blob_name = f"{GCS_BASE_PREFIX}/core_{core_id}/{filename}"
     
-    print("-" * 60)
-    print(f"Core ID: {core_id}")
-    print(f"Target Bucket: {BUCKET_NAME}")
-    print(f"Target Blob:   {blob_name}")
-    print("-" * 60)
+    # Use xm.master_print to only log the full path from the master core (core 0)
+    # to avoid spamming the log, but print the Core ID's actions from the core itself.
+    if core_id == 0:
+        xm.master_print("-" * 60)
+        xm.master_print(f"Target Bucket: {BUCKET_NAME}")
+        xm.master_print(f"Target Blob Prefix: {blob_name.rsplit('/', 1)[0]}/...")
+        xm.master_print("-" * 60)
 
     try:
         # 2. Get the Blob and Download to Memory
@@ -51,68 +64,34 @@ def load_npz_from_gcs(core_id: int, filename: str) -> dict:
         blob = bucket.blob(blob_name)
         
         if not blob.exists():
-            print(f"❌ ERROR: Blob not found at gs://{BUCKET_NAME}/{blob_name}")
+            print(f"[Core {core_id}] ❌ ERROR: Blob not found at gs://{BUCKET_NAME}/{blob_name}")
             return None
 
         # Create an in-memory binary stream (BytesIO)
         buffer = io.BytesIO()
         blob.download_to_file(buffer)
-        buffer.seek(0) # Rewind the buffer to the beginning for NumPy to read it
+        buffer.seek(0) # Rewind the buffer to the beginning
         
-        # --- CRITICAL CHECK: Buffer size and header ---
         buffer_size = buffer.getbuffer().nbytes
-        print(f"✅ GCS Download successful. Data loaded into memory buffer ({buffer_size} bytes).")
+        print(f"[Core {core_id}] ✅ GCS Download successful. Data loaded ({buffer_size} bytes).")
 
         if buffer_size == 0:
-            print(f"❌ CRITICAL ERROR: Downloaded file is EMPTY (0 bytes).")
+            print(f"[Core {core_id}] ❌ CRITICAL ERROR: Downloaded file is EMPTY (0 bytes).")
             return None
         
-        if buffer_size < 1024:
-             print(f"⚠️ WARNING: Downloaded file size is suspiciously small.")
-
-
         # 3. Load NPZ data from the memory buffer
         npz_data = np.load(buffer, allow_pickle=False)
 
-        # 4. Inspect and return the content
-        print(f"\n--- NPZ Content Check (Keys) ---")
-        print(f"Keys found: {list(npz_data.keys())}")
-        
-        cls_tokens = npz_data['all_layer_cls_tokens']
-        classifications = npz_data['classifications']
-        
-        print(f"\n'all_layer_cls_tokens' shape: {cls_tokens.shape}, Dtype: {cls_tokens.dtype}")
-        print(f"'classifications' shape: {classifications.shape}, Dtype: {classifications.dtype}")
-        
-        if cls_tokens.shape[0] != classifications.shape[0]:
-             print("❌ CRITICAL WARNING: Sample counts for CLS tokens and classifications do not match!")
-
+        # 4. Return the content
         return dict(npz_data)
 
-    except KeyError as e:
-        print(f"\nFATAL ERROR: Missing expected key {e} in NPZ file.")
-        return None
-    except OSError as e:
-        print(f"\nFATAL ERROR processing NPZ file: {e}")
-        return None
     except Exception as e:
-        print(f"\nFATAL ERROR during GCS communication or other unexpected issue: {e}")
+        print(f"[Core {core_id}] FATAL ERROR: GCS/NPZ processing failed: {e}")
         return None
 
-# --- NEW FUNCTION FOR TRAINING DATA PREP ---
-
-def training_data_download(core_id: int, filename: str, max_entries: int) -> dict:
+def training_data_download(core_id: int, filename: str, max_entries: int) -> Optional[Dict[str, np.ndarray]]:
     """
-    Downloads NPZ data from GCS, selects the first N entries (for speed), 
-    and then shuffles the data before returning it.
-
-    Args:
-        core_id: The TPU core index.
-        filename: The name of the NPZ file.
-        max_entries: The maximum number of entries to return.
-
-    Returns:
-        A dictionary containing the shuffled and sliced NumPy arrays, or None on failure.
+    Downloads NPZ data from GCS, slices, and shuffles the first N entries.
     """
     # 1. Load the data
     data = load_npz_from_gcs(core_id, filename)
@@ -121,73 +100,95 @@ def training_data_download(core_id: int, filename: str, max_entries: int) -> dic
 
     cls_tokens = data['all_layer_cls_tokens']
     classifications = data['classifications']
-    
     total_samples = cls_tokens.shape[0]
 
-    # 2. Determine the slice size for speed/testing
+    # 2. Determine the slice size
     N = min(total_samples, max_entries)
     
-    print(f"\n--- Data Preparation ---")
-    print(f"Total samples found: {total_samples}")
-    print(f"Samples selected (N): {N} (max_entries={max_entries})")
+    print(f"[Core {core_id}] Data Prep: Total samples found: {total_samples}, Slicing to N: {N}")
 
     if N == 0:
-        print("❌ Data slice resulted in 0 samples.")
+        print(f"[Core {core_id}] ❌ Data slice resulted in 0 samples.")
         return None
     
-    # 3. Create a shuffle index (0 to N-1)
-    # We only create indices up to N, which performs the slice implicitly
+    # 3. Apply shuffle and slice
     indices = np.arange(total_samples)
-    
-    # Create a random permutation of all available indices
     np.random.shuffle(indices)
-    
-    # Select the first N shuffled indices to achieve both shuffle and slice
-    # This is more efficient than slicing first, then shuffling.
     shuffled_and_sliced_indices = indices[:N]
 
-    # 4. Apply the shuffle and slice to the arrays
     shuffled_cls_tokens = cls_tokens[shuffled_and_sliced_indices]
     shuffled_classifications = classifications[shuffled_and_sliced_indices]
     
-    print(f"✅ Data successfully shuffled and sliced. Final samples: {shuffled_cls_tokens.shape[0]}")
+    print(f"[Core {core_id}] ✅ Data successfully shuffled and sliced. Final samples: {shuffled_cls_tokens.shape[0]}")
     
-    # 5. Return the shuffled data
+    # 4. Return the shuffled data
     return {
         'all_layer_cls_tokens': shuffled_cls_tokens,
         'classifications': shuffled_classifications
     }
 
+# ----------------------------------------------------------------------
+# Core Function for XLA Multiprocessing
+# ----------------------------------------------------------------------
 
-if __name__ == '__main__':
-    # --- Example Usage for Training Data ---
+def data_prep_fn(rank, flags):
+    """
+    The function executed by each TPU core.
+    The 'rank' argument is the unique core ID (0 to N-1).
+    """
+    # 1. Get Core ID and synchronize start
+    core_id = xm.get_ordinal()
+    num_cores = xm.xrt_world_size()
     
-    # Configuration to test
-    TEST_CORE_ID = 10
-    TEST_CHUNK_FILENAME = "embeddings_chunk_1.npz"
-    # User-defined limit for the number of entries
-    SAMPLES_TO_LOAD = 19500 
-
-    # Call the new function
-    training_data = training_data_download(
-        core_id=TEST_CORE_ID, 
-        filename=TEST_CHUNK_FILENAME, 
-        max_entries=SAMPLES_TO_LOAD
-    )
-
-    if training_data:
-        print("\n--- Summary of Prepared Training Data ---")
+    if core_id == 0:
+        xm.master_print(f"🚀 Starting data loading across {num_cores} TPU cores.")
         
-        # Access the arrays by key
+    # Synchronization point: wait for all cores to start before loading data
+    xm.rendezvous('data_loading_start')
+    start_time = time.time()
+
+    # 2. Load and Prepare Data
+    # Each core loads its own shard based on its unique core_id
+    training_data = training_data_download(
+        core_id=core_id, 
+        filename=flags["chunk_filename"], 
+        max_entries=flags["samples_to_load"]
+    )
+    
+    # 3. Log Results
+    if training_data:
         cls_tokens_array = training_data['all_layer_cls_tokens']
         classifications_array = training_data['classifications']
+        num_samples = cls_tokens_array.shape[0]
         
-        print(f"Total samples returned: {cls_tokens_array.shape[0]}")
+        # Move the data to the XLA device (important for subsequent training)
+        # We only do this check for a sanity test
+        device = xm.xla_device()
+        cls_tokens_tensor = torch.from_numpy(cls_tokens_array).float().to(device)
+        classifications_tensor = torch.from_numpy(classifications_array).long().to(device)
         
-        # Check that the data is shuffled (first 10 classifications should be random)
-        print(f"First 10 classification indices (Shuffled): {classifications_array[:10]}")
-        
-        # Display summary stats for the embedding vectors
-        print(f"Mean of first embedding vector: {cls_tokens_array[0, 0, :].mean():.4f}")
+        print(f"[Core {core_id}] 🎉 SUCCESS: Loaded {num_samples} samples. Data moved to {device}.")
+        # Use master_print for high-level summaries to keep logs clean
+        if core_id == 0:
+             xm.master_print(f"Sample CLS token shape: {cls_tokens_tensor.shape}")
+             xm.master_print(f"Sample Classification: {classifications_tensor[0:5]}")
+             
     else:
-        print("\nFailed to load and prepare training data.")
+        print(f"[Core {core_id}] ⚠️ WARNING: Failed to load data or returned 0 samples.")
+
+    # 4. Synchronization and Reporting
+    # Wait for ALL cores to finish loading before exiting (prevents process termination race conditions)
+    xm.rendezvous('data_loading_end')
+
+    if core_id == 0:
+        end_time = time.time()
+        xm.master_print(f"✅ Data loading and preparation complete for all cores in {end_time - start_time:.2f} seconds.")
+
+
+if __name__ == '__main__':
+    # Ensure all cores use the same random seed for consistent shuffling
+    # Note: For production use, you might use a more sophisticated mechanism.
+    np.random.seed(42) 
+    
+    # Execute the data_prep_fn on all available TPU cores
+    xmp.spawn(data_prep_fn, args=(FLAGS,), start_method='fork')
