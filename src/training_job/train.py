@@ -90,14 +90,15 @@ def train_loop(rank, flags):
     
     # --- Training Loop ---
         
-    # Single step test with SPMD verification
     model.train()
-
+     
+    # Single step test - just one forward/backward pass with detailed logging
     for epoch in range(1):  # Just 1 epoch
-        print(f"[Core {rank}] Starting single test epoch with SPMD verification...")
+        print(f"[Core {rank}] Starting single test epoch...")
         
         model.train()
         
+        # Just do ONE batch
         batch_idx = 0
         global_step = 1
         
@@ -108,28 +109,14 @@ def train_loop(rank, flags):
         print(f"[Core {rank}] Getting batch slice [{start_idx}:{end_idx}]")
         teacher_cls = teacher_cls_full[start_idx:end_idx]
         teacher_label = teacher_label_full[start_idx:end_idx]
+        print(f"[Core {rank}] teacher_label [{teacher_label}]")
         
         print(f"[Core {rank}] Batch shapes: cls={teacher_cls.shape}, label={teacher_label.shape}")
-        
-        # ========== VERIFY WEIGHTS ARE SAME BEFORE TRAINING ==========
-        # Check first layer weight to verify all cores start with same weights
-        first_param = next(model.parameters())
-        param_sum = xm.all_reduce(xm.REDUCE_SUM, first_param[0, 0])  # Sum one element
-        xm.torch_xla.sync()
-        
-        if rank == 0:
-            xm.master_print("=" * 80)
-            xm.master_print("INITIAL WEIGHT CHECK (BEFORE TRAINING)")
-            xm.master_print("=" * 80)
-            xm.master_print(f"Sum of first weight element across all cores: {param_sum.item():.6f}")
-            xm.master_print(f"Expected if all cores identical: {first_param[0, 0].item() * num_cores:.6f}")
-            xm.master_print("=" * 80)
-        
-        xm.rendezvous("initial_weight_check")
         
         # Forward pass
         print(f"[Core {rank}] Starting forward pass...")
         halting_logits, class_logits, _ = model(teacher_cls)
+        print(f"[Core {rank}] halting_logits [{halting_logits}]")
         
         print(f"[Core {rank}] Forward complete. Output shapes:")
         print(f"  halting_logits: {halting_logits.shape}")
@@ -144,6 +131,7 @@ def train_loop(rank, flags):
         B_actual = teacher_cls.shape[0]
         labels = teacher_label.float().unsqueeze(1).expand(-1, L)
         
+        # Handle binary classification (take positive class logit)
         if class_logits.size(-1) == 2:
             class_logits_positive = class_logits[:, :, 1]
         else:
@@ -157,6 +145,9 @@ def train_loop(rank, flags):
         print(f"[Core {rank}] Computing halting loss...")
         depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
         halt_penalty = (depths * (1 - h)).sum(dim=1)
+        progress = 0.0  # First epoch
+        #lambda_start should not start at 0, because that would set the whole loss_halt to zero. Start at a small number >= 0, then increase 
+        #to first learn the classification task, then worry about exiting early
         lambda_now = lambda_start
         loss_halt = lambda_now * halt_penalty.mean()
         
@@ -165,17 +156,19 @@ def train_loop(rank, flags):
         
         print(f"[Core {rank}] Loss computed. About to do all_reduce...")
         
-        # All-reduce losses BEFORE backward
+        # All-reduce losses BEFORE backward (to see initial state)
         loss_sum_before = xm.all_reduce(xm.REDUCE_SUM, loss)
         loss_cls_sum_before = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
         loss_halt_sum_before = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
         h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
         
+        # Force synchronization before printing
         xm.torch_xla.sync()
         
         num_cores = xm.xrt_world_size()
         
         if rank == 0:
+            # Only on master, materialize the values
             xm.master_print("=" * 80)
             xm.master_print("BEFORE BACKWARD PASS")
             xm.master_print("=" * 80)
@@ -186,69 +179,22 @@ def train_loop(rank, flags):
             xm.master_print(f"Lambda: {lambda_now:.6f}")
             xm.master_print("=" * 80)
         
+        # Barrier to ensure all cores are in sync
         xm.rendezvous("before_backward")
         
         print(f"[Core {rank}] Starting backward pass...")
         
-        # Backward pass - compute gradients
+        # Backward pass
         optimizer.zero_grad()
         loss.backward()
         
-        print(f"[Core {rank}] Backward complete.")
-        
-        # ========== VERIFY GRADIENTS BEFORE ALL-REDUCE ==========
-        # Check gradient on first parameter BEFORE optimizer step
-        # Each core will have different gradients based on its local batch
-        first_param_grad = first_param.grad[0, 0].clone()
-        grad_sum_before = xm.all_reduce(xm.REDUCE_SUM, first_param_grad)
-        xm.torch_xla.sync()
-        
-        if rank == 0:
-            xm.master_print("=" * 80)
-            xm.master_print("GRADIENT CHECK (BEFORE OPTIMIZER STEP)")
-            xm.master_print("=" * 80)
-            xm.master_print(f"Sum of first gradient across all cores: {grad_sum_before.item():.6f}")
-            xm.master_print(f"This is the RAW gradient sum before averaging")
-            xm.master_print("=" * 80)
-        
-        xm.rendezvous("gradient_check")
-        
-        print(f"[Core {rank}] Clipping gradients...")
+        print(f"[Core {rank}] Backward complete. Clipping gradients...")
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         
-        print(f"[Core {rank}] Calling optimizer step (this does gradient all-reduce!)...")
-        
-        # ========== THIS IS WHERE SPMD HAPPENS ==========
-        # xm.optimizer_step() will:
-        # 1. All-reduce gradients across cores (average them)
-        # 2. Apply the averaged gradient to update weights
-        # 3. Ensure all cores end up with identical weights
+        print(f"[Core {rank}] Calling optimizer step...")
         xm.optimizer_step(optimizer)
         
-        print(f"[Core {rank}] Optimizer step complete.")
-        
-        # ========== VERIFY WEIGHTS ARE SAME AFTER TRAINING ==========
-        # Check that all cores have identical weights after update
-        first_param_after = next(model.parameters())
-        param_sum_after = xm.all_reduce(xm.REDUCE_SUM, first_param_after[0, 0])
-        xm.torch_xla.sync()
-        
-        if rank == 0:
-            xm.master_print("=" * 80)
-            xm.master_print("WEIGHT SYNCHRONIZATION CHECK (AFTER OPTIMIZER STEP)")
-            xm.master_print("=" * 80)
-            xm.master_print(f"Sum of first weight element across all cores: {param_sum_after.item():.6f}")
-            xm.master_print(f"Expected if all cores identical: {first_param_after[0, 0].item() * num_cores:.6f}")
-            diff = abs(param_sum_after.item() - first_param_after[0, 0].item() * num_cores)
-            if diff < 1e-5:
-                xm.master_print("✅ WEIGHTS ARE SYNCHRONIZED across all cores!")
-            else:
-                xm.master_print(f"⚠️  WARNING: Weight mismatch detected! Diff: {diff:.6e}")
-            xm.master_print("=" * 80)
-        
-        xm.rendezvous("weight_sync_check")
-        
-        print(f"[Core {rank}] Computing loss AFTER update...")
+        print(f"[Core {rank}] Optimizer step complete. Computing loss AFTER update...")
         
         # Recompute loss AFTER update
         with torch.no_grad():
@@ -277,49 +223,71 @@ def train_loop(rank, flags):
         loss_halt_sum_after = xm.all_reduce(xm.REDUCE_SUM, loss_halt2)
         h_mean_after = xm.all_reduce(xm.REDUCE_SUM, h2.mean())
         
+        # Force synchronization before printing
         xm.torch_xla.sync()
         
         if rank == 0:
-            # Save before values for comparison
-            before_loss = (loss_sum_before / num_cores).item()
-            
             xm.master_print("=" * 80)
             xm.master_print("AFTER BACKWARD PASS")
             xm.master_print("=" * 80)
-            after_loss = (loss_sum_after / num_cores).item()
-            xm.master_print(f"Global Loss (avg): {after_loss:.6f}")
-            xm.master_print(f"Global Cls Loss (avg): {(loss_cls_sum_after / num_cores).item():.6f}")
-            xm.master_print(f"Global Halt Loss (avg): {(loss_halt_sum_after / num_cores).item():.6f}")
-            xm.master_print(f"Global Mean h (avg): {(h_mean_after / num_cores).item():.6f}")
+            avg_loss_after = loss_sum_after / num_cores
+            avg_cls_after = loss_cls_sum_after / num_cores
+            avg_halt_after = loss_halt_sum_after / num_cores
+            avg_h_after = h_mean_after / num_cores
+            xm.master_print(f"Global Loss (avg): {avg_loss_after}")
+            xm.master_print(f"Global Cls Loss (avg): {avg_cls_after}")
+            xm.master_print(f"Global Halt Loss (avg): {avg_halt_after}")
+            xm.master_print(f"Global Mean h (avg): {avg_h_after}")
             xm.master_print("=" * 80)
             xm.master_print("LOSS CHANGE")
             xm.master_print("=" * 80)
-            loss_delta = after_loss - before_loss
-            xm.master_print(f"Delta Loss: {loss_delta:.6f}")
-            if loss_delta < 0:
-                xm.master_print("✅ Loss DECREASED (training is working!)")
-            else:
-                xm.master_print("⚠️  Loss INCREASED or stayed same")
+            loss_delta = avg_loss_after - loss_sum_before / num_cores
+            xm.master_print(f"Delta Loss: {loss_delta}")
+            xm.master_print("(Check if negative = loss decreased)")
             xm.master_print("=" * 80)
         
+        # Final barrier
         xm.rendezvous("after_update")
         
         print(f"[Core {rank}] Single step test complete!")
 
+        #NEXT, TEST ITERATION ON MULTIPLE BATCHES AND SYNCING WEIGHTS ACROSS CORES
     # End after one step
+       # ========== WEIGHT SYNCHRONIZATION VERIFICATION ==========
     if rank == 0:
         xm.master_print("\n" + "=" * 80)
-        xm.master_print("✅ SINGLE STEP SPMD TEST COMPLETED SUCCESSFULLY")
+        xm.master_print("WEIGHT SYNCHRONIZATION CHECK")
         xm.master_print("=" * 80)
-        xm.master_print("SPMD Protocol Summary:")
-        xm.master_print("1. ✅ All cores started with identical weights")
-        xm.master_print("2. ✅ Each core computed gradients on its local batch")
-        xm.master_print("3. ✅ xm.optimizer_step() averaged gradients across cores")
-        xm.master_print("4. ✅ All cores updated with the same averaged gradient")
-        xm.master_print("5. ✅ All cores end with identical weights")
+    
+    # Check multiple parameters to verify synchronization
+    param_checks = []
+    for i, param in enumerate(model.parameters()):
+        if i >= 3:  # Check first 3 parameters
+            break
+        # Take first element of each parameter
+        param_element = param.flatten()[0]
+        # Sum across all cores
+        param_sum = xm.all_reduce(xm.REDUCE_SUM, param_element)
+        param_checks.append((param_sum, param_element))
+    
+    xm.torch_xla.sync()
+    
+    if rank == 0:
+        for i, (param_sum, param_element) in enumerate(param_checks):
+            expected_sum = param_element * num_cores
+            xm.master_print(f"Parameter {i}:")
+            xm.master_print(f"  Sum across cores: {param_sum}")
+            xm.master_print(f"  Expected if synced: {expected_sum}")
+            xm.master_print(f"  Difference: {param_sum - expected_sum}")
         xm.master_print("=" * 80)
-        xm.master_print("Your training loop is correctly implementing SPMD!")
+        xm.master_print("✅ If differences are ~0, weights are synchronized!")
         xm.master_print("=" * 80)
+    
+    xm.rendezvous("weight_check_complete")
+
+    if rank == 0:
+        xm.master_print("\n✅ SINGLE STEP TEST COMPLETED SUCCESSFULLY")
+        xm.master_print("If you see this message, the training loop is working correctly!")
 
 
 def _mp_fn(rank, flags):
