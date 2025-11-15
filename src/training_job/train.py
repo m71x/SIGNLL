@@ -40,7 +40,7 @@ def train_loop(rank, flags):
     )
     
     if data is None:
-        raise RuntimeError(f"[Core {rank}] Failed to load training data")
+        raise xm.master_print(f"[Core {rank}] Failed to load training data")
     
     # Convert to torch tensors and move to XLA device
     print(f"[Core {rank}] Converting to torch tensors...")
