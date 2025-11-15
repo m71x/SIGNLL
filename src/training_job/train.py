@@ -19,18 +19,19 @@ from training_data_download import training_data_download
 #halt loss is not computing correctly, it seems like it is always 0 ->fixed
 #implement weight averaging after update: gradients are reduced (summed or averaged) across all replicas, and then all replicas update their model parameters identically. ->fixed
 #consider using 6 transformer layers instead of 4 to get more nuance
-#figure out why code is only running on 21/32 cores
-#training_data_download appears to work for 25 cores only
+#figure out why code seems to run on a variable amount of cores 25-30 every time you run
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
     
+    # Get actual number of cores (don't hardcode!)
+    num_cores = xm.xrt_world_size()
+    
     if rank == 0:
-        print(f"[Core {rank}] Using device: {device}")
-        print(f"[Core {rank}] Starting training with {flags['samples_per_shard']} samples per core")
+        xm.master_print(f"Detected {num_cores} active cores")
+        xm.master_print(f"Starting training with {flags['samples_per_shard']} samples per core")
     
     # --- Load Data Once (Outside Training Loop) ---
-    if rank == 0:
-        print(f"[Core {rank}] Loading training data from GCS...")
+    print(f"[Core {rank}] Loading training data from GCS...")
     
     # Each core loads its own shard
     data = training_data_download(
@@ -40,14 +41,17 @@ def train_loop(rank, flags):
     )
     
     if data is None:
-        raise xm.master_print(f"[Core {rank}] Failed to load training data")
+        raise RuntimeError(f"[Core {rank}] Failed to load training data")
+    
+    print(f"[Core {rank}] Data loaded from GCS")
+    
+    # CRITICAL: Wait for all cores to finish loading before proceeding
+    xm.rendezvous("data_loaded")
     
     # Convert to torch tensors and move to XLA device
     print(f"[Core {rank}] Converting to torch tensors...")
     teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float().to(device)
     teacher_label_full = torch.from_numpy(data['classifications']).long().to(device)
-    
-    print(f"[Core {rank}] Tensors moved to device")
     
     # Handle layer slicing if needed (remove layer 0 if data has 25 layers)
     if teacher_cls_full.shape[1] == 25:
@@ -57,13 +61,18 @@ def train_loop(rank, flags):
     
     num_samples = teacher_cls_full.shape[0]
     
-    print(f"[Core {rank}] Data shape verified: {num_samples} samples")
+    print(f"[Core {rank}] Data ready: {num_samples} samples")
+    
+    # Wait for all cores to finish data preparation
+    xm.rendezvous("data_prepared")
     
     if rank == 0:
+        xm.master_print(f"All {num_cores} cores have loaded data successfully")
         xm.master_print(f"CLS tokens shape: {teacher_cls_full.shape}")
         xm.master_print(f"Labels shape: {teacher_label_full.shape}")
     
-        print(f"[Core {rank}] Initializing model...")
+    # --- Initialize Model ---
+    print(f"[Core {rank}] Initializing model...")
     L = 24
     model = Controller(
         L=L,
@@ -72,40 +81,29 @@ def train_loop(rank, flags):
         n_layers=flags["transformer_layers"],
         num_classes=2
     ).to(device)
-
+    
     print(f"[Core {rank}] Model initialized")
-
+    
     # ========== CRITICAL: SYNCHRONIZE INITIAL WEIGHTS ==========
-    # Each core may have different random initialization
-    # We need to broadcast weights from rank 0 to all other cores
     if rank == 0:
-        xm.master_print("Broadcasting initial weights from rank 0 to all cores...")
-
-    num_cores = 32
-    # Synchronize all parameters
+        xm.master_print("Synchronizing initial weights across all cores...")
+    
+    # Use DYNAMIC num_cores, not hardcoded!
     for param in model.parameters():
-        # All-reduce with MEAN will give the average, but we want rank 0's values
-        # So we'll use a different approach: multiply rank 0's params by num_cores
-        # and others by 0, then sum and divide
         if rank == 0:
             param.data = param.data * num_cores
         else:
             param.data = param.data * 0
         
-        # Sum across cores (only rank 0 contributes)
         param.data = xm.all_reduce(xm.REDUCE_SUM, param.data)
-        
-        # Divide by num_cores to get original rank 0 values
         param.data = param.data / num_cores
-
-    xm.torch_xla.sync()
-
+    
+    xm.mark_step()
+    xm.rendezvous("weights_synced")
+    
     if rank == 0:
         xm.master_print("✅ Initial weights synchronized across all cores")
-
-    # Verify synchronization
-    xm.rendezvous("initial_sync_complete")
-
+    
     # ========== VERIFY INITIAL WEIGHT SYNC ==========
     param_checks = []
     for i, param in enumerate(model.parameters()):
@@ -114,56 +112,47 @@ def train_loop(rank, flags):
         param_element = param.flatten()[0]
         param_sum = xm.all_reduce(xm.REDUCE_SUM, param_element)
         param_checks.append((param_sum, param_element))
-
-    xm.torch_xla.sync()
-
+    
+    xm.mark_step()
+    
     if rank == 0:
         xm.master_print("=" * 80)
         xm.master_print("INITIAL WEIGHT SYNC VERIFICATION")
         xm.master_print("=" * 80)
-        all_synced = True
         for i, (param_sum, param_element) in enumerate(param_checks):
             expected_sum = param_element * num_cores
             diff = param_sum - expected_sum
-            xm.master_print(f"Parameter {i}:")
-            xm.master_print(f"  Difference: {diff}")
-            # Check if difference is small (accounting for floating point errors)
-            # We can't use abs() on XLA tensors without .item(), so just print
+            xm.master_print(f"Parameter {i}: Difference = {diff}")
         xm.master_print("=" * 80)
-        xm.master_print("If all differences are near 0, initialization is synced!")
-        xm.master_print("=" * 80)
-
-    xm.rendezvous("verify_initial_sync")
-
+    
+    xm.rendezvous("verify_weights")
+    
     # NOW continue with optimizer initialization
     optimizer = optim.AdamW(model.parameters(), lr=flags["lr"], weight_decay=1e-2)
     bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none")
-        
+    
     # --- Training Configuration ---
     num_epochs = flags["epochs"]
     lambda_start, lambda_target = flags["lambda_start"], flags["lambda_target"]
     batch_size = flags["batch_size"]
-        
+    
     # Calculate number of batches per epoch
-    num_batches = (num_samples) // batch_size
-        
+    num_batches = num_samples // batch_size
+    
     if rank == 0:
-        print(f"[Core {rank}] Training config: {num_epochs} epochs, {num_batches} batches/epoch, batch_size={batch_size}")
+        xm.master_print(f"Training config: {num_epochs} epochs, {num_batches} batches/epoch, batch_size={batch_size}")
+        xm.master_print(f"Total global samples: {num_samples * num_cores}")
     
     global_step = 0
     start_time = time.time()
     
     # --- Training Loop ---
-        
     model.train()
-     
-    # Single step test - just one forward/backward pass with detailed logging
-    for epoch in range(1):  # Just 1 epoch
+    
+    # Single step test
+    for epoch in range(1):
         print(f"[Core {rank}] Starting single test epoch...")
         
-        model.train()
-        
-        # Just do ONE batch
         batch_idx = 0
         global_step = 1
         
@@ -171,69 +160,49 @@ def train_loop(rank, flags):
         start_idx = 0
         end_idx = min(batch_size, num_samples)
         
-        print(f"[Core {rank}] Getting batch slice [{start_idx}:{end_idx}]")
         teacher_cls = teacher_cls_full[start_idx:end_idx]
         teacher_label = teacher_label_full[start_idx:end_idx]
-        print(f"[Core {rank}] teacher_label [{teacher_label}]")
         
         print(f"[Core {rank}] Batch shapes: cls={teacher_cls.shape}, label={teacher_label.shape}")
         
         # Forward pass
         print(f"[Core {rank}] Starting forward pass...")
         halting_logits, class_logits, _ = model(teacher_cls)
-        print(f"[Core {rank}] halting_logits [{halting_logits}]")
-        
-        print(f"[Core {rank}] Forward complete. Output shapes:")
-        print(f"  halting_logits: {halting_logits.shape}")
-        print(f"  class_logits: {class_logits.shape}")
         
         h = torch.sigmoid(halting_logits)
         q = compute_q_from_h(h)
         
-        print(f"[Core {rank}] Computed h and q")
-        
         # Classification loss
-        B_actual = teacher_cls.shape[0]
         labels = teacher_label.float().unsqueeze(1).expand(-1, L)
         
-        # Handle binary classification (take positive class logit)
         if class_logits.size(-1) == 2:
             class_logits_positive = class_logits[:, :, 1]
         else:
             class_logits_positive = class_logits.squeeze(-1)
         
-        print(f"[Core {rank}] Computing classification loss...")
         ce_per_layer = bce_loss_fn(class_logits_positive, labels)
         loss_cls = (q * ce_per_layer).sum(dim=1).mean()
         
         # Halting loss
-        print(f"[Core {rank}] Computing halting loss...")
         depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
         halt_penalty = (depths * (1 - h)).sum(dim=1)
-        progress = 0.0  # First epoch
-        #lambda_start should not start at 0, because that would set the whole loss_halt to zero. Start at a small number >= 0, then increase 
-        #to first learn the classification task, then worry about exiting early
         lambda_now = lambda_start
         loss_halt = lambda_now * halt_penalty.mean()
         
         # Total loss
         loss = loss_cls + loss_halt
         
-        print(f"[Core {rank}] Loss computed. About to do all_reduce...")
+        print(f"[Core {rank}] Computing global losses...")
         
-        # All-reduce losses BEFORE backward (to see initial state)
+        # All-reduce losses BEFORE backward
         loss_sum_before = xm.all_reduce(xm.REDUCE_SUM, loss)
         loss_cls_sum_before = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
         loss_halt_sum_before = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
         h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
         
-        # Force synchronization before printing
-        xm.torch_xla.sync()
-        
-        num_cores = xm.xrt_world_size()
+        xm.mark_step()
         
         if rank == 0:
-            # Only on master, materialize the values
             xm.master_print("=" * 80)
             xm.master_print("BEFORE BACKWARD PASS")
             xm.master_print("=" * 80)
@@ -244,7 +213,6 @@ def train_loop(rank, flags):
             xm.master_print(f"Lambda: {lambda_now:.6f}")
             xm.master_print("=" * 80)
         
-        # Barrier to ensure all cores are in sync
         xm.rendezvous("before_backward")
         
         print(f"[Core {rank}] Starting backward pass...")
@@ -252,14 +220,10 @@ def train_loop(rank, flags):
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
-        
-        print(f"[Core {rank}] Backward complete. Clipping gradients...")
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        
-        print(f"[Core {rank}] Calling optimizer step...")
         xm.optimizer_step(optimizer)
         
-        print(f"[Core {rank}] Optimizer step complete. Computing loss AFTER update...")
+        print(f"[Core {rank}] Optimizer step complete")
         
         # Recompute loss AFTER update
         with torch.no_grad():
@@ -280,85 +244,80 @@ def train_loop(rank, flags):
             loss_halt2 = lambda_now * halt_penalty2.mean()
             loss2 = loss_cls2 + loss_halt2
         
-        print(f"[Core {rank}] Recomputed loss. Doing all_reduce AFTER update...")
-        
         # All-reduce losses AFTER update
         loss_sum_after = xm.all_reduce(xm.REDUCE_SUM, loss2)
         loss_cls_sum_after = xm.all_reduce(xm.REDUCE_SUM, loss_cls2)
         loss_halt_sum_after = xm.all_reduce(xm.REDUCE_SUM, loss_halt2)
         h_mean_after = xm.all_reduce(xm.REDUCE_SUM, h2.mean())
         
-        # Force synchronization before printing
-        xm.torch_xla.sync()
+        xm.mark_step()
         
         if rank == 0:
+            before_loss = (loss_sum_before / num_cores).item()
+            after_loss = (loss_sum_after / num_cores).item()
+            
             xm.master_print("=" * 80)
             xm.master_print("AFTER BACKWARD PASS")
             xm.master_print("=" * 80)
-            avg_loss_after = loss_sum_after / num_cores
-            avg_cls_after = loss_cls_sum_after / num_cores
-            avg_halt_after = loss_halt_sum_after / num_cores
-            avg_h_after = h_mean_after / num_cores
-            xm.master_print(f"Global Loss (avg): {avg_loss_after}")
-            xm.master_print(f"Global Cls Loss (avg): {avg_cls_after}")
-            xm.master_print(f"Global Halt Loss (avg): {avg_halt_after}")
-            xm.master_print(f"Global Mean h (avg): {avg_h_after}")
+            xm.master_print(f"Global Loss (avg): {after_loss:.6f}")
+            xm.master_print(f"Global Cls Loss (avg): {(loss_cls_sum_after / num_cores).item():.6f}")
+            xm.master_print(f"Global Halt Loss (avg): {(loss_halt_sum_after / num_cores).item():.6f}")
+            xm.master_print(f"Global Mean h (avg): {(h_mean_after / num_cores).item():.6f}")
             xm.master_print("=" * 80)
             xm.master_print("LOSS CHANGE")
             xm.master_print("=" * 80)
-            loss_delta = avg_loss_after - loss_sum_before / num_cores
-            xm.master_print(f"Delta Loss: {loss_delta}")
-            xm.master_print("(Check if negative = loss decreased)")
+            loss_delta = after_loss - before_loss
+            xm.master_print(f"Delta Loss: {loss_delta:.6f}")
+            if loss_delta < 0:
+                xm.master_print("✅ Loss DECREASED")
+            else:
+                xm.master_print("⚠️  Loss INCREASED")
             xm.master_print("=" * 80)
         
-        # Final barrier
         xm.rendezvous("after_update")
         
         print(f"[Core {rank}] Single step test complete!")
-
-        #NEXT, TEST ITERATION ON MULTIPLE BATCHES AND SYNCING WEIGHTS ACROSS CORES
-    # End after one step
     
-    if rank == 0:
-        xm.master_print("\n✅ SINGLE STEP TEST COMPLETED SUCCESSFULLY")
-        xm.master_print("If you see this message, the training loop is working correctly!")
-    
-    # ========== WEIGHT SYNCHRONIZATION VERIFICATION ==========
+    # Weight synchronization verification
     if rank == 0:
         xm.master_print("\n" + "=" * 80)
-        xm.master_print("WEIGHT SYNCHRONIZATION CHECK")
+        xm.master_print("FINAL WEIGHT SYNCHRONIZATION CHECK")
         xm.master_print("=" * 80)
     
-    # Check multiple parameters to verify synchronization
-    param_checks = []
+    param_checks_final = []
     for i, param in enumerate(model.parameters()):
-        if i >= 3:  # Check first 3 parameters
+        if i >= 3:
             break
-        # Take first element of each parameter
         param_element = param.flatten()[0]
-        # Sum across all cores
         param_sum = xm.all_reduce(xm.REDUCE_SUM, param_element)
-        param_checks.append((param_sum, param_element))
+        param_checks_final.append((param_sum, param_element))
     
-    xm.torch_xla.sync()
+    xm.mark_step()
     
     if rank == 0:
-        for i, (param_sum, param_element) in enumerate(param_checks):
+        for i, (param_sum, param_element) in enumerate(param_checks_final):
             expected_sum = param_element * num_cores
             xm.master_print(f"Parameter {i}:")
             xm.master_print(f"  Sum across cores: {param_sum}")
             xm.master_print(f"  Expected if synced: {expected_sum}")
             xm.master_print(f"  Difference: {param_sum - expected_sum}")
         xm.master_print("=" * 80)
-        xm.master_print("✅ If differences are ~0, weights are synchronized!")
+        xm.master_print("✅ TRAINING TEST COMPLETED ON ALL CORES")
+        xm.master_print(f"Active cores: {num_cores}/32")
         xm.master_print("=" * 80)
     
-    xm.rendezvous("weight_check_complete")
+    xm.rendezvous("final_check")
 
 
 def _mp_fn(rank, flags):
-    torch.set_default_tensor_type('torch.FloatTensor')
-    train_loop(rank, flags)
+    try:
+        torch.set_default_tensor_type('torch.FloatTensor')
+        train_loop(rank, flags)
+    except Exception as e:
+        print(f"[Core {rank}] FATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 if __name__ == "__main__":
