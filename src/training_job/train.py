@@ -78,7 +78,8 @@ def train_loop(rank, flags):
     # We need to broadcast weights from rank 0 to all other cores
     if rank == 0:
         xm.master_print("Broadcasting initial weights from rank 0 to all cores...")
-
+        
+    num_cores = 32
     # Synchronize all parameters
     for param in model.parameters():
         # All-reduce with MEAN will give the average, but we want rank 0's values
