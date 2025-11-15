@@ -185,14 +185,23 @@ def train_loop(rank, flags):
         print(f"[Core {rank}] Starting backward pass...")
         
         # Backward pass
+        # ... backward pass
         optimizer.zero_grad()
         loss.backward()
-        
-        print(f"[Core {rank}] Backward complete. Clipping gradients...")
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        
+
+        # 1. SUM GRADIENTS ACROSS ALL CORES
+        xm.reduce_gradients(optimizer) 
+
+        print(f"[Core {rank}] Backward complete. Gradients reduced. Clipping gradients...")
+
+        # 2. Clip the now-reduced (global) gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) 
+
         print(f"[Core {rank}] Calling optimizer step...")
-        xm.optimizer_step(optimizer)
+
+        # 3. Apply the global, reduced gradients identically on all cores
+        xm.optimizer_step(optimizer) 
+        # ...
         
         print(f"[Core {rank}] Optimizer step complete. Computing loss AFTER update...")
         
