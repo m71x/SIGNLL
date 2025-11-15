@@ -257,6 +257,38 @@ def train_loop(rank, flags):
     if rank == 0:
         xm.master_print("\n✅ SINGLE STEP TEST COMPLETED SUCCESSFULLY")
         xm.master_print("If you see this message, the training loop is working correctly!")
+    
+    # ========== WEIGHT SYNCHRONIZATION VERIFICATION ==========
+    if rank == 0:
+        xm.master_print("\n" + "=" * 80)
+        xm.master_print("WEIGHT SYNCHRONIZATION CHECK")
+        xm.master_print("=" * 80)
+    
+    # Check multiple parameters to verify synchronization
+    param_checks = []
+    for i, param in enumerate(model.parameters()):
+        if i >= 3:  # Check first 3 parameters
+            break
+        # Take first element of each parameter
+        param_element = param.flatten()[0]
+        # Sum across all cores
+        param_sum = xm.all_reduce(xm.REDUCE_SUM, param_element)
+        param_checks.append((param_sum, param_element))
+    
+    xm.torch_xla.sync()
+    
+    if rank == 0:
+        for i, (param_sum, param_element) in enumerate(param_checks):
+            expected_sum = param_element * num_cores
+            xm.master_print(f"Parameter {i}:")
+            xm.master_print(f"  Sum across cores: {param_sum}")
+            xm.master_print(f"  Expected if synced: {expected_sum}")
+            xm.master_print(f"  Difference: {param_sum - expected_sum}")
+        xm.master_print("=" * 80)
+        xm.master_print("✅ If differences are ~0, weights are synchronized!")
+        xm.master_print("=" * 80)
+    
+    xm.rendezvous("weight_check_complete")
 
 
 def _mp_fn(rank, flags):
