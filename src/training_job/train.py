@@ -216,14 +216,7 @@ def train_loop(rank, flags):
             xm.master_print("-" * 80)
         
         # Save checkpoint every epoch (only on master core)
-        if rank == 0 and (epoch + 1) % flags["checkpoint_interval"] == 0:
-            checkpoint_path = f"/tmp/controller_epoch_{epoch+1}.pt"
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-            }, checkpoint_path)
-            xm.master_print(f"✅ Checkpoint saved: {checkpoint_path}")
+        #got rid of for now
     
     # Final weight synchronization verification
     if rank == 0:
