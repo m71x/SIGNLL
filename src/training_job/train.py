@@ -190,7 +190,7 @@ def train_loop(rank, flags):
         loss.backward()
 
         # 1. AVERAGE GRADIENTS ACROSS ALL CORES
-        xm.reduce_gradients(optimizer, reduce_op='mean')    
+        xm.reduce_gradients(optimizer)    
 
         print(f"[Core {rank}] Backward complete. Gradients reduced. Clipping gradients...")
 
