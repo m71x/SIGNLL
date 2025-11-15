@@ -28,7 +28,7 @@ def train_loop(rank, flags):
     )
     
     if data is None:
-        raise RuntimeError(f"[Core {rank}] Failed to load training data")
+        xm.master_print(f"[Core {rank}] Failed to load training data")
     
     # Convert to torch tensors and move to XLA device
     print(f"[Core {rank}] Converting to torch tensors...")
@@ -46,6 +46,12 @@ def train_loop(rank, flags):
     num_samples = teacher_cls_full.shape[0]
     
     print(f"[Core {rank}] Data shape verified: {num_samples} samples")
+
+    num_samples = teacher_cls_full.shape[0] # This will be 0 for the idle cores
+    
+
+
+    # The rest of the training loop continues here...
     
     if rank == 0:
         xm.master_print(f"CLS tokens shape: {teacher_cls_full.shape}")

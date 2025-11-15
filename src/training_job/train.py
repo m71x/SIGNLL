@@ -17,8 +17,9 @@ from training_data_download import training_data_download
 #speed
 #deadlock with master_print, make sure synchronization through rendevous and mark step -> fixed
 #halt loss is not computing correctly, it seems like it is always 0 ->fixed
-#implement weight averaging after update: gradients are reduced (summed or averaged) across all replicas, and then all replicas update their model parameters identically.
+#implement weight averaging after update: gradients are reduced (summed or averaged) across all replicas, and then all replicas update their model parameters identically. ->fixed
 #consider using 6 transformer layers instead of 4 to get more nuance
+#figure out why code is only running on 21/32 cores
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
     
@@ -78,7 +79,7 @@ def train_loop(rank, flags):
     # We need to broadcast weights from rank 0 to all other cores
     if rank == 0:
         xm.master_print("Broadcasting initial weights from rank 0 to all cores...")
-        
+
     num_cores = 32
     # Synchronize all parameters
     for param in model.parameters():
