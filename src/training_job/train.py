@@ -61,7 +61,7 @@ def train_loop(rank, flags):
         xm.master_print(f"CLS tokens shape: {teacher_cls_full.shape}")
         xm.master_print(f"Labels shape: {teacher_label_full.shape}")
     
-    # --- Initialize Model ---
+        print(f"[Core {rank}] Initializing model...")
     L = 24
     model = Controller(
         L=L,
@@ -70,18 +70,80 @@ def train_loop(rank, flags):
         n_layers=flags["transformer_layers"],
         num_classes=2
     ).to(device)
-    
+
+    print(f"[Core {rank}] Model initialized")
+
+    # ========== CRITICAL: SYNCHRONIZE INITIAL WEIGHTS ==========
+    # Each core may have different random initialization
+    # We need to broadcast weights from rank 0 to all other cores
+    if rank == 0:
+        xm.master_print("Broadcasting initial weights from rank 0 to all cores...")
+
+    # Synchronize all parameters
+    for param in model.parameters():
+        # All-reduce with MEAN will give the average, but we want rank 0's values
+        # So we'll use a different approach: multiply rank 0's params by num_cores
+        # and others by 0, then sum and divide
+        if rank == 0:
+            param.data = param.data * num_cores
+        else:
+            param.data = param.data * 0
+        
+        # Sum across cores (only rank 0 contributes)
+        param.data = xm.all_reduce(xm.REDUCE_SUM, param.data)
+        
+        # Divide by num_cores to get original rank 0 values
+        param.data = param.data / num_cores
+
+    xm.torch_xla.sync()
+
+    if rank == 0:
+        xm.master_print("✅ Initial weights synchronized across all cores")
+
+    # Verify synchronization
+    xm.rendezvous("initial_sync_complete")
+
+    # ========== VERIFY INITIAL WEIGHT SYNC ==========
+    param_checks = []
+    for i, param in enumerate(model.parameters()):
+        if i >= 3:
+            break
+        param_element = param.flatten()[0]
+        param_sum = xm.all_reduce(xm.REDUCE_SUM, param_element)
+        param_checks.append((param_sum, param_element))
+
+    xm.torch_xla.sync()
+
+    if rank == 0:
+        xm.master_print("=" * 80)
+        xm.master_print("INITIAL WEIGHT SYNC VERIFICATION")
+        xm.master_print("=" * 80)
+        all_synced = True
+        for i, (param_sum, param_element) in enumerate(param_checks):
+            expected_sum = param_element * num_cores
+            diff = param_sum - expected_sum
+            xm.master_print(f"Parameter {i}:")
+            xm.master_print(f"  Difference: {diff}")
+            # Check if difference is small (accounting for floating point errors)
+            # We can't use abs() on XLA tensors without .item(), so just print
+        xm.master_print("=" * 80)
+        xm.master_print("If all differences are near 0, initialization is synced!")
+        xm.master_print("=" * 80)
+
+    xm.rendezvous("verify_initial_sync")
+
+    # NOW continue with optimizer initialization
     optimizer = optim.AdamW(model.parameters(), lr=flags["lr"], weight_decay=1e-2)
     bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none")
-    
+        
     # --- Training Configuration ---
     num_epochs = flags["epochs"]
     lambda_start, lambda_target = flags["lambda_start"], flags["lambda_target"]
     batch_size = flags["batch_size"]
-    
+        
     # Calculate number of batches per epoch
     num_batches = (num_samples) // batch_size
-    
+        
     if rank == 0:
         print(f"[Core {rank}] Training config: {num_epochs} epochs, {num_batches} batches/epoch, batch_size={batch_size}")
     
@@ -185,23 +247,14 @@ def train_loop(rank, flags):
         print(f"[Core {rank}] Starting backward pass...")
         
         # Backward pass
-        # ... backward pass
         optimizer.zero_grad()
         loss.backward()
-
-        # 1. AVERAGE GRADIENTS ACROSS ALL CORES
-        xm.reduce_gradients(optimizer)    
-
-        print(f"[Core {rank}] Backward complete. Gradients reduced. Clipping gradients...")
-
-        # 2. Clip the now-reduced (global) gradients
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) 
-
+        
+        print(f"[Core {rank}] Backward complete. Clipping gradients...")
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        
         print(f"[Core {rank}] Calling optimizer step...")
-
-        # 3. Apply the global, reduced gradients identically on all cores
-        xm.optimizer_step(optimizer) 
-        # ...
+        xm.optimizer_step(optimizer)
         
         print(f"[Core {rank}] Optimizer step complete. Computing loss AFTER update...")
         
