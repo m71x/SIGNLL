@@ -12,14 +12,14 @@ from training_data_download import training_data_download
 #summary of existing issues:
 # .item() -> fixed
 # trying to shuffle data through some weird function even though it is already shuffled -> fixed
-#memory overusage
+#memory overusage ->fixed
 #worker 3 always failing ->fixed
-#speed
+#speed ->fixed
 #deadlock with master_print, make sure synchronization through rendevous and mark step -> fixed
 #halt loss is not computing correctly, it seems like it is always 0 ->fixed
 #implement weight averaging after update: gradients are reduced (summed or averaged) across all replicas, and then all replicas update their model parameters identically. ->fixed
 #consider using 6 transformer layers instead of 4 to get more nuance
-#figure out why code seems to run on a variable amount of cores 25-30 every time you run
+#figure out why code seems to run on a variable amount of cores 25-30 every time you run -> fixed
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
     
@@ -149,136 +149,83 @@ def train_loop(rank, flags):
     # --- Training Loop ---
     model.train()
     
-    # Single step test
-    for epoch in range(1):
-        print(f"[Core {rank}] Starting single test epoch...")
-        
-        batch_idx = 0
-        global_step = 1
-        
-        # Get first batch
-        start_idx = 0
-        end_idx = min(batch_size, num_samples)
-        
-        teacher_cls = teacher_cls_full[start_idx:end_idx]
-        teacher_label = teacher_label_full[start_idx:end_idx]
-        
-        print(f"[Core {rank}] Batch shapes: cls={teacher_cls.shape}, label={teacher_label.shape}")
-        
-        # Forward pass
-        print(f"[Core {rank}] Starting forward pass...")
-        halting_logits, class_logits, _ = model(teacher_cls)
-        
-        h = torch.sigmoid(halting_logits)
-        q = compute_q_from_h(h)
-        
-        # Classification loss
-        labels = teacher_label.float().unsqueeze(1).expand(-1, L)
-        
-        if class_logits.size(-1) == 2:
-            class_logits_positive = class_logits[:, :, 1]
-        else:
-            class_logits_positive = class_logits.squeeze(-1)
-        
-        ce_per_layer = bce_loss_fn(class_logits_positive, labels)
-        loss_cls = (q * ce_per_layer).sum(dim=1).mean()
-        
-        # Halting loss
-        depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
-        halt_penalty = (depths * (1 - h)).sum(dim=1)
-        lambda_now = lambda_start
-        loss_halt = lambda_now * halt_penalty.mean()
-        
-        # Total loss
-        loss = loss_cls + loss_halt
-        
-        print(f"[Core {rank}] Computing global losses...")
-        
-        # All-reduce losses BEFORE backward
-        loss_sum_before = xm.all_reduce(xm.REDUCE_SUM, loss)
-        loss_cls_sum_before = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
-        loss_halt_sum_before = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
-        h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
-        
-        xm.mark_step()
-        
+    # CHANGED: Loop over all batches instead of just one
+    for epoch in range(num_epochs):
         if rank == 0:
-            xm.master_print("=" * 80)
-            xm.master_print("BEFORE BACKWARD PASS")
-            xm.master_print("=" * 80)
-            xm.master_print(f"Global Loss (avg): {(loss_sum_before / num_cores).item():.6f}")
-            xm.master_print(f"Global Cls Loss (avg): {(loss_cls_sum_before / num_cores).item():.6f}")
-            xm.master_print(f"Global Halt Loss (avg): {(loss_halt_sum_before / num_cores).item():.6f}")
-            xm.master_print(f"Global Mean h (avg): {(h_mean / num_cores).item():.6f}")
-            xm.master_print(f"Lambda: {lambda_now:.6f}")
-            xm.master_print("=" * 80)
+            xm.master_print(f"\n{'='*80}")
+            xm.master_print(f"EPOCH {epoch+1}/{num_epochs}")
+            xm.master_print(f"{'='*80}")
         
-        xm.rendezvous("before_backward")
-        
-        print(f"[Core {rank}] Starting backward pass...")
-        
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        xm.optimizer_step(optimizer)
-        
-        print(f"[Core {rank}] Optimizer step complete")
-        
-        # Recompute loss AFTER update
-        with torch.no_grad():
-            halting_logits2, class_logits2, _ = model(teacher_cls)
-            h2 = torch.sigmoid(halting_logits2)
-            q2 = compute_q_from_h(h2)
+        for batch_idx in range(num_batches):  # CHANGED: now loops through all batches
+            global_step += 1
             
-            labels2 = teacher_label.float().unsqueeze(1).expand(-1, L)
-            if class_logits2.size(-1) == 2:
-                class_logits_positive2 = class_logits2[:, :, 1]
+            # Get batch slice
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, num_samples)
+            
+            teacher_cls = teacher_cls_full[start_idx:end_idx]
+            teacher_label = teacher_label_full[start_idx:end_idx]
+            
+            # Forward pass
+            halting_logits, class_logits, _ = model(teacher_cls)
+            
+            h = torch.sigmoid(halting_logits)
+            q = compute_q_from_h(h)
+            
+            # Classification loss
+            labels = teacher_label.float().unsqueeze(1).expand(-1, L)
+            
+            if class_logits.size(-1) == 2:
+                class_logits_positive = class_logits[:, :, 1]
             else:
-                class_logits_positive2 = class_logits2.squeeze(-1)
+                class_logits_positive = class_logits.squeeze(-1)
             
-            ce2 = bce_loss_fn(class_logits_positive2, labels2)
-            loss_cls2 = (q2 * ce2).sum(dim=1).mean()
+            ce_per_layer = bce_loss_fn(class_logits_positive, labels)
+            loss_cls = (q * ce_per_layer).sum(dim=1).mean()
             
-            halt_penalty2 = (depths * (1 - h2)).sum(dim=1)
-            loss_halt2 = lambda_now * halt_penalty2.mean()
-            loss2 = loss_cls2 + loss_halt2
+            # Halting loss
+            depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
+            halt_penalty = (depths * (1 - h)).sum(dim=1)
+            progress = epoch / max(1, num_epochs - 1)  # CHANGED: proper progress calculation
+            lambda_now = lambda_start + (lambda_target - lambda_start) * progress
+            loss_halt = lambda_now * halt_penalty.mean()
+            
+            # Total loss
+            loss = loss_cls + loss_halt
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            xm.optimizer_step(optimizer)
+            
+            # Log every N steps
+            if global_step % flags["log_interval"] == 0 and rank == 0:
+                xm.master_print(
+                    f"[Epoch {epoch+1}/{num_epochs}] [Step {global_step}] [Batch {batch_idx+1}/{num_batches}] "
+                    f"loss={loss.item():.4f} cls={loss_cls.item():.4f} halt={loss_halt.item():.4f} "
+                    f"mean_h={h.mean().item():.4f} lambda={lambda_now:.6f}"
+                )
         
-        # All-reduce losses AFTER update
-        loss_sum_after = xm.all_reduce(xm.REDUCE_SUM, loss2)
-        loss_cls_sum_after = xm.all_reduce(xm.REDUCE_SUM, loss_cls2)
-        loss_halt_sum_after = xm.all_reduce(xm.REDUCE_SUM, loss_halt2)
-        h_mean_after = xm.all_reduce(xm.REDUCE_SUM, h2.mean())
-        
-        xm.mark_step()
-        
+        # End of epoch
         if rank == 0:
-            before_loss = (loss_sum_before / num_cores).item()
-            after_loss = (loss_sum_after / num_cores).item()
-            
-            xm.master_print("=" * 80)
-            xm.master_print("AFTER BACKWARD PASS")
-            xm.master_print("=" * 80)
-            xm.master_print(f"Global Loss (avg): {after_loss:.6f}")
-            xm.master_print(f"Global Cls Loss (avg): {(loss_cls_sum_after / num_cores).item():.6f}")
-            xm.master_print(f"Global Halt Loss (avg): {(loss_halt_sum_after / num_cores).item():.6f}")
-            xm.master_print(f"Global Mean h (avg): {(h_mean_after / num_cores).item():.6f}")
-            xm.master_print("=" * 80)
-            xm.master_print("LOSS CHANGE")
-            xm.master_print("=" * 80)
-            loss_delta = after_loss - before_loss
-            xm.master_print(f"Delta Loss: {loss_delta:.6f}")
-            if loss_delta < 0:
-                xm.master_print("✅ Loss DECREASED")
-            else:
-                xm.master_print("⚠️  Loss INCREASED")
-            xm.master_print("=" * 80)
+            elapsed = time.time() - start_time
+            xm.master_print("-" * 80)
+            xm.master_print(f"EPOCH {epoch+1}/{num_epochs} COMPLETED")
+            xm.master_print(f"  Elapsed Time: {elapsed:.1f}s")
+            xm.master_print("-" * 80)
         
-        xm.rendezvous("after_update")
-        
-        print(f"[Core {rank}] Single step test complete!")
+        # Save checkpoint every epoch (only on master core)
+        if rank == 0 and (epoch + 1) % flags["checkpoint_interval"] == 0:
+            checkpoint_path = f"/tmp/controller_epoch_{epoch+1}.pt"
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }, checkpoint_path)
+            xm.master_print(f"✅ Checkpoint saved: {checkpoint_path}")
     
-    # Weight synchronization verification
+    # Final weight synchronization verification
     if rank == 0:
         xm.master_print("\n" + "=" * 80)
         xm.master_print("FINAL WEIGHT SYNCHRONIZATION CHECK")
@@ -295,6 +242,7 @@ def train_loop(rank, flags):
     xm.mark_step()
     
     if rank == 0:
+        total_time = time.time() - start_time
         for i, (param_sum, param_element) in enumerate(param_checks_final):
             expected_sum = param_element * num_cores
             xm.master_print(f"Parameter {i}:")
@@ -302,8 +250,10 @@ def train_loop(rank, flags):
             xm.master_print(f"  Expected if synced: {expected_sum}")
             xm.master_print(f"  Difference: {param_sum - expected_sum}")
         xm.master_print("=" * 80)
-        xm.master_print("✅ TRAINING TEST COMPLETED ON ALL CORES")
+        xm.master_print("✅ TRAINING COMPLETED ON ALL CORES")
         xm.master_print(f"Active cores: {num_cores}/32")
+        xm.master_print(f"Total time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
+        xm.master_print(f"Total steps: {global_step}")
         xm.master_print("=" * 80)
     
     xm.rendezvous("final_check")
