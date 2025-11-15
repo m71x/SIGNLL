@@ -1,4 +1,3 @@
-# controller_train_xla.py
 import os, time
 import torch
 import torch.nn as nn
@@ -104,7 +103,7 @@ def train_loop(rank, flags):
     if rank == 0:
         xm.master_print("✅ Initial weights synchronized across all cores")
     
-    # ========== VERIFY INITIAL WEIGHT SYNC ==========
+    # ========== VERIFY INITIAL WEIGHT SYNC (Keep for debugging initial state) ==========
     param_checks = []
     for i, param in enumerate(model.parameters()):
         if i >= 3:
@@ -122,7 +121,7 @@ def train_loop(rank, flags):
         for i, (param_sum, param_element) in enumerate(param_checks):
             expected_sum = param_element * num_cores
             diff = param_sum - expected_sum
-            xm.master_print(f"Parameter {i}: Difference = {diff}")
+            xm.master_print(f"Parameter {i}: Difference = {diff:.6f}")
         xm.master_print("=" * 80)
     
     xm.rendezvous("verify_weights")
@@ -135,6 +134,7 @@ def train_loop(rank, flags):
     num_epochs = flags["epochs"]
     lambda_start, lambda_target = flags["lambda_start"], flags["lambda_target"]
     batch_size = flags["batch_size"]
+    total_steps = num_epochs * (num_samples // batch_size)
     
     # Calculate number of batches per epoch
     num_batches = num_samples // batch_size
@@ -142,29 +142,28 @@ def train_loop(rank, flags):
     if rank == 0:
         xm.master_print(f"Training config: {num_epochs} epochs, {num_batches} batches/epoch, batch_size={batch_size}")
         xm.master_print(f"Total global samples: {num_samples * num_cores}")
+        xm.master_print(f"Total steps: {total_steps}")
     
     global_step = 0
     start_time = time.time()
     
-    # --- Training Loop ---
+    # --- Full Training Loop ---
     model.train()
     
-    # CHANGED: Loop over all batches instead of just one
-    for epoch in range(num_epochs):
+    for epoch in range(num_epochs): # MODIFICATION 1: Iterate over all epochs
         if rank == 0:
-            xm.master_print(f"\n{'='*80}")
-            xm.master_print(f"EPOCH {epoch+1}/{num_epochs}")
-            xm.master_print(f"{'='*80}")
+            xm.master_print(f"\n--- Epoch {epoch + 1}/{num_epochs} ---")
         
-        for batch_idx in range(num_batches):  # CHANGED: now loops through all batches
-            global_step += 1
+        for batch_idx in range(num_batches): # MODIFICATION 2: Iterate over all batches
             
-            # Get batch slice
+            # MODIFICATION 3: Implement batch slicing
             start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, num_samples)
+            end_idx = min((batch_idx + 1) * batch_size, num_samples)
             
             teacher_cls = teacher_cls_full[start_idx:end_idx]
             teacher_label = teacher_label_full[start_idx:end_idx]
+            
+            # --- Loss Calculation ---
             
             # Forward pass
             halting_logits, class_logits, _ = model(teacher_cls)
@@ -183,15 +182,19 @@ def train_loop(rank, flags):
             ce_per_layer = bce_loss_fn(class_logits_positive, labels)
             loss_cls = (q * ce_per_layer).sum(dim=1).mean()
             
-            # Halting loss
+            # Halting loss (Lambda calculation should be dynamic)
             depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
             halt_penalty = (depths * (1 - h)).sum(dim=1)
-            progress = epoch / max(1, num_epochs - 1)  # CHANGED: proper progress calculation
+            
+            # MODIFICATION 4: Calculate dynamic lambda
+            progress = global_step / total_steps
             lambda_now = lambda_start + (lambda_target - lambda_start) * progress
             loss_halt = lambda_now * halt_penalty.mean()
             
             # Total loss
             loss = loss_cls + loss_halt
+            
+            # --- Backward Pass and Optimization ---
             
             # Backward pass
             optimizer.zero_grad()
@@ -199,29 +202,56 @@ def train_loop(rank, flags):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             xm.optimizer_step(optimizer)
             
-            # Log every N steps
-            if global_step % flags["log_interval"] == 0 and rank == 0:
-                xm.master_print(
-                    f"[Epoch {epoch+1}/{num_epochs}] [Step {global_step}] [Batch {batch_idx+1}/{num_batches}] "
-                    f"loss={loss.item():.4f} cls={loss_cls.item():.4f} halt={loss_halt.item():.4f} "
-                    f"mean_h={h.mean().item():.4f} lambda={lambda_now:.6f}"
-                )
+            # CRITICAL MODIFICATION 5: Add mark_step to prevent XLA deadlock
+            # This is essential for preventing the hang when iterating over multiple batches.
+            xm.mark_step()
+            
+            # --- Logging (Only on master rank and every log_interval) ---
+            if global_step % flags["log_interval"] == 0:
+                
+                # All-reduce losses for logging
+                loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
+                loss_cls_sum = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
+                loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
+                h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
+                
+                # Log on master core after all-reduce
+                if rank == 0:
+                    current_time = time.time()
+                    elapsed_time = current_time - start_time
+                    
+                    xm.master_print("-" * 50)
+                    xm.master_print(f"Epoch: {epoch + 1}/{num_epochs} | Step: {global_step}/{total_steps} ({global_step * 100 / total_steps:.1f}%)")
+                    xm.master_print(f"Avg Total Loss: {(loss_sum / num_cores).item():.6f}")
+                    xm.master_print(f"Avg Cls Loss: {(loss_cls_sum / num_cores).item():.6f}")
+                    xm.master_print(f"Avg Halt Loss: {(loss_halt_sum / num_cores).item():.6f}")
+                    xm.master_print(f"Avg Mean h: {(h_mean / num_cores).item():.6f}")
+                    xm.master_print(f"Lambda: {lambda_now:.6f}")
+                    xm.master_print(f"Time elapsed: {elapsed_time:.1f}s")
+                    xm.master_print("-" * 50)
+
+            # Update step count
+            global_step += 1
         
-        # End of epoch
-        if rank == 0:
-            elapsed = time.time() - start_time
-            xm.master_print("-" * 80)
-            xm.master_print(f"EPOCH {epoch+1}/{num_epochs} COMPLETED")
-            xm.master_print(f"  Elapsed Time: {elapsed:.1f}s")
-            xm.master_print("-" * 80)
+        # --- Checkpoint after each epoch ---
+        if (epoch + 1) % flags["checkpoint_interval"] == 0:
+            if rank == 0:
+                checkpoint_path = f"checkpoint_epoch_{epoch + 1}.pt"
+                # Save only the model state dict (and possibly optimizer state dict)
+                # xm.save(model.state_dict(), checkpoint_path) # Example save command
+                xm.master_print(f"Checkpoint saved for Epoch {epoch + 1} at {checkpoint_path} (placeholder)")
         
-        # Save checkpoint every epoch (only on master core)
-        #got rid of for now
-    
-    # Final weight synchronization verification
+        # Ensure all cores finish the epoch before proceeding to the next one
+        xm.rendezvous(f"epoch_end_{epoch}")
+
+
+    # --- FINAL WEIGHT CHECK (Keep for peace of mind) ---
+    total_time = time.time() - start_time
     if rank == 0:
         xm.master_print("\n" + "=" * 80)
-        xm.master_print("FINAL WEIGHT SYNCHRONIZATION CHECK")
+        xm.master_print("TRAINING FINISHED")
+        xm.master_print(f"Total time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
+        xm.master_print(f"Total steps: {global_step}")
         xm.master_print("=" * 80)
     
     param_checks_final = []
@@ -235,18 +265,14 @@ def train_loop(rank, flags):
     xm.mark_step()
     
     if rank == 0:
-        total_time = time.time() - start_time
         for i, (param_sum, param_element) in enumerate(param_checks_final):
             expected_sum = param_element * num_cores
             xm.master_print(f"Parameter {i}:")
             xm.master_print(f"  Sum across cores: {param_sum}")
             xm.master_print(f"  Expected if synced: {expected_sum}")
-            xm.master_print(f"  Difference: {param_sum - expected_sum}")
+            xm.master_print(f"  Difference: {param_sum - expected_sum:.6f}")
         xm.master_print("=" * 80)
-        xm.master_print("✅ TRAINING COMPLETED ON ALL CORES")
-        xm.master_print(f"Active cores: {num_cores}/32")
-        xm.master_print(f"Total time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
-        xm.master_print(f"Total steps: {global_step}")
+        xm.master_print(f"✅ FINAL TRAINING COMPLETED ON ALL CORES. Active cores: {num_cores}/32")
         xm.master_print("=" * 80)
     
     xm.rendezvous("final_check")
@@ -260,6 +286,9 @@ def _mp_fn(rank, flags):
         print(f"[Core {rank}] FATAL ERROR: {e}")
         import traceback
         traceback.print_exc()
+        # If one core raises an exception, we need to ensure the TPU job stops
+        # Calling xm.rendezvous here might hang if other cores are stuck,
+        # so simply re-raising the exception is the right move for XLA.
         raise
 
 
