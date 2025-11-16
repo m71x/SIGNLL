@@ -220,7 +220,8 @@ def train_loop(rank, flags):
             halt_penalty = (depths * (1 - h)).sum(dim=1)
             
             progress = global_step / total_steps
-            lambda_now = lambda_start + (lambda_target - lambda_start) * progress
+            #deleted lambda increase for now
+            lambda_now = lambda_start
             loss_halt = lambda_now * halt_penalty.mean()
             
             # Total loss
