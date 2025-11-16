@@ -18,6 +18,7 @@ from training_data_download import training_data_download
 #TODO
 #write code to run on all chunks from 0-28 for each shard
 #double check architecture of model and loss is actually what you want it to do
+#fix the loss function to prioritize CLS loss more, CLS loss seems to be increasing per epoch because halt loss matters too much
 
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
