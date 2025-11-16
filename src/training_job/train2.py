@@ -105,29 +105,6 @@ def train_loop(rank, flags):
     
     if rank == 0:
         xm.master_print("✅ Initial weights synchronized across all cores")
-    
-    # ========== VERIFY INITIAL WEIGHT SYNC ==========
-    param_checks = []
-    for i, param in enumerate(model.parameters()):
-        if i >= 3:
-            break
-        param_element = param.flatten()[0]
-        param_sum = xm.all_reduce(xm.REDUCE_SUM, param_element)
-        param_checks.append((param_sum, param_element))
-    
-    xm.mark_step()
-    
-    if rank == 0:
-        xm.master_print("=" * 80)
-        xm.master_print("INITIAL WEIGHT SYNC VERIFICATION")
-        xm.master_print("=" * 80)
-        for i, (param_sum, param_element) in enumerate(param_checks):
-            expected_sum = param_element * num_cores
-            diff = param_sum - expected_sum
-            xm.master_print(f"Parameter {i}: Difference = {diff}")
-        xm.master_print("=" * 80)
-    
-    xm.rendezvous("verify_weights")
 
     # ... (Rest of your optimizer setup) ...
     optimizer = optim.AdamW(model.parameters(), lr=flags["lr"], weight_decay=1e-2)
@@ -229,13 +206,29 @@ def train_loop(rank, flags):
                     xm.master_print("-" * 50)
 
             global_step += 1
-            
-        # --- End of Epoch Logging ---
+        
+        # --- End of Epoch Weight Sync Check ---
+        param_checks = []
+        for i, param in enumerate(model.parameters()):
+            if i >= 3:
+                break
+            param_element = param.flatten()[0]
+            param_sum = xm.all_reduce(xm.REDUCE_SUM, param_element)
+            param_checks.append((param_sum, param_element))
+        
+        xm.mark_step()
+        
         if rank == 0:
             elapsed = time.time() - start_time
             xm.master_print("-" * 80)
             xm.master_print(f"EPOCH {epoch+1}/{num_epochs} COMPLETED")
             xm.master_print(f"  Elapsed Time: {elapsed:.1f}s")
+            xm.master_print("")
+            xm.master_print("WEIGHT SYNCHRONIZATION CHECK:")
+            for i, (param_sum, param_element) in enumerate(param_checks):
+                expected_sum = param_element * num_cores
+                diff = param_sum - expected_sum
+                xm.master_print(f"  Parameter {i}: Difference = {diff}")
             xm.master_print("-" * 80)
         
         # --- Checkpointing (Same as before) ---
@@ -252,37 +245,14 @@ def train_loop(rank, flags):
         # Ensure all cores finish the epoch before proceeding
         xm.rendezvous(f"epoch_end_{epoch}")
 
-    # --- FINAL WEIGHT CHECK ---
+    # --- FINAL SUMMARY ---
     total_time = time.time() - start_time
     if rank == 0:
         xm.master_print("\n" + "=" * 80)
         xm.master_print("TRAINING FINISHED")
         xm.master_print(f"Total time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
         xm.master_print(f"Total steps: {global_step}")
-        xm.master_print("=" * 80)
-    
-    param_checks_final = []
-    for i, param in enumerate(model.parameters()):
-        if i >= 3:
-            break
-        param_element = param.flatten()[0]
-        param_sum = xm.all_reduce(xm.REDUCE_SUM, param_element)
-        param_checks_final.append((param_sum, param_element))
-    
-    xm.mark_step()
-    
-    if rank == 0:
-        xm.master_print("\n" + "=" * 80)
-        xm.master_print("FINAL WEIGHT SYNCHRONIZATION CHECK")
-        xm.master_print("=" * 80)
-        for i, (param_sum, param_element) in enumerate(param_checks_final):
-            expected_sum = param_element * num_cores
-            xm.master_print(f"Parameter {i}:")
-            xm.master_print(f"  Sum across cores: {param_sum}")
-            xm.master_print(f"  Expected if synced: {expected_sum}")
-            xm.master_print(f"  Difference: {param_sum - expected_sum}")
-        xm.master_print("=" * 80)
-        xm.master_print(f"✅ FINAL TRAINING COMPLETED ON ALL CORES. Active cores: {num_cores}/32")
+        xm.master_print(f"✅ TRAINING COMPLETED ON ALL CORES. Active cores: {num_cores}/32")
         xm.master_print("=" * 80)
     
     xm.rendezvous("final_check")
