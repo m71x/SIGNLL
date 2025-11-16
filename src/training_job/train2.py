@@ -389,7 +389,7 @@ if __name__ == "__main__":
         
         # Halting loss schedule, halting loss should at first be very small then gradually go to a maximum where it matters about exactly as much as CLS
         "lambda_start": 0.0001,
-        "lambda_target": 0.05,
+        "lambda_target": 0.025,
         
         # Training, leave at 5 if model seems to be converging, else go to 10
         "epochs": 10,
