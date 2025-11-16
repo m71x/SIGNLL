@@ -21,6 +21,7 @@ from training_data_download import training_data_download
 #modify script to also show an example of predicted classification vs label for each of the 24 CLS/halting heads per epoch
 #consider if it is necessary to do data sharding so that the number of positive and negative samples are approximately equal, right now it is more of a 3-1 ratio
 #SEPARATE CLS AND HALTING TRAINING, FOR HALTING, TRAIN CLS FIRST, THEN FREEZE CLS AND ONLY MODIFY HALTING
+#don't worry about it now, but during inference, consider settting halting threshold to confidece >= 0.9 or >=0.85 or >=0.95. That's when it seems like it is confident enough
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
     num_cores = xm.xrt_world_size()
@@ -388,7 +389,7 @@ if __name__ == "__main__":
         
         # Halting loss schedule, halting loss should at first be very small then gradually go to a maximum where it matters about exactly as much as CLS
         "lambda_start": 0.0001,
-        "lambda_target": 0.01,
+        "lambda_target": 0.05,
         
         # Training, leave at 5 if model seems to be converging, else go to 10
         "epochs": 10,
