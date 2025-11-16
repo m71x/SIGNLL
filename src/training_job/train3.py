@@ -97,11 +97,12 @@ def train_loop(rank, flags):
     # --- Training Configuration ---
     num_epochs = flags["epochs"]
     batch_size = flags["batch_size"]
-    
+    lambda_start, lambda_target = flags["lambda_start"], flags["lambda_target"]
     # (3) Get number of steps from the DataLoader
     # We use len(data_loader) which is XLA-safe
     num_batches_per_epoch = len(data_loader)
     total_steps = num_epochs * num_batches_per_epoch
+
 
     if rank == 0:
         xm.master_print(f"Training config: {num_epochs} epochs, {num_batches_per_epoch} batches/epoch")
@@ -179,3 +180,45 @@ def train_loop(rank, flags):
     # ... (Rest of your final checks) ...
 
 # ... (Rest of your _mp_fn and __main__ block) ...
+def _mp_fn(rank, flags):
+    try:
+        torch.set_default_tensor_type('torch.FloatTensor')
+        train_loop(rank, flags)
+    except Exception as e:
+        print(f"[Core {rank}] FATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        # If one core raises an exception, we need to ensure the TPU job stops
+        # Calling xm.rendezvous here might hang if other cores are stuck,
+        # so simply re-raising the exception is the right move for XLA.
+        raise
+
+
+if __name__ == "__main__":
+    FLAGS = {
+        # Model architecture
+        "d_ctrl": 256,
+        "transformer_layers": 4,
+        
+        # Optimization
+        "lr": 3e-4,
+        "batch_size": 64,  # Smaller batch size for 19500 samples
+        
+        # Halting loss schedule, halting loss should at first be very small then gradually go to a maximum where it matters about exactly as much as CLS
+        "lambda_start": 0.0001,
+        "lambda_target": 0.01,
+        
+        # Training, leave at 5 if model seems to be converging, else go to 10
+        "epochs": 5,
+        
+        # Data loading
+        "chunk_filename": "embeddings_chunk_0.npz",  # Change to desired chunk
+        "samples_per_shard": 19500,  # Number of samples per core
+        
+        # Logging and checkpointing
+        "log_interval": 50,  # Log every N steps
+        "checkpoint_interval": 1,  # Save checkpoint every N epochs
+    }
+    
+    # Automatically detect number of TPU cores
+    xmp.spawn(_mp_fn, args=(FLAGS,), start_method='fork')
