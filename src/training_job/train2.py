@@ -13,7 +13,7 @@ from controller_model import Controller, compute_q_from_h
 from training_data_download import training_data_download
 #NOTE:
 #DO NOT USE .item(), IT WILL FORCE XLA TO RECOMPILE AT EVERY BATCH ITERATION
-
+#be wary of using torch.save()
 #TODO
 #write code to run on all chunks from 0-28 for each shard
 #double check architecture of model and loss is actually what you want it to do
@@ -48,6 +48,15 @@ def train_loop(rank, flags):
     elif teacher_cls_full.shape[1] != 24:
         raise ValueError(f"Unexpected number of layers: {teacher_cls_full.shape[1]}")
 
+    # === NEW: Print Sample Distribution for the current shard ===
+    # Calculate the number of samples with label 0
+    # Use .item() to extract the Python integer from the single-element tensor for printing
+    neg_samples_count = (teacher_label_full == 0).sum().item() 
+    
+    # Use standard print() here to show local core data distribution
+    print(f"[Core {rank}] Data Shard Check: {neg_samples_count} samples have Label 0 (Negative).")
+    # ==========================================================
+    
     num_samples = teacher_cls_full.shape[0]
 
     # --- (2) Create Dataset and DataLoader ---
@@ -153,14 +162,8 @@ def train_loop(rank, flags):
             # --- Loss Calculation (Same as before) ---
             halting_logits, class_logits, _ = model(teacher_cls)
             
-            # === New: Capture diagnostic data on the first batch of rank 0 ===
-            # We only do this once per epoch on the master core (rank 0) to minimize overhead.
+            # === Capture diagnostic data on the first batch of rank 0 ===
             if rank == 0 and batch_idx == 0:
-                # class_logits shape is (Batch, L=24, Num_Classes=2)
-                # teacher_label shape is (Batch,)
-                
-                # Detach, move to CPU, and store the first sample's data
-                # This only happens once per epoch, so CPU transfer is acceptable.
                 sample_logits_cpu = class_logits[0].detach().cpu()
                 sample_label_cpu = teacher_label[0].detach().cpu()
             
@@ -233,7 +236,7 @@ def train_loop(rank, flags):
             xm.master_print(f"  Avg Mean h: {h_mean / num_cores}")
             xm.master_print(f"  Lambda: {lambda_now:.6f}")
             
-            # === NEW: SAMPLE CLASSIFICATION DIAGNOSTIC (using .tolist() instead of .item()) ===
+            # === SAMPLE CLASSIFICATION DIAGNOSTIC ===
             if sample_logits_cpu is not None and sample_label_cpu is not None:
                 xm.master_print("\nSAMPLE CLASSIFICATION DIAGNOSTIC (First sample of first batch):")
                 
@@ -243,16 +246,14 @@ def train_loop(rank, flags):
                 # Get the predicted class index (0 or 1) for each of the 24 layers
                 predicted_classes = torch.argmax(sample_probs, dim=-1).tolist()
                 
-                # Get the probability of the predicted class (max probability) at each layer
                 # Get the maximum confidence for all layers as a tensor (24,)
                 max_confidences = sample_probs.max(dim=-1).values
                 # Convert to a standard list of floats
                 max_confidences_list = max_confidences.tolist()
-                # Format the list of floats for readability, no .item() needed
+                # Format the list of floats for readability
                 predicted_probs = [f"{p:.4f}" for p in max_confidences_list]
                 
-                # Extract the scalar true label using tolist() instead of tolist()[0]
-                # FIX: Remove [0] as sample_label_cpu.tolist() returns a Python scalar (int) directly.
+                # Extract the scalar true label
                 true_label_value = sample_label_cpu.tolist()
                 
                 xm.master_print(f"  True Label (0 or 1): {true_label_value}")
