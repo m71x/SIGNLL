@@ -4,17 +4,19 @@ import torch.nn as nn
 import torch.optim as optim
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
+import torch_xla.runtime as xr  # <-- Import runtime for new API
 
-# (1) Import new classes
+# (1) Import standard DataLoader, Dataset
 from torch.utils.data import TensorDataset, DataLoader
-from torch.utils.data.distributed import DistributedSampler
+# (DistributedSampler is NO LONGER needed)
 
 from controller_model import Controller, compute_q_from_h
 from training_data_download import training_data_download
 
 def train_loop(rank, flags):
-    device = xm.torch_xla.device()
-    num_cores = xm.xrt_world_size()
+    # --- (FIX 1) Use new runtime API ---
+    device = xm.xla_device()
+    num_cores = xr.world_size() # <-- Fixed deprecation
 
     if rank == 0:
         xm.master_print(f"Detected {num_cores} active cores")
@@ -39,23 +41,17 @@ def train_loop(rank, flags):
     elif teacher_cls_full.shape[1] != 24:
         raise ValueError(f"Unexpected number of layers: {teacher_cls_full.shape[1]}")
 
-    num_samples = teacher_cls_full.shape[0]
-
-    # --- Create Dataset and DataLoader ---
+    # --- (FIX 2) Create DataLoader WITHOUT DistributedSampler ---
     dataset = TensorDataset(teacher_cls_full, teacher_label_full)
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=num_cores,
-        rank=rank,
-        shuffle=True
-    )
+    
     data_loader = DataLoader(
         dataset,
-        sampler=sampler,
         batch_size=flags["batch_size"],
         drop_last=True,
-        num_workers=2
+        shuffle=True,      # <-- Use shuffle=True to shuffle the local shard
+        num_workers=0      # <-- CRITICAL FIX for deadlock
     )
+    # The 'sampler' argument is removed.
 
     xm.rendezvous("data_prepared")
 
@@ -92,19 +88,16 @@ def train_loop(rank, flags):
     for i, param in enumerate(model.parameters()):
         if i >= 3:
             break
-        # We need to clone and move to CPU for the master print later
         param_element_cpu = param.flatten()[0].cpu() 
         param_checks.append(param_element_cpu)
     
-    xm.rendezvous("verify_weights_prep") # Wait for all cores to grab their params
+    xm.rendezvous("verify_weights_prep")
     
     if rank == 0:
         xm.master_print("=" * 80)
         xm.master_print("INITIAL WEIGHT SYNC VERIFICATION (Value on Rank 0)")
         xm.master_print("=" * 80)
         for i, param_val in enumerate(param_checks):
-            # This check is simpler: just print the value from Rank 0.
-            # The all_reduce above already guarantees they are the same.
             xm.master_print(f"Parameter {i} (Rank 0): Value = {param_val.item():.6f}")
         xm.master_print("=" * 80)
     
@@ -118,13 +111,14 @@ def train_loop(rank, flags):
     num_epochs = flags["epochs"]
     lambda_start, lambda_target = flags["lambda_start"], flags["lambda_target"]
     batch_size = flags["batch_size"]
+    
+    # len(data_loader) will now be correct: 19500 // 64 = 304
     num_batches_per_epoch = len(data_loader)
     total_steps = num_epochs * num_batches_per_epoch
 
     if rank == 0:
         xm.master_print(f"Training config: {num_epochs} epochs, {num_batches_per_epoch} batches/epoch")
-        xm.master_print(f"Total global samples: (approx) {num_batches_per_epoch * batch_size * num_cores}")
-        xm.master_print(f"Total steps: {total_steps}")
+        xm.master_print(f"Total global steps: {total_steps}")
     
     global_step = 0
     start_time = time.time()
@@ -135,14 +129,14 @@ def train_loop(rank, flags):
         if rank == 0:
             xm.master_print(f"\n--- Epoch {epoch + 1}/{num_epochs} ---")
         
-        sampler.set_epoch(epoch)
+        # --- (FIX 3) We no longer need sampler.set_epoch() ---
 
-        # --- FIX: Initialize as tensors on device ---
         epoch_total_loss = torch.tensor(0.0, device=device)
         epoch_cls_loss = torch.tensor(0.0, device=device)
         epoch_halt_loss = torch.tensor(0.0, device=device)
         epoch_h_mean = torch.tensor(0.0, device=device)
 
+        # This loop should no longer hang
         for batch_idx, (teacher_cls, teacher_label) in enumerate(data_loader):
             
             teacher_cls = teacher_cls.to(device)
@@ -179,11 +173,8 @@ def train_loop(rank, flags):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             xm.optimizer_step(optimizer)
             
-            # We still need mark_step()!
             xm.mark_step()
             
-            # --- FIX: Accumulate as tensors (NO .item()) ---
-            # We use .detach() to prevent gradient history from accumulating
             epoch_total_loss += loss.detach()
             epoch_cls_loss += loss_cls.detach()
             epoch_halt_loss += loss_halt.detach()
@@ -191,18 +182,14 @@ def train_loop(rank, flags):
 
             # --- Logging (Per-Step) ---
             if global_step % flags["log_interval"] == 0:
-                
-                # All-reduce losses for logging
                 loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
                 loss_cls_sum = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
                 loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
                 h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
                 
-                # Log on master core after all-reduce
                 if rank == 0:
                     current_time = time.time()
                     elapsed_time = current_time - start_time
-                    
                     xm.master_print("-" * 50)
                     xm.master_print(f"Epoch: {epoch + 1}/{num_epochs} | Step: {global_step}/{total_steps} ({global_step * 100 / total_steps:.1f}%)")
                     xm.master_print(f"Avg Total Loss: {(loss_sum / num_cores).item():.6f}")
@@ -216,16 +203,12 @@ def train_loop(rank, flags):
             global_step += 1
         
         # --- End of Epoch Logging and Checkpoint ---
-
-        # All-reduce the accumulated epoch totals
         total_loss_all_reduce = xm.all_reduce(xm.REDUCE_SUM, epoch_total_loss)
         cls_loss_all_reduce = xm.all_reduce(xm.REDUCE_SUM, epoch_cls_loss)
         halt_loss_all_reduce = xm.all_reduce(xm.REDUCE_SUM, epoch_halt_loss)
         h_mean_all_reduce = xm.all_reduce(xm.REDUCE_SUM, epoch_h_mean)
         
         if rank == 0:
-            # We divide by num_batches_per_epoch here because the tensors 
-            # already represent the sum of losses *on each core*.
             avg_epoch_loss = (total_loss_all_reduce / (num_cores * num_batches_per_epoch)).item()
             avg_epoch_cls_loss = (cls_loss_all_reduce / (num_cores * num_batches_per_epoch)).item()
             avg_epoch_halt_loss = (halt_loss_all_reduce / (num_cores * num_batches_per_epoch)).item()
@@ -256,7 +239,6 @@ def train_loop(rank, flags):
         xm.master_print(f"Total steps: {global_step}")
         xm.master_print("=" * 80)
     
-    # Final check is good for debugging
     param_checks_final_cpu = []
     for i, param in enumerate(model.parameters()):
         if i >= 3:
@@ -275,18 +257,16 @@ def train_loop(rank, flags):
         xm.master_print("=" * 80)
     
     xm.rendezvous("final_check_done")
-    
+
+
 def _mp_fn(rank, flags):
     try:
-        torch.set_default_tensor_type('torch.FloatTensor')
+        # --- (FIX 4) Removed deprecated set_default_tensor_type ---
         train_loop(rank, flags)
     except Exception as e:
         print(f"[Core {rank}] FATAL ERROR: {e}")
         import traceback
         traceback.print_exc()
-        # If one core raises an exception, we need to ensure the TPU job stops
-        # Calling xm.rendezvous here might hang if other cores are stuck,
-        # so simply re-raising the exception is the right move for XLA.
         raise
 
 
@@ -298,23 +278,22 @@ if __name__ == "__main__":
         
         # Optimization
         "lr": 3e-4,
-        "batch_size": 64,  # Smaller batch size for 19500 samples
+        "batch_size": 64,  # This will now be 19500 // 64 = 304 batches
         
-        # Halting loss schedule, halting loss should at first be very small then gradually go to a maximum where it matters about exactly as much as CLS
+        # Halting loss schedule
         "lambda_start": 0.0001,
         "lambda_target": 0.01,
         
-        # Training, leave at 5 if model seems to be converging, else go to 10
+        # Training
         "epochs": 5,
         
         # Data loading
-        "chunk_filename": "embeddings_chunk_0.npz",  # Change to desired chunk
-        "samples_per_shard": 19500,  # Number of samples per core
+        "chunk_filename": "embeddings_chunk_0.npz",
+        "samples_per_shard": 19500,  # Each core loads 19500
         
         # Logging and checkpointing
         "log_interval": 50,  # Log every N steps
         "checkpoint_interval": 1,  # Save checkpoint every N epochs
     }
     
-    # Automatically detect number of TPU cores
     xmp.spawn(_mp_fn, args=(FLAGS,), start_method='fork')
