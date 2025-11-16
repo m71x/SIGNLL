@@ -46,15 +46,34 @@ class Controller(nn.Module):
             nn.Linear(d_ctrl, 1) for _ in range(L)
         ])
         
-        # Initialize bias of all halting heads
-        with torch.no_grad():
-            for head in self.halting_heads:
-                head.bias.fill_(halting_bias_init)
-
         # Classification Heads: A list of L unique nn.Linear(d_ctrl, num_classes) layers
         self.classifier_heads = nn.ModuleList([
             nn.Linear(d_ctrl, self.num_classes) for _ in range(L)
         ])
+        
+        # =========================================================================
+        # --- FIX: Weight Re-scaling for Stability in Deep Networks (n_layers=12) ---
+        # =========================================================================
+        with torch.no_grad():
+            
+            # 1. Initialize Classification Heads
+            # Scale down weights to prevent compounded deep-network output explosion
+            # and set a small negative bias for stable initial probabilities.
+            for head in self.classifier_heads:
+                # Use a small gain (e.g., 1e-2) to keep initial logits near zero
+                torch.nn.init.xavier_uniform_(head.weight, gain=1e-2) 
+                if head.bias is not None:
+                    # Set bias slightly negative for initial stability
+                    torch.nn.init.constant_(head.bias, -0.1) 
+                    
+            # 2. Initialize Halting Heads
+            for head in self.halting_heads:
+                # Re-initialize weights to prevent large initial logits
+                torch.nn.init.xavier_uniform_(head.weight, gain=1e-2) 
+                # Keep the user's explicit bias initialization for the halting head
+                head.bias.fill_(halting_bias_init) 
+        # =========================================================================
+
 
     def forward(self, teacher_cls: torch.Tensor):
         """
@@ -79,6 +98,8 @@ class Controller(nn.Module):
         x = x + self.layer_embed(idx)
         x = self.pre_ln(x)
         
+        # Mask for the self-attention layer (causal mask: attention only to preceding layers)
+        # Note: L must be equal to the sequence length in the batch (24)
         attn_mask = torch.triu(torch.ones(L, L, device=teacher_cls.device), diagonal=1).bool()
         z = self.transformer(x, mask=attn_mask)
         z = self.post_ln(z) # z is the sequence of layer representations [B, L, d_ctrl]
@@ -108,10 +129,22 @@ class Controller(nn.Module):
 
 # The utility function remains unchanged as it operates on the outputs, not the model.
 def compute_q_from_h(h: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    # ... (function body as before)
+    """
+    Computes the probability of halting at layer l, q_l, given the probability of 
+    halting *not before* layer l, h_l.
+    h: [B, L], the per-layer halting probability (h_l = P(halt | l))
+    Returns:
+        q: [B, L], the probability of halting exactly at layer l (q_l = P(halt at l))
+    """
     h = h.clamp(min=eps, max=1.0 - eps)
+    # S is the probability of *not* halting before this layer: P(stop > l) = Prod_{i=1}^{l} (1 - h_i)
     one_minus_h = 1.0 - h
     S = torch.cumprod(one_minus_h, dim=1)
+    
+    # S_prev is P(stop > l-1)
+    # [1, S_1, S_2, ..., S_{L-1}]
     ones = torch.ones(h.size(0), 1, device=h.device, dtype=h.dtype)
     S_prev = torch.cat([ones, S[:, :-1]], dim=1)
+    
+    # q_l = P(halt at l) = P(halt | l) * P(stop > l-1) = h_l * S_prev_{l}
     return S_prev * h
