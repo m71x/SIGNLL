@@ -9,7 +9,7 @@ class Controller(nn.Module):
         L: int = 24,
         d_teacher: int = 1024,
         d_ctrl: int = 256,
-        n_layers: int = 4,
+        n_layers: int = 6,
         n_heads: int = 4,
         ffn_dim: int = 1024,
         dropout: float = 0.1,
