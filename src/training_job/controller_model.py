@@ -34,7 +34,7 @@ class Controller(nn.Module):
             dropout=dropout,
             activation="gelu",
             batch_first=True,
-            norm_first=True,  # <-- MODIFIED: Set to True for pre-normalization (more stable)
+            norm_first=True,  # MODIFIED: Use pre-normalization for stability
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         self.pre_ln = nn.LayerNorm(d_ctrl)
@@ -68,7 +68,7 @@ class Controller(nn.Module):
             # Use Xavier/Glorot uniform initialization for linear layers
             nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
-                # Initialize biases to zero, except for the halting head (handled above)
+                # Initialize biases to zero
                 nn.init.constant_(module.bias, 0)
         elif isinstance(module, nn.Embedding):
             # Use a standard normal distribution for embeddings
@@ -86,5 +86,54 @@ class Controller(nn.Module):
             class_logits: [B, L, num_classes]
             z: [B, L, d_ctrl]
         """
-        # (The rest of the file remains unchanged)
-# ...
+        #teacher_cls = teacher_cls[:, 1:25, :]   # now shape becomes [B, 24, D]
+        B, L, D = teacher_cls.shape
+        #xm.master_print(f"[DEBUG] forward() received shape: B={B}, L={L}, D={D}")
+        #xm.master_print(f"[DEBUG] Model expects L={self.L}, D={self.d_teacher}")
+
+        assert L == self.L and D == self.d_teacher, \
+            f"Shape mismatch! got (L={L}, D={D}) but model expects (L={self.L}, D={self.d_teacher})"
+        
+        
+        # 1. Controller Body Computation (Same as before)
+        x = self.proj(teacher_cls)
+        idx = torch.arange(self.L, device=teacher_cls.device).unsqueeze(0).expand(B, -1)
+        x = x + self.layer_embed(idx)
+        x = self.pre_ln(x)
+        
+        attn_mask = torch.triu(torch.ones(L, L, device=teacher_cls.device), diagonal=1).bool()
+        z = self.transformer(x, mask=attn_mask)
+        z = self.post_ln(z) # z is the sequence of layer representations [B, L, d_ctrl]
+        
+        # 2. Apply Unique Heads (Iterate over the L tokens)
+        halting_logits_list = []
+        class_logits_list = []
+        
+        # z[:, l, :] is the l-th depth token y_l (shape [B, d_ctrl])
+        for l in range(L):
+            # Apply the l-th unique halting head
+            h_l = self.halting_heads[l](z[:, l, :]) # Output shape: [B, 1]
+            halting_logits_list.append(h_l)
+            
+            # Apply the l-th unique classification head
+            c_l = self.classifier_heads[l](z[:, l, :]) # Output shape: [B, num_classes]
+            class_logits_list.append(c_l)
+        
+        # Stack the results to match the required output shape
+        # Halting logits: L lists of [B, 1] -> [B, L, 1] -> [B, L]
+        halting_logits = torch.cat(halting_logits_list, dim=-1).squeeze(-1) 
+        
+        # Class logits: L lists of [B, num_classes] -> [B, L, num_classes]
+        class_logits = torch.stack(class_logits_list, dim=1)
+        
+        return halting_logits, class_logits, z
+
+# The utility function remains unchanged as it operates on the outputs, not the model.
+def compute_q_from_h(h: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    # ... (function body as before)
+    h = h.clamp(min=eps, max=1.0 - eps)
+    one_minus_h = 1.0 - h
+    S = torch.cumprod(one_minus_h, dim=1)
+    ones = torch.ones(h.size(0), 1, device=h.device, dtype=h.dtype)
+    S_prev = torch.cat([ones, S[:, :-1]], dim=1)
+    return S_prev * h
