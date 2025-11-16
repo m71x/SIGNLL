@@ -20,6 +20,7 @@ from training_data_download import training_data_download
 #fix the loss function to prioritize CLS loss more, CLS loss seems to be increasing per epoch because halt loss matters too much
 #modify script to also show an example of predicted classification vs label for each of the 24 CLS/halting heads per epoch
 #consider if it is necessary to do data sharding so that the number of positive and negative samples are approximately equal, right now it is more of a 3-1 ratio
+#SEPARATE CLS AND HALTING TRAINING, FOR HALTING, TRAIN CLS FIRST, THEN FREEZE CLS AND ONLY MODIFY HALTING
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
     num_cores = xm.xrt_world_size()
