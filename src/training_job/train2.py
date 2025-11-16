@@ -374,7 +374,7 @@ if __name__ == "__main__":
         "lambda_target": 0.01,
         
         # Training, leave at 5 if model seems to be converging, else go to 10
-        "epochs": 5,
+        "epochs": 10,
         
         # Data loading
         "chunk_filename": "embeddings_chunk_0.npz", # Change to desired chunk
