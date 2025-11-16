@@ -1,4 +1,3 @@
-#train2.py
 import os, time
 import torch
 import torch.nn as nn
@@ -19,7 +18,7 @@ from training_data_download import training_data_download
 #write code to run on all chunks from 0-28 for each shard
 #double check architecture of model and loss is actually what you want it to do
 #fix the loss function to prioritize CLS loss more, CLS loss seems to be increasing per epoch because halt loss matters too much
-
+#modify script to also show an example of predicted classification vs label for each of the 24 CLS/halting heads per epoch
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
     num_cores = xm.xrt_world_size()
@@ -124,7 +123,6 @@ def train_loop(rank, flags):
     num_batches_per_epoch = len(data_loader)
     total_steps = num_epochs * num_batches_per_epoch
 
-
     if rank == 0:
         xm.master_print(f"Training config: {num_epochs} epochs, {num_batches_per_epoch} batches/epoch")
         xm.master_print(f"Total global samples: (approx) {num_samples * num_cores}")
@@ -133,6 +131,10 @@ def train_loop(rank, flags):
     global_step = 0
     start_time = time.time()
     model.train()
+
+    # Variables to hold diagnostic data for rank 0
+    sample_logits_cpu = None
+    sample_label_cpu = None
 
     # --- (4) Full Training Loop (Refactored) ---
     for epoch in range(num_epochs):
@@ -151,6 +153,18 @@ def train_loop(rank, flags):
             # --- Loss Calculation (Same as before) ---
             halting_logits, class_logits, _ = model(teacher_cls)
             
+            # === New: Capture diagnostic data on the first batch of rank 0 ===
+            # We only do this once per epoch on the master core (rank 0) to minimize overhead.
+            if rank == 0 and batch_idx == 0:
+                # class_logits shape is (Batch, L=24, Num_Classes=2)
+                # teacher_label shape is (Batch,)
+                
+                # Detach, move to CPU, and store the first sample's data
+                # This only happens once per epoch, so CPU transfer is acceptable.
+                sample_logits_cpu = class_logits[0].detach().cpu()
+                sample_label_cpu = teacher_label[0].detach().cpu()
+            
+            # --- Loss Calculation (Continuing) ---
             h = torch.sigmoid(halting_logits)
             q = compute_q_from_h(h)
             
@@ -194,7 +208,7 @@ def train_loop(rank, flags):
         loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
         h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
         
-        # Weight sync check
+        # Weight sync check (keeping for debugging consistency)
         param_checks = []
         for i, param in enumerate(model.parameters()):
             if i >= 3:
@@ -218,6 +232,25 @@ def train_loop(rank, flags):
             xm.master_print(f"  Avg Halt Loss: {loss_halt_sum / num_cores}")
             xm.master_print(f"  Avg Mean h: {h_mean / num_cores}")
             xm.master_print(f"  Lambda: {lambda_now:.6f}")
+            
+            # === NEW: SAMPLE CLASSIFICATION DIAGNOSTIC ===
+            if sample_logits_cpu is not None and sample_label_cpu is not None:
+                xm.master_print("\nSAMPLE CLASSIFICATION DIAGNOSTIC (First sample of first batch):")
+                
+                # Convert logits (24, 2) to probabilities (24, 2)
+                sample_probs = torch.softmax(sample_logits_cpu, dim=-1)
+                
+                # Get the predicted class index (0 or 1) for each of the 24 layers
+                predicted_classes = torch.argmax(sample_probs, dim=-1).tolist()
+                
+                # Get the probability of the predicted class (max probability) at each layer
+                # Formatting the probability string for readability
+                predicted_probs = [f"{p.max().item():.4f}" for p in sample_probs]
+                
+                xm.master_print(f"  True Label (0 or 1): {sample_label_cpu.item()}")
+                xm.master_print(f"  Predicted Class per Layer (0-23): {predicted_classes}")
+                xm.master_print(f"  Max Confidence per Layer: {predicted_probs}")
+            
             xm.master_print("")
             xm.master_print("WEIGHT SYNCHRONIZATION CHECK:")
             for i, (param_sum, param_element) in enumerate(param_checks):
