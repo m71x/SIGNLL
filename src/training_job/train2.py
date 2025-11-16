@@ -161,7 +161,6 @@ def train_loop(rank, flags):
                 
                 # Detach, move to CPU, and store the first sample's data
                 # This only happens once per epoch, so CPU transfer is acceptable.
-                # Use tolist() to avoid .item()
                 sample_logits_cpu = class_logits[0].detach().cpu()
                 sample_label_cpu = teacher_label[0].detach().cpu()
             
@@ -252,8 +251,9 @@ def train_loop(rank, flags):
                 # Format the list of floats for readability, no .item() needed
                 predicted_probs = [f"{p:.4f}" for p in max_confidences_list]
                 
-                # Extract the scalar true label using tolist()[0] instead of .item()
-                true_label_value = sample_label_cpu.tolist()[0]
+                # Extract the scalar true label using tolist() instead of tolist()[0]
+                # FIX: Remove [0] as sample_label_cpu.tolist() returns a Python scalar (int) directly.
+                true_label_value = sample_label_cpu.tolist()
                 
                 xm.master_print(f"  True Label (0 or 1): {true_label_value}")
                 xm.master_print(f"  Predicted Class per Layer (0-23): {predicted_classes}")
