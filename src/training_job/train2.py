@@ -70,7 +70,7 @@ def train_loop(rank, flags):
         dataset,
         num_replicas=num_cores,
         rank=rank,
-        shuffle=True  # Shuffle data every epoch
+        shuffle=True # Shuffle data every epoch
     )
 
     # Create the DataLoader
@@ -78,8 +78,8 @@ def train_loop(rank, flags):
         dataset,
         sampler=sampler,
         batch_size=flags["batch_size"],
-        drop_last=True,  # CRITICAL: Ensures all batches are the same size
-        num_workers=2    # Use a few workers to load data in background
+        drop_last=True, # CRITICAL: Ensures all batches are the same size
+        num_workers=2  # Use a few workers to load data in background
     )
 
     # CRITICAL: Wait for all cores to finish data setup
@@ -144,6 +144,13 @@ def train_loop(rank, flags):
     # Variables to hold diagnostic data for rank 0
     sample_logits_cpu = None
     sample_label_cpu = None
+    
+    # NEW: Variables to hold one positive and one negative sample diagnostic data
+    sample_logits_pos_cpu = None
+    sample_label_pos_cpu = None
+    sample_logits_neg_cpu = None
+    sample_label_neg_cpu = None
+    # ==========================================================
 
     # --- (4) Full Training Loop (Refactored) ---
     for epoch in range(num_epochs):
@@ -162,10 +169,35 @@ def train_loop(rank, flags):
             # --- Loss Calculation (Same as before) ---
             halting_logits, class_logits, _ = model(teacher_cls)
             
-            # === Capture diagnostic data on the first batch of rank 0 ===
+            # === Capture diagnostic data on the first batch of rank 0 (MODIFIED) ===
             if rank == 0 and batch_idx == 0:
+                # Keep existing variables assigned to comply with 'don't delete'
                 sample_logits_cpu = class_logits[0].detach().cpu()
                 sample_label_cpu = teacher_label[0].detach().cpu()
+                
+                # NEW: Find and capture one positive and one negative sample
+                positive_indices = (teacher_label == 1).nonzero(as_tuple=True)[0]
+                negative_indices = (teacher_label == 0).nonzero(as_tuple=True)[0]
+
+                # Capture Positive Sample (Label 1)
+                if positive_indices.numel() > 0:
+                    pos_idx = positive_indices[0]
+                    # Logits are (L, 2). Extract the specific sample and move to CPU.
+                    sample_logits_pos_cpu = class_logits[pos_idx].detach().cpu() 
+                    sample_label_pos_cpu = teacher_label[pos_idx].detach().cpu()
+                else:
+                    sample_logits_pos_cpu = None
+                    sample_label_pos_cpu = None
+
+                # Capture Negative Sample (Label 0)
+                if negative_indices.numel() > 0:
+                    neg_idx = negative_indices[0]
+                    # Logits are (L, 2). Extract the specific sample and move to CPU.
+                    sample_logits_neg_cpu = class_logits[neg_idx].detach().cpu()
+                    sample_label_neg_cpu = teacher_label[neg_idx].detach().cpu()
+                else:
+                    sample_logits_neg_cpu = None
+                    sample_label_neg_cpu = None
             
             # --- Loss Calculation (Continuing) ---
             h = torch.sigmoid(halting_logits)
@@ -223,49 +255,65 @@ def train_loop(rank, flags):
         xm.mark_step()
         
         if rank == 0:
-            elapsed = time.time() - start_time
-            xm.master_print("-" * 80)
-            xm.master_print(f"EPOCH {epoch+1}/{num_epochs} COMPLETED")
-            xm.master_print(f"  Total Elapsed Time: {elapsed:.1f}s")
-            xm.master_print("")
-            xm.master_print("FINAL METRICS:")
-            xm.master_print(f"  Step: {global_step}/{total_steps} ({global_step * 100 / total_steps:.1f}%)")
-            xm.master_print(f"  Avg Total Loss: {loss_sum / num_cores}")
-            xm.master_print(f"  Avg Cls Loss: {loss_cls_sum / num_cores}")
-            xm.master_print(f"  Avg Halt Loss: {loss_halt_sum / num_cores}")
-            xm.master_print(f"  Avg Mean h: {h_mean / num_cores}")
-            xm.master_print(f"  Lambda: {lambda_now:.6f}")
             
-            # === SAMPLE CLASSIFICATION DIAGNOSTIC ===
-            if sample_logits_cpu is not None and sample_label_cpu is not None:
-                xm.master_print("\nSAMPLE CLASSIFICATION DIAGNOSTIC (First sample of first batch):")
-                
-                # Convert logits (24, 2) to probabilities (24, 2)
-                sample_probs = torch.softmax(sample_logits_cpu, dim=-1)
+            # NEW HELPER FUNCTION DEFINITION
+            def format_diagnostic_output(logits_cpu, label_cpu, sample_type):
+                """Helper function to format the prediction vs label output for a single sample."""
+                if logits_cpu is None or label_cpu is None:
+                    return f"  No {sample_type} sample found in the first batch of this core."
+
+                # Logits shape is (24, 2)
+                sample_probs = torch.softmax(logits_cpu, dim=-1)
                 
                 # Get the predicted class index (0 or 1) for each of the 24 layers
                 predicted_classes = torch.argmax(sample_probs, dim=-1).tolist()
                 
                 # Get the maximum confidence for all layers as a tensor (24,)
                 max_confidences = sample_probs.max(dim=-1).values
-                # Convert to a standard list of floats
                 max_confidences_list = max_confidences.tolist()
-                # Format the list of floats for readability
                 predicted_probs = [f"{p:.4f}" for p in max_confidences_list]
                 
-                # Extract the scalar true label
-                true_label_value = sample_label_cpu.tolist()
+                true_label_value = label_cpu.item()
                 
-                xm.master_print(f"  True Label (0 or 1): {true_label_value}")
-                xm.master_print(f"  Predicted Class per Layer (0-23): {predicted_classes}")
-                xm.master_print(f"  Max Confidence per Layer: {predicted_probs}")
+                output = []
+                output.append(f" --- {sample_type} Sample (True Label: {true_label_value}) ---")
+                output.append(f" Predicted Class per Layer (0-23): {predicted_classes}")
+                output.append(f" Max Confidence per Layer: {predicted_probs}")
+                return "\n".join(output)
+            # END NEW HELPER FUNCTION
+            
+            elapsed = time.time() - start_time
+            xm.master_print("-" * 80)
+            xm.master_print(f"EPOCH {epoch+1}/{num_epochs} COMPLETED")
+            xm.master_print(f"  Total Elapsed Time: {elapsed:.1f}s")
+            xm.master_print("")
+            xm.master_print("FINAL METRICS:")
+            xm.master_print(f"  Step: {global_step}/{total_steps} ({global_step * 100 / total_steps:.1f}%)")
+            xm.master_print(f"  Avg Total Loss: {loss_sum / num_cores}")
+            xm.master_print(f"  Avg Cls Loss: {loss_cls_sum / num_cores}")
+            xm.master_print(f"  Avg Halt Loss: {loss_halt_sum / num_cores}")
+            xm.master_print(f"  Avg Mean h: {h_mean / num_cores}")
+            xm.master_print(f"  Lambda: {lambda_now:.6f}")
+            
+            # === SAMPLE CLASSIFICATION DIAGNOSTIC (MODIFIED TO DUAL SAMPLE) ===
+            # The existing check is reused to comply with 'no delete'
+            if sample_logits_cpu is not None and sample_label_cpu is not None:
+                xm.master_print("\nDUAL SAMPLE CLASSIFICATION DIAGNOSTIC (One Positive & One Negative Sample):")
+                
+                # Print Positive Sample Diagnostic
+                pos_output = format_diagnostic_output(sample_logits_pos_cpu, sample_label_pos_cpu, "Positive (Label 1)")
+                xm.master_print(pos_output)
+
+                # Print Negative Sample Diagnostic
+                neg_output = format_diagnostic_output(sample_logits_neg_cpu, sample_label_neg_cpu, "Negative (Label 0)")
+                xm.master_print(neg_output)
             
             xm.master_print("")
             xm.master_print("WEIGHT SYNCHRONIZATION CHECK:")
             for i, (param_sum, param_element) in enumerate(param_checks):
                 expected_sum = param_element * num_cores
                 diff = param_sum - expected_sum
-                xm.master_print(f"  Parameter {i}: Difference = {diff}")
+                xm.master_print(f"  Parameter {i}: Difference = {diff}")
             xm.master_print("-" * 80)
         
         # --- Checkpointing (Same as before) ---
@@ -317,7 +365,7 @@ if __name__ == "__main__":
         
         # Optimization
         "lr": 3e-4,
-        "batch_size": 64,  # Smaller batch size for 19500 samples
+        "batch_size": 64, # Smaller batch size for 19500 samples
         
         # Halting loss schedule, halting loss should at first be very small then gradually go to a maximum where it matters about exactly as much as CLS
         "lambda_start": 0.0001,
@@ -327,12 +375,12 @@ if __name__ == "__main__":
         "epochs": 5,
         
         # Data loading
-        "chunk_filename": "embeddings_chunk_0.npz",  # Change to desired chunk
-        "samples_per_shard": 19500,  # Number of samples per core
+        "chunk_filename": "embeddings_chunk_0.npz", # Change to desired chunk
+        "samples_per_shard": 19500, # Number of samples per core
         
         # Logging and checkpointing
-        "log_interval": 50,  # Log every N steps
-        "checkpoint_interval": 1,  # Save checkpoint every N epochs
+        "log_interval": 50, # Log every N steps
+        "checkpoint_interval": 1, # Save checkpoint every N epochs
     }
     
     # Automatically detect number of TPU cores
