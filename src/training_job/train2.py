@@ -221,7 +221,7 @@ def train_loop(rank, flags):
             
             progress = global_step / total_steps
             lambda_now = lambda_start + (lambda_target - lambda_start) * progress
-            loss_halt = 0 #lambda_now * halt_penalty.mean()
+            loss_halt = 0.0 #lambda_now * halt_penalty.mean()
             
             # Total loss
             loss = loss_cls + loss_halt
