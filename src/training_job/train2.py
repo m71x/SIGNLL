@@ -50,14 +50,22 @@ def train_loop(rank, flags):
     elif teacher_cls_full.shape[1] != 24:
         raise ValueError(f"Unexpected number of layers: {teacher_cls_full.shape[1]}")
 
-    # === NEW: Print Sample Distribution for the current shard ===
-    # Calculate the number of samples with label 0
+    # === NEW: Calculate and Apply Class Weighting ===
+    # Calculate the number of samples with label 0 (Negative) and 1 (Positive)
     # Use .item() to extract the Python integer from the single-element tensor for printing
     neg_samples_count = (teacher_label_full == 0).sum().item() 
+    pos_samples_count = (teacher_label_full == 1).sum().item() 
+    
+    # Calculate pos_weight = Count(Negative) / Count(Positive). This reduces the 
+    # influence of the majority (Positive) class to mitigate bias.
+    pos_weight_value = neg_samples_count / pos_samples_count
+    pos_weight_tensor = torch.tensor([pos_weight_value]).float()
     
     # Use standard print() here to show local core data distribution
     print(f"[Core {rank}] Data Shard Check: {neg_samples_count} samples have Label 0 (Negative).")
-    # ==========================================================
+    if rank == 0:
+        xm.master_print(f"[Core {rank}] Calculated Positive Weight (pos_weight): {pos_weight_value:.4f}")
+    # ===============================================
     
     num_samples = teacher_cls_full.shape[0]
 
@@ -81,7 +89,7 @@ def train_loop(rank, flags):
         sampler=sampler,
         batch_size=flags["batch_size"],
         drop_last=True, # CRITICAL: Ensures all batches are the same size
-        num_workers=2  # Use a few workers to load data in background
+        num_workers=2 # Use a few workers to load data in background
     )
 
     # CRITICAL: Wait for all cores to finish data setup
@@ -123,7 +131,15 @@ def train_loop(rank, flags):
 
     # ... (Rest of your optimizer setup) ...
     optimizer = optim.AdamW(model.parameters(), lr=flags["lr"], weight_decay=1e-2)
-    bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none").to(device) # Can move loss fn to device
+    
+    # CRITICAL: Move pos_weight to device before passing to loss function
+    pos_weight_device = pos_weight_tensor.to(device)
+
+    # Instantiate BCE loss with the calculated weight (pos_weight)
+    bce_loss_fn = nn.BCEWithLogitsLoss(
+        reduction="none", 
+        pos_weight=pos_weight_device # NEW: Apply class weighting to counter bias
+    ).to(device)
 
     # --- Training Configuration ---
     num_epochs = flags["epochs"]
@@ -213,16 +229,17 @@ def train_loop(rank, flags):
             else:
                 class_logits_positive = class_logits.squeeze(-1)
             
+            # NOTE: bce_loss_fn now includes pos_weight
             ce_per_layer = bce_loss_fn(class_logits_positive, labels)
+            # The q vector ensures only the loss from layers *before* halting is considered.
             loss_cls = (q * ce_per_layer).sum(dim=1).mean()
             
-            # Halting loss
-            depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
-            halt_penalty = (depths * (1 - h)).sum(dim=1)
-            
-            progress = global_step / total_steps
-            lambda_now = lambda_start + (lambda_target - lambda_start) * progress
-            loss_halt = 0.0 #lambda_now * halt_penalty.mean()
+            # Halting loss (set to zero as requested)
+            # depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
+            # halt_penalty = (depths * (1 - h)).sum(dim=1)
+            # progress = global_step / total_steps
+            # lambda_now = lambda_start + (lambda_target - lambda_start) * progress
+            loss_halt = 0.0 # lambda_now * halt_penalty.mean()
             
             # Total loss
             loss = loss_cls + loss_halt
@@ -242,7 +259,7 @@ def train_loop(rank, flags):
         # All-reduce losses for epoch summary
         loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
         loss_cls_sum = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
-        #loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
+        # loss_halt_sum is not needed since loss_halt is zero.
         h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
         
         # Weight sync check (keeping for debugging consistency)
@@ -278,9 +295,9 @@ def train_loop(rank, flags):
                 true_label_value = label_cpu.item()
                 
                 output = []
-                output.append(f" --- {sample_type} Sample (True Label: {true_label_value}) ---")
-                output.append(f" Predicted Class per Layer (0-23): {predicted_classes}")
-                output.append(f" Max Confidence per Layer: {predicted_probs}")
+                output.append(f"  --- {sample_type} Sample (True Label: {true_label_value}) ---")
+                output.append(f"  Predicted Class per Layer (0-23): {predicted_classes}")
+                output.append(f"  Max Confidence per Layer: {predicted_probs}")
                 return "\n".join(output)
             # END NEW HELPER FUNCTION
             
@@ -293,9 +310,9 @@ def train_loop(rank, flags):
             xm.master_print(f"  Step: {global_step}/{total_steps} ({global_step * 100 / total_steps:.1f}%)")
             xm.master_print(f"  Avg Total Loss: {loss_sum / num_cores}")
             xm.master_print(f"  Avg Cls Loss: {loss_cls_sum / num_cores}")
-            #xm.master_print(f"  Avg Halt Loss: {loss_halt_sum / num_cores}")
+            # The lambda is still tracked but the loss is 0.0
             xm.master_print(f"  Avg Mean h: {h_mean / num_cores}")
-            xm.master_print(f"  Lambda: {lambda_now:.6f}")
+            xm.master_print(f"  Lambda: {lambda_start + (lambda_target - lambda_start) * (global_step / total_steps):.6f}")
             
             # === SAMPLE CLASSIFICATION DIAGNOSTIC (MODIFIED TO DUAL SAMPLE) ===
             # The existing check is reused to comply with 'no delete'
