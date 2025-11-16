@@ -12,7 +12,7 @@ class Controller(nn.Module):
         n_layers: int = 10,
         n_heads: int = 4,
         ffn_dim: int = 1024,
-        dropout: float = 0.2,
+        dropout: float = 0.3,
         halting_bias_init: float = -2.5,
         num_classes: int = 2,
     ):
