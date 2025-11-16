@@ -7,7 +7,7 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 
 # (1) Import new classes
 from torch.utils.data import TensorDataset, DataLoader
-from torch_xla.distributed import DistributedSampler
+from torch.utils.data.distributed import DistributedSampler
 
 from controller_model import Controller, compute_q_from_h
 from training_data_download import training_data_download
