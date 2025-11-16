@@ -1,3 +1,4 @@
+#train2.py
 import os, time
 import torch
 import torch.nn as nn
@@ -173,48 +174,10 @@ def train_loop(rank, flags):
             
         # --- Checkpointing (Same as before) ---
         # ... (Your checkpoint logic) ...
-        loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
-        loss_cls_sum = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
-        loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
-        h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
-        if rank == 0:
-                    current_time = time.time()
-                    elapsed_time = current_time - start_time
-                    
-                    xm.master_print("-" * 50)
-                    xm.master_print(f"Epoch: {epoch + 1}/{num_epochs} | Step: {global_step}/{total_steps} ({global_step * 100 / total_steps:.1f}%)")
-                    xm.master_print(f"Avg Total Loss: {(loss_sum / num_cores).item():.6f}")
-                    xm.master_print(f"Avg Cls Loss: {(loss_cls_sum / num_cores).item():.6f}")
-                    xm.master_print(f"Avg Halt Loss: {(loss_halt_sum / num_cores).item():.6f}")
-                    xm.master_print(f"Avg Mean h: {(h_mean / num_cores).item():.6f}")
-                    xm.master_print(f"Lambda: {lambda_now:.6f}")
-                    xm.master_print(f"Time elapsed: {elapsed_time:.1f}s")
-                    xm.master_print("-" * 50)
+        
         # Ensure all cores finish the epoch before proceeding
         xm.rendezvous(f"epoch_end_{epoch}")
-
-        param_checks_final = []
-        for i, param in enumerate(model.parameters()):
-            if i >= 3:
-                break
-            param_element = param.flatten()[0]
-            param_sum = xm.all_reduce(xm.REDUCE_SUM, param_element)
-            param_checks_final.append((param_sum, param_element))
         
-        xm.mark_step()
-        
-        if rank == 0:
-            for i, (param_sum, param_element) in enumerate(param_checks_final):
-                expected_sum = param_element * num_cores
-                xm.master_print(f"Parameter {i}:")
-                xm.master_print(f"  Sum across cores: {param_sum}")
-                xm.master_print(f"  Expected if synced: {expected_sum}")
-                xm.master_print(f"  Difference: {param_sum - expected_sum:.6f}")
-            xm.master_print("=" * 80)
-            xm.master_print(f"✅ FINAL TRAINING COMPLETED ON ALL CORES. Active cores: {num_cores}/32")
-            xm.master_print("=" * 80)
-        
-        xm.rendezvous("final_check")
 
     # ... (Rest of your final checks) ...
 
