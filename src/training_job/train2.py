@@ -21,6 +21,7 @@ from training_data_download import training_data_download
 #modify script to also show an example of predicted classification vs label for each of the 24 CLS/halting heads per epoch
 #consider if it is necessary to do data sharding so that the number of positive and negative samples are approximately equal, right now it is more of a 3-1 ratio
 #SEPARATE CLS AND HALTING TRAINING, FOR HALTING, TRAIN CLS FIRST, THEN FREEZE CLS AND ONLY MODIFY HALTING
+#don't worry about it now, but during inference, consider settting halting threshold to confidece >= 0.9 or >=0.85 or >=0.95. That's when it seems like it is confident enough
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
     num_cores = xm.xrt_world_size()
@@ -234,12 +235,12 @@ def train_loop(rank, flags):
             # The q vector ensures only the loss from layers *before* halting is considered.
             loss_cls = (q * ce_per_layer).sum(dim=1).mean()
             
-            # Halting loss (set to zero as requested)
-            # depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
-            # halt_penalty = (depths * (1 - h)).sum(dim=1)
-            # progress = global_step / total_steps
-            # lambda_now = lambda_start + (lambda_target - lambda_start) * progress
-            loss_halt = 0.0 # lambda_now * halt_penalty.mean()
+            # Halting loss (re-enabled)
+            depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
+            halt_penalty = (depths * (1 - h)).sum(dim=1)
+            progress = global_step / total_steps
+            lambda_now = lambda_start + (lambda_target - lambda_start) * progress
+            loss_halt = lambda_now * halt_penalty.mean()
             
             # Total loss
             loss = loss_cls + loss_halt
@@ -259,7 +260,7 @@ def train_loop(rank, flags):
         # All-reduce losses for epoch summary
         loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
         loss_cls_sum = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
-        # loss_halt_sum is not needed since loss_halt is zero.
+        loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt) # Re-added for logging
         h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
         
         # Weight sync check (keeping for debugging consistency)
@@ -310,7 +311,7 @@ def train_loop(rank, flags):
             xm.master_print(f"  Step: {global_step}/{total_steps} ({global_step * 100 / total_steps:.1f}%)")
             xm.master_print(f"  Avg Total Loss: {loss_sum / num_cores}")
             xm.master_print(f"  Avg Cls Loss: {loss_cls_sum / num_cores}")
-            # The lambda is still tracked but the loss is 0.0
+            xm.master_print(f"  Avg Halt Loss: {loss_halt_sum / num_cores}") # Re-added for logging
             xm.master_print(f"  Avg Mean h: {h_mean / num_cores}")
             xm.master_print(f"  Lambda: {lambda_start + (lambda_target - lambda_start) * (global_step / total_steps):.6f}")
             
