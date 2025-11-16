@@ -180,34 +180,16 @@ def train_loop(rank, flags):
             # We still need mark_step()!
             xm.mark_step()
             
-            # --- Logging (Same as before) ---
-            if global_step % flags["log_interval"] == 0:
-                # All-reduce losses for logging
-                loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
-                loss_cls_sum = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
-                loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
-                h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
-                
-                xm.mark_step()
-                
-                # Log on master core after all-reduce
-                if rank == 0:
-                    current_time = time.time()
-                    elapsed_time = current_time - start_time
-                    
-                    xm.master_print("-" * 50)
-                    xm.master_print(f"Epoch: {epoch + 1}/{num_epochs} | Step: {global_step}/{total_steps} ({global_step * 100 / total_steps:.1f}%)")
-                    xm.master_print(f"Avg Total Loss: {loss_sum / num_cores}")
-                    xm.master_print(f"Avg Cls Loss: {loss_cls_sum / num_cores}")
-                    xm.master_print(f"Avg Halt Loss: {loss_halt_sum / num_cores}")
-                    xm.master_print(f"Avg Mean h: {h_mean / num_cores}")
-                    xm.master_print(f"Lambda: {lambda_now:.6f}")
-                    xm.master_print(f"Time elapsed: {elapsed_time:.1f}s")
-                    xm.master_print("-" * 50)
-
             global_step += 1
         
-        # --- End of Epoch Weight Sync Check ---
+        # --- End of Epoch Diagnostics ---
+        # All-reduce losses for epoch summary
+        loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
+        loss_cls_sum = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
+        loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
+        h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
+        
+        # Weight sync check
         param_checks = []
         for i, param in enumerate(model.parameters()):
             if i >= 3:
@@ -222,7 +204,15 @@ def train_loop(rank, flags):
             elapsed = time.time() - start_time
             xm.master_print("-" * 80)
             xm.master_print(f"EPOCH {epoch+1}/{num_epochs} COMPLETED")
-            xm.master_print(f"  Elapsed Time: {elapsed:.1f}s")
+            xm.master_print(f"  Total Elapsed Time: {elapsed:.1f}s")
+            xm.master_print("")
+            xm.master_print("FINAL METRICS:")
+            xm.master_print(f"  Step: {global_step}/{total_steps} ({global_step * 100 / total_steps:.1f}%)")
+            xm.master_print(f"  Avg Total Loss: {loss_sum / num_cores}")
+            xm.master_print(f"  Avg Cls Loss: {loss_cls_sum / num_cores}")
+            xm.master_print(f"  Avg Halt Loss: {loss_halt_sum / num_cores}")
+            xm.master_print(f"  Avg Mean h: {h_mean / num_cores}")
+            xm.master_print(f"  Lambda: {lambda_now:.6f}")
             xm.master_print("")
             xm.master_print("WEIGHT SYNCHRONIZATION CHECK:")
             for i, (param_sum, param_element) in enumerate(param_checks):
