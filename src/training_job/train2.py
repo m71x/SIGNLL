@@ -161,6 +161,7 @@ def train_loop(rank, flags):
                 
                 # Detach, move to CPU, and store the first sample's data
                 # This only happens once per epoch, so CPU transfer is acceptable.
+                # Use tolist() to avoid .item()
                 sample_logits_cpu = class_logits[0].detach().cpu()
                 sample_label_cpu = teacher_label[0].detach().cpu()
             
@@ -233,7 +234,7 @@ def train_loop(rank, flags):
             xm.master_print(f"  Avg Mean h: {h_mean / num_cores}")
             xm.master_print(f"  Lambda: {lambda_now:.6f}")
             
-            # === NEW: SAMPLE CLASSIFICATION DIAGNOSTIC ===
+            # === NEW: SAMPLE CLASSIFICATION DIAGNOSTIC (using .tolist() instead of .item()) ===
             if sample_logits_cpu is not None and sample_label_cpu is not None:
                 xm.master_print("\nSAMPLE CLASSIFICATION DIAGNOSTIC (First sample of first batch):")
                 
@@ -244,10 +245,17 @@ def train_loop(rank, flags):
                 predicted_classes = torch.argmax(sample_probs, dim=-1).tolist()
                 
                 # Get the probability of the predicted class (max probability) at each layer
-                # Formatting the probability string for readability
-                predicted_probs = [f"{p.max().item():.4f}" for p in sample_probs]
+                # Get the maximum confidence for all layers as a tensor (24,)
+                max_confidences = sample_probs.max(dim=-1).values
+                # Convert to a standard list of floats
+                max_confidences_list = max_confidences.tolist()
+                # Format the list of floats for readability, no .item() needed
+                predicted_probs = [f"{p:.4f}" for p in max_confidences_list]
                 
-                xm.master_print(f"  True Label (0 or 1): {sample_label_cpu.item()}")
+                # Extract the scalar true label using tolist()[0] instead of .item()
+                true_label_value = sample_label_cpu.tolist()[0]
+                
+                xm.master_print(f"  True Label (0 or 1): {true_label_value}")
                 xm.master_print(f"  Predicted Class per Layer (0-23): {predicted_classes}")
                 xm.master_print(f"  Max Confidence per Layer: {predicted_probs}")
             
