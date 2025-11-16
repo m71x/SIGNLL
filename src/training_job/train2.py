@@ -12,6 +12,8 @@ from torch.utils.data.distributed import DistributedSampler
 
 from controller_model import Controller, compute_q_from_h
 from training_data_download import training_data_download
+#NOTE:
+#DO NOT USE .item(), IT WILL FORCE XLA TO RECOMPILE AT EVERY BATCH ITERATION
 
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
