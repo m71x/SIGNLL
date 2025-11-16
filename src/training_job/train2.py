@@ -241,7 +241,7 @@ def train_loop(rank, flags):
         # All-reduce losses for epoch summary
         loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
         loss_cls_sum = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
-        loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
+        #loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
         h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
         
         # Weight sync check (keeping for debugging consistency)
@@ -292,7 +292,7 @@ def train_loop(rank, flags):
             xm.master_print(f"  Step: {global_step}/{total_steps} ({global_step * 100 / total_steps:.1f}%)")
             xm.master_print(f"  Avg Total Loss: {loss_sum / num_cores}")
             xm.master_print(f"  Avg Cls Loss: {loss_cls_sum / num_cores}")
-            xm.master_print(f"  Avg Halt Loss: {loss_halt_sum / num_cores}")
+            #xm.master_print(f"  Avg Halt Loss: {loss_halt_sum / num_cores}")
             xm.master_print(f"  Avg Mean h: {h_mean / num_cores}")
             xm.master_print(f"  Lambda: {lambda_now:.6f}")
             
