@@ -23,10 +23,44 @@ from training_data_download import training_data_download
 #SEPARATE CLS AND HALTING TRAINING, FOR HALTING, TRAIN CLS FIRST, THEN FREEZE CLS AND ONLY MODIFY HALTING
 #don't worry about it now, but during inference, consider settting halting threshold to confidece >= 0.9 or >=0.85 or >=0.95. That's when it seems like it is confident enough
 #SEE IF YOU CAN AVOID SEPARATING HALT AND CLS LOSS, MAKE IT INTO ONE FUNCTION WHERE THE BCE OF THE PREDICTED CLS IS MULTIPLIED BY THE HALTING LOSS INSTEAD
-def train_loop(rank, flags):
+
+# =========================================================================
+# NEW HELPER FUNCTION TO INITIALIZE MODEL/OPTIMIZER WITH OPTIONAL CHECKPOINT
+# =========================================================================
+def initialize_model_and_optimizer(flags, device, checkpoint_path=None):
+    L = 24
+    model = Controller(
+        L=L,
+        d_teacher=1024,
+        d_ctrl=flags["d_ctrl"],
+        n_layers=flags["transformer_layers"],
+        num_classes=2
+    ).to(device)
+
+    optimizer = optim.AdamW(model.parameters(), lr=flags["lr"], weight_decay=1e-2)
+    
+    start_epoch = 0
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint.get('epoch', 0)
+        xm.master_print(f"✅ Weights loaded from checkpoint: {checkpoint_path} (Starting at epoch {start_epoch})")
+
+    return model, optimizer, start_epoch
+
+# =========================================================================
+# TRAIN LOOP - MODIFIED TO ACCEPT MODEL/OPTIMIZER
+# =========================================================================
+def train_loop(rank, flags, model, optimizer):
     device = xm.torch_xla.device()
     num_cores = xm.xrt_world_size()
 
+    # NOTE: The model and optimizer are now passed in, not initialized here.
+    # The initial weight synchronization logic is removed from here as it should be handled 
+    # during the model's first initialization *outside* the `train_loop` call.
+    
     if rank == 0:
         xm.master_print(f"Detected {num_cores} active cores")
         xm.master_print(f"Starting training with {flags['samples_per_shard']} samples per core on chunk: {flags['chunk_filename']}")
@@ -55,6 +89,7 @@ def train_loop(rank, flags):
     # === NEW: Calculate and Apply Class Weighting ===
     # Calculate the number of samples with label 0 (Negative) and 1 (Positive)
     # Use .item() to extract the Python integer from the single-element tensor for printing
+    # NOTE: Keep the .item() here as it is used outside the XLA graph for python logic/printing
     neg_samples_count = (teacher_label_full == 0).sum().item() 
     pos_samples_count = (teacher_label_full == 1).sum().item() 
     
@@ -101,39 +136,6 @@ def train_loop(rank, flags):
         xm.master_print(f"All {num_cores} cores have loaded data successfully")
         xm.master_print(f"CLS tokens shape (CPU): {teacher_cls_full.shape}")
 
-    # --- Initialize Model (Same as before) ---
-    print(f"[Core {rank}] Initializing model...")
-    L = 24
-    model = Controller(
-        L=L,
-        d_teacher=1024,
-        d_ctrl=flags["d_ctrl"],
-        n_layers=flags["transformer_layers"],
-        num_classes=2
-    ).to(device)
-    
-    # ========== CRITICAL: SYNCHRONIZE INITIAL WEIGHTS ==========
-    if rank == 0:
-        xm.master_print("Synchronizing initial weights across all cores...")
-    
-    for param in model.parameters():
-        if rank == 0:
-            param.data = param.data * num_cores
-        else:
-            param.data = param.data * 0
-        
-        param.data = xm.all_reduce(xm.REDUCE_SUM, param.data)
-        param.data = param.data / num_cores
-    
-    xm.mark_step()
-    xm.rendezvous("weights_synced")
-    
-    if rank == 0:
-        xm.master_print("✅ Initial weights synchronized across all cores")
-
-    # ... (Rest of your optimizer setup) ...
-    optimizer = optim.AdamW(model.parameters(), lr=flags["lr"], weight_decay=1e-2)
-    
     # CRITICAL: Move pos_weight to device before passing to loss function
     pos_weight_device = pos_weight_tensor.to(device)
 
@@ -222,7 +224,7 @@ def train_loop(rank, flags):
             # --- Loss Calculation (Continuing) ---
             h = torch.sigmoid(halting_logits)
             q = compute_q_from_h(h)
-            
+            L = 24
             # Classification loss
             labels = teacher_label.float().unsqueeze(1).expand(-1, L)
             
@@ -239,7 +241,8 @@ def train_loop(rank, flags):
             # Halting loss (re-enabled)
             depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
             halt_penalty = (depths * (1 - h)).sum(dim=1)
-            progress = global_step / total_steps
+            # The progress calculation needs to be relative to a single chunk's training
+            progress = (epoch * num_batches_per_epoch + batch_idx) / total_steps 
             lambda_now = lambda_start + (lambda_target - lambda_start) * progress
             loss_halt = lambda_now * halt_penalty.mean()
             
@@ -340,15 +343,14 @@ def train_loop(rank, flags):
         # --- Checkpointing (Same as before) ---
         if (epoch + 1) % flags["checkpoint_interval"] == 0:
             if rank == 0:
-                # Append chunk number to checkpoint path
-                chunk_num = flags["chunk_filename"].split('_')[-1].split('.')[0]
-                checkpoint_path = f"/tmp/controller_chunk_{chunk_num}_epoch_{epoch+1}.pt"
+                # Use a consistent name for the temporary checkpoint to be loaded in the next chunk loop
+                checkpoint_path = flags["final_checkpoint_path"]
                 torch.save({
                     'epoch': epoch + 1,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                 }, checkpoint_path)
-                xm.master_print(f"✅ Checkpoint saved: {checkpoint_path}")
+                xm.master_print(f"✅ Temporary Checkpoint saved: {checkpoint_path}")
         
         # Ensure all cores finish the epoch before proceeding
         xm.rendezvous(f"epoch_end_{epoch}")
@@ -365,18 +367,36 @@ def train_loop(rank, flags):
     
     xm.rendezvous("final_check")
 
-# ... (Rest of your _mp_fn and __main__ block) ...
+# =========================================================================
+# MP FN - MODIFIED TO INITIALIZE/LOAD MODEL AND CALL TRAIN_LOOP
+# =========================================================================
 def _mp_fn(rank, flags):
     try:
         torch.set_default_tensor_type('torch.FloatTensor')
-        train_loop(rank, flags)
+        device = xm.torch_xla.device()
+        
+        # Initialize model and optimizer, loading from the final checkpoint if it exists
+        model, optimizer, _ = initialize_model_and_optimizer(flags, device, flags["initial_checkpoint_path"])
+
+        # CRITICAL: SYNCHRONIZE INITIAL WEIGHTS ACROSS TPUS (Necessary after loading or fresh init)
+        if rank == 0:
+            xm.master_print("Synchronizing weights across all cores...")
+        
+        num_cores = xm.xrt_world_size()
+        for param in model.parameters():
+            # Broadcast the loaded/initialized weights from core 0 to all other cores
+            param.data = xm.all_reduce(xm.REDUCE_SUM, param.data) / num_cores
+        
+        xm.mark_step()
+        xm.rendezvous("weights_synced_for_chunk")
+        
+        # Pass the model and optimizer to the training loop
+        train_loop(rank, flags, model, optimizer)
+        
     except Exception as e:
         print(f"[Core {rank}] FATAL ERROR: {e}")
         import traceback
         traceback.print_exc()
-        # If one core raises an exception, we need to ensure the TPU job stops
-        # Calling xm.rendezvous here might hang if other cores are stuck,
-        # so simply re-raising the exception is the right move for XLA.
         raise
 
 
@@ -400,21 +420,41 @@ if __name__ == "__main__":
         # Data loading
         "samples_per_shard": 19500, # Number of samples per core
         
+        # Checkpoint path for saving/loading weights across chunks
+        "initial_checkpoint_path": "/tmp/controller_latest_weights.pt", 
+        "final_checkpoint_path": "/tmp/controller_latest_weights.pt",
+        
         # Logging and checkpointing
         "log_interval": 50, # Log every N steps
         "checkpoint_interval": 1, # Save checkpoint every N epochs
     }
     
+    # Checkpoint persistence path
+    LATEST_CHECKPOINT_PATH = BASE_FLAGS["final_checkpoint_path"]
+    
     # ----------------------------------------------------
     # NEW: Loop over data chunks from 0 to 28
     # ----------------------------------------------------
+    print(f"Starting training process across {29} data chunks.")
+    
     for i in range(29): # i iterates from 0 up to and including 28
         FLAGS = BASE_FLAGS.copy()
-        FLAGS["chunk_filename"] = f"embeddings_chunk_{i}.npz" # Set the chunk filename
+        FLAGS["chunk_filename"] = f"embeddings_chunk_{i}.npz" # Set the current chunk filename
         
-        print(f"Starting training for chunk: {FLAGS['chunk_filename']}")
+        # The xmp.spawn call in _mp_fn will handle loading weights from 
+        # LATEST_CHECKPOINT_PATH if it exists, and then saving back to it.
+        print(f"\n========================================================")
+        print(f"Chunk {i+1}/29: Starting training for chunk: {FLAGS['chunk_filename']}")
+        print(f"========================================================\n")
         
         # Automatically detect number of TPU cores
+        # This executes the training for one full chunk using the loaded weights
         xmp.spawn(_mp_fn, args=(FLAGS,), start_method='fork')
         
+        # After xmp.spawn finishes, the model state is saved to LATEST_CHECKPOINT_PATH.
+        
+    print("\n\n========================================================")
+    print("ALL DATA CHUNKS (0-28) PROCESSED SUCCESSFULLY.")
+    print(f"Final weights saved at: {LATEST_CHECKPOINT_PATH}")
+    print("========================================================")
     # ----------------------------------------------------
