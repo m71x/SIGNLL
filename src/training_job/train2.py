@@ -248,7 +248,7 @@ def train_loop(rank, flags):
                     max_confidences = sample_probs.max(dim=-1).values
                     predicted_probs = [f"{p:.4f}" for p in max_confidences.tolist()]
                     # Using tolist()[0] for XLA-safe extraction of scalar from CPU tensor
-                    true_label_value = label_cpu.tolist()[0]
+                    true_label_value = label_cpu.item()
                     
                     output = []
                     output.append(f"  --- {sample_type} Sample (True Label: {true_label_value}) ---")
