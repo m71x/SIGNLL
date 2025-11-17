@@ -22,13 +22,14 @@ from training_data_download import training_data_download
 #consider if it is necessary to do data sharding so that the number of positive and negative samples are approximately equal, right now it is more of a 3-1 ratio
 #SEPARATE CLS AND HALTING TRAINING, FOR HALTING, TRAIN CLS FIRST, THEN FREEZE CLS AND ONLY MODIFY HALTING
 #don't worry about it now, but during inference, consider settting halting threshold to confidece >= 0.9 or >=0.85 or >=0.95. That's when it seems like it is confident enough
+#SEE IF YOU CAN AVOID SEPARATING HALT AND CLS LOSS, MAKE IT INTO ONE FUNCTION WHERE THE BCE OF THE PREDICTED CLS IS MULTIPLIED BY THE HALTING LOSS INSTEAD
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
     num_cores = xm.xrt_world_size()
 
     if rank == 0:
         xm.master_print(f"Detected {num_cores} active cores")
-        xm.master_print(f"Starting training with {flags['samples_per_shard']} samples per core")
+        xm.master_print(f"Starting training with {flags['samples_per_shard']} samples per core on chunk: {flags['chunk_filename']}")
 
     # --- Load Data Once (On CPU!) ---
     # Each core loads its own shard
@@ -175,7 +176,7 @@ def train_loop(rank, flags):
     for epoch in range(num_epochs):
         if rank == 0:
             xm.master_print(f"\n{'='*80}")
-            xm.master_print(f"EPOCH {epoch + 1}/{num_epochs}")
+            xm.master_print(f"EPOCH {epoch + 1}/{num_epochs} on {flags['chunk_filename']}")
             xm.master_print(f"{'='*80}")
         
         # The sampler handles shuffling, so we just iterate
@@ -304,7 +305,7 @@ def train_loop(rank, flags):
             
             elapsed = time.time() - start_time
             xm.master_print("-" * 80)
-            xm.master_print(f"EPOCH {epoch+1}/{num_epochs} COMPLETED")
+            xm.master_print(f"EPOCH {epoch+1}/{num_epochs} COMPLETED on {flags['chunk_filename']}")
             xm.master_print(f"  Total Elapsed Time: {elapsed:.1f}s")
             xm.master_print("")
             xm.master_print("FINAL METRICS:")
@@ -339,7 +340,9 @@ def train_loop(rank, flags):
         # --- Checkpointing (Same as before) ---
         if (epoch + 1) % flags["checkpoint_interval"] == 0:
             if rank == 0:
-                checkpoint_path = f"/tmp/controller_epoch_{epoch+1}.pt"
+                # Append chunk number to checkpoint path
+                chunk_num = flags["chunk_filename"].split('_')[-1].split('.')[0]
+                checkpoint_path = f"/tmp/controller_chunk_{chunk_num}_epoch_{epoch+1}.pt"
                 torch.save({
                     'epoch': epoch + 1,
                     'model_state_dict': model.state_dict(),
@@ -354,7 +357,7 @@ def train_loop(rank, flags):
     total_time = time.time() - start_time
     if rank == 0:
         xm.master_print("\n" + "=" * 80)
-        xm.master_print("TRAINING FINISHED")
+        xm.master_print(f"TRAINING FINISHED FOR CHUNK: {flags['chunk_filename']}")
         xm.master_print(f"Total time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
         xm.master_print(f"Total steps: {global_step}")
         xm.master_print(f"✅ TRAINING COMPLETED ON ALL CORES. Active cores: {num_cores}/32")
@@ -378,7 +381,7 @@ def _mp_fn(rank, flags):
 
 
 if __name__ == "__main__":
-    FLAGS = {
+    BASE_FLAGS = {
         # Model architecture
         "d_ctrl": 256,
         "transformer_layers": 4,
@@ -395,7 +398,6 @@ if __name__ == "__main__":
         "epochs": 10,
         
         # Data loading
-        "chunk_filename": "embeddings_chunk_0.npz", # Change to desired chunk
         "samples_per_shard": 19500, # Number of samples per core
         
         # Logging and checkpointing
@@ -403,5 +405,16 @@ if __name__ == "__main__":
         "checkpoint_interval": 1, # Save checkpoint every N epochs
     }
     
-    # Automatically detect number of TPU cores
-    xmp.spawn(_mp_fn, args=(FLAGS,), start_method='fork')
+    # ----------------------------------------------------
+    # NEW: Loop over data chunks from 0 to 28
+    # ----------------------------------------------------
+    for i in range(29): # i iterates from 0 up to and including 28
+        FLAGS = BASE_FLAGS.copy()
+        FLAGS["chunk_filename"] = f"embeddings_chunk_{i}.npz" # Set the chunk filename
+        
+        print(f"Starting training for chunk: {FLAGS['chunk_filename']}")
+        
+        # Automatically detect number of TPU cores
+        xmp.spawn(_mp_fn, args=(FLAGS,), start_method='fork')
+        
+    # ----------------------------------------------------
