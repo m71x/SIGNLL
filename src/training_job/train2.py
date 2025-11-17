@@ -385,7 +385,7 @@ if __name__ == "__main__":
         
         # Optimization
         "lr": 3e-4,
-        "batch_size": 64, # Smaller batch size for 19500 samples
+        "batch_size": 32, # Smaller batch size for 19500 samples
         
         # Halting loss schedule, halting loss should at first be very small then gradually go to a maximum where it matters about exactly as much as CLS
         "lambda_start": 0.0001,
