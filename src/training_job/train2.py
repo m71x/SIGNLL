@@ -381,7 +381,7 @@ if __name__ == "__main__":
     FLAGS = {
         # Model architecture
         "d_ctrl": 256,
-        "transformer_layers": 6,
+        "transformer_layers": 4,
         
         # Optimization
         "lr": 3e-4,

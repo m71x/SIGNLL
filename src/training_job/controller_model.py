@@ -37,6 +37,7 @@ class Controller(nn.Module):
             norm_first=True,  # MODIFIED: Use pre-normalization for stability
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.pre_ln = nn.LayerNorm(d_ctrl)
         self.post_ln = nn.LayerNorm(d_ctrl) 
 
         # 3. Output Heads: 24 UNIQUE SETS OF HEADS
@@ -98,6 +99,7 @@ class Controller(nn.Module):
         x = self.proj(teacher_cls)
         idx = torch.arange(self.L, device=teacher_cls.device).unsqueeze(0).expand(B, -1)
         x = x + self.layer_embed(idx)
+        x = self.pre_ln(x)
         
         attn_mask = torch.triu(torch.ones(L, L, device=teacher_cls.device), diagonal=1).bool()
         z = self.transformer(x, mask=attn_mask)
