@@ -107,8 +107,8 @@ def train_loop(rank, flags):
         # === Calculate and Apply Class Weighting (Per-Chunk) ===
         # Calculate the number of samples with label 0 (Negative) and 1 (Positive)
         # Using tolist()[0] to avoid .item() while extracting scalar value from CPU tensor
-        neg_samples_count = (teacher_label_full == 0).sum().tolist()[0]
-        pos_samples_count = (teacher_label_full == 1).sum().tolist()[0]
+        neg_samples_count = (teacher_label_full == 0).sum().item()
+        pos_samples_count = (teacher_label_full == 1).sum().item()
         
         pos_weight_value = neg_samples_count / pos_samples_count
         pos_weight_tensor = torch.tensor([pos_weight_value]).float()
