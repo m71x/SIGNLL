@@ -9,25 +9,29 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 from torch.utils.data import TensorDataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
+# NOTE: Assuming these imports resolve correctly in the environment
 from controller_model import Controller, compute_q_from_h
 from training_data_download import training_data_download
-#NOTE:
-#DO NOT USE .item(), IT WILL FORCE XLA TO RECOMPILE AT EVERY BATCH ITERATION
-#be wary of using torch.save()
-#TODO
-#write code to run on all chunks from 0-28 for each shard
-#double check architecture of model and loss is actually what you want it to do
-#fix the loss function to prioritize CLS loss more, CLS loss seems to be increasing per epoch because halt loss matters too much
-#modify script to also show an example of predicted classification vs label for each of the 24 CLS/halting heads per epoch
-#consider if it is necessary to do data sharding so that the number of positive and negative samples are approximately equal, right now it is more of a 3-1 ratio
-#SEPARATE CLS AND HALTING TRAINING, FOR HALTING, TRAIN CLS FIRST, THEN FREEZE CLS AND ONLY MODIFY HALTING
-#don't worry about it now, but during inference, consider settting halting threshold to confidece >= 0.9 or >=0.85 or >=0.95. That's when it seems like it is confident enough
-#SEE IF YOU CAN AVOID SEPARATING HALT AND CLS LOSS, MAKE IT INTO ONE FUNCTION WHERE THE BCE OF THE PREDICTED CLS IS MULTIPLIED BY THE HALTING LOSS INSTEAD
 
-# =========================================================================
-# NEW HELPER FUNCTION TO INITIALIZE MODEL/OPTIMIZER WITH OPTIONAL CHECKPOINT
-# =========================================================================
-def initialize_model_and_optimizer(flags, device, checkpoint_path=None):
+# DO NOT USE .item(), IT WILL FORCE XLA TO RECOMPILE AT EVERY BATCH ITERATION
+# Be wary of using torch.save()
+
+def train_loop(rank, flags):
+    """
+    The main training function executed independently on each TPU core.
+    This function initializes the model once and then iterates through all 29 data chunks (0-28) sequentially.
+    """
+    device = xm.torch_xla.device()
+    num_cores = xm.xrt_world_size()
+
+    if rank == 0:
+        xm.master_print(f"Detected {num_cores} active cores")
+        xm.master_print(f"Starting single-model training across 29 sequential data chunks.")
+        
+    # =========================================================================
+    # 1. MODEL INITIALIZATION (RUNS ONCE PER CORE, OUTSIDE CHUNK LOOP)
+    # =========================================================================
+    print(f"[Core {rank}] Initializing model...")
     L = 24
     model = Controller(
         L=L,
@@ -36,363 +40,290 @@ def initialize_model_and_optimizer(flags, device, checkpoint_path=None):
         n_layers=flags["transformer_layers"],
         num_classes=2
     ).to(device)
-
+    
     optimizer = optim.AdamW(model.parameters(), lr=flags["lr"], weight_decay=1e-2)
     
-    start_epoch = 0
-
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint.get('epoch', 0)
-        xm.master_print(f"✅ Weights loaded from checkpoint: {checkpoint_path} (Starting at epoch {start_epoch})")
-
-    return model, optimizer, start_epoch
-
-# =========================================================================
-# TRAIN LOOP - MODIFIED TO ACCEPT MODEL/OPTIMIZER
-# =========================================================================
-def train_loop(rank, flags, model, optimizer):
-    device = xm.torch_xla.device()
-    num_cores = xm.xrt_world_size()
-
-    # NOTE: The model and optimizer are now passed in, not initialized here.
-    # The initial weight synchronization logic is removed from here as it should be handled 
-    # during the model's first initialization *outside* the `train_loop` call.
+    # CRITICAL: SYNCHRONIZE INITIAL WEIGHTS ACROSS ALL CORES
+    if rank == 0:
+        xm.master_print("Synchronizing initial weights across all cores...")
+    
+    # Clean synchronization implementation
+    for param in model.parameters():
+        param.data = xm.all_reduce(xm.REDUCE_SUM, param.data) / num_cores
+    
+    xm.mark_step()
+    xm.rendezvous("weights_synced")
     
     if rank == 0:
-        xm.master_print(f"Detected {num_cores} active cores")
-        xm.master_print(f"Starting training with {flags['samples_per_shard']} samples per core on chunk: {flags['chunk_filename']}")
+        xm.master_print("✅ Initial weights synchronized across all cores. Starting chunk loop.")
 
-    # --- Load Data Once (On CPU!) ---
-    # Each core loads its own shard
-    data = training_data_download(
-        core_id=rank,
-        filename=flags["chunk_filename"],
-        max_entries=flags["samples_per_shard"]
-    )
+    # Variables to hold diagnostic data for rank 0 (re-used for every chunk)
+    sample_logits_pos_cpu = None
+    sample_label_pos_cpu = None
+    sample_logits_neg_cpu = None
+    sample_label_neg_cpu = None
     
-    if data is None:
-        raise RuntimeError(f"[Core {rank}] Failed to load training data")
-
-    # CRITICAL: Keep data on CPU. DO NOT call .to(device) here.
-    teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
-    teacher_label_full = torch.from_numpy(data['classifications']).long()
-    
-    # Handle layer slicing (still on CPU)
-    if teacher_cls_full.shape[1] == 25:
-        teacher_cls_full = teacher_cls_full[:, 1:25, :]
-    elif teacher_cls_full.shape[1] != 24:
-        raise ValueError(f"Unexpected number of layers: {teacher_cls_full.shape[1]}")
-
-    # === NEW: Calculate and Apply Class Weighting ===
-    # Calculate the number of samples with label 0 (Negative) and 1 (Positive)
-    # Use .item() to extract the Python integer from the single-element tensor for printing
-    # NOTE: Keep the .item() here as it is used outside the XLA graph for python logic/printing
-    neg_samples_count = (teacher_label_full == 0).sum().item() 
-    pos_samples_count = (teacher_label_full == 1).sum().item() 
-    
-    # Calculate pos_weight = Count(Negative) / Count(Positive). This reduces the 
-    # influence of the majority (Positive) class to mitigate bias.
-    pos_weight_value = neg_samples_count / pos_samples_count
-    pos_weight_tensor = torch.tensor([pos_weight_value]).float()
-    
-    # Use standard print() here to show local core data distribution
-    print(f"[Core {rank}] Data Shard Check: {neg_samples_count} samples have Label 0 (Negative).")
-    if rank == 0:
-        xm.master_print(f"[Core {rank}] Calculated Positive Weight (pos_weight): {pos_weight_value:.4f}")
-    # ===============================================
-    
-    num_samples = teacher_cls_full.shape[0]
-
-    # --- (2) Create Dataset and DataLoader ---
-    
-    # Create a standard PyTorch Dataset
-    dataset = TensorDataset(teacher_cls_full, teacher_label_full)
-
-    # Create a DistributedSampler to ensure each core gets unique data
-    # This also handles shuffling for you.
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=num_cores,
-        rank=rank,
-        shuffle=True # Shuffle data every epoch
-    )
-
-    # Create the DataLoader
-    data_loader = DataLoader(
-        dataset,
-        sampler=sampler,
-        batch_size=flags["batch_size"],
-        drop_last=True, # CRITICAL: Ensures all batches are the same size
-        num_workers=2 # Use a few workers to load data in background
-    )
-
-    # CRITICAL: Wait for all cores to finish data setup
-    xm.rendezvous("data_prepared")
-
-    if rank == 0:
-        xm.master_print(f"All {num_cores} cores have loaded data successfully")
-        xm.master_print(f"CLS tokens shape (CPU): {teacher_cls_full.shape}")
-
-    # CRITICAL: Move pos_weight to device before passing to loss function
-    pos_weight_device = pos_weight_tensor.to(device)
-
-    # Instantiate BCE loss with the calculated weight (pos_weight)
-    bce_loss_fn = nn.BCEWithLogitsLoss(
-        reduction="none", 
-        pos_weight=pos_weight_device # NEW: Apply class weighting to counter bias
-    ).to(device)
-
-    # --- Training Configuration ---
-    num_epochs = flags["epochs"]
-    batch_size = flags["batch_size"]
-    lambda_start, lambda_target = flags["lambda_start"], flags["lambda_target"]
-    # (3) Get number of steps from the DataLoader
-    # We use len(data_loader) which is XLA-safe
-    num_batches_per_epoch = len(data_loader)
-    total_steps = num_epochs * num_batches_per_epoch
-
-    if rank == 0:
-        xm.master_print(f"Training config: {num_epochs} epochs, {num_batches_per_epoch} batches/epoch")
-        xm.master_print(f"Total global samples: (approx) {num_samples * num_cores}")
-        xm.master_print(f"Total steps: {total_steps}")
+    # Calculate total steps across ALL chunks for lambda schedule
+    # Note: total steps is calculated based on flags["epochs"] * 29 chunks * batches_per_chunk
+    # The number of batches per chunk is (samples_per_shard * num_cores) // batch_size
+    total_samples = flags["samples_per_shard"] * num_cores
+    num_batches_per_chunk = total_samples // flags["batch_size"]
+    total_steps = flags["epochs"] * 29 * num_batches_per_chunk
     
     global_step = 0
     start_time = time.time()
     model.train()
 
-    # Variables to hold diagnostic data for rank 0
-    sample_logits_cpu = None
-    sample_label_cpu = None
-    
-    # NEW: Variables to hold one positive and one negative sample diagnostic data
-    sample_logits_pos_cpu = None
-    sample_label_pos_cpu = None
-    sample_logits_neg_cpu = None
-    sample_label_neg_cpu = None
-    # ==========================================================
-
-    # --- (4) Full Training Loop (Refactored) ---
-    for epoch in range(num_epochs):
-        if rank == 0:
-            xm.master_print(f"\n{'='*80}")
-            xm.master_print(f"EPOCH {epoch + 1}/{num_epochs} on {flags['chunk_filename']}")
-            xm.master_print(f"{'='*80}")
+    # =========================================================================
+    # 2. OUTER LOOP: ITERATE OVER DATA CHUNKS (0 to 28)
+    # =========================================================================
+    for chunk_idx in range(29): 
+        current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
         
-        # The sampler handles shuffling, so we just iterate
-        for batch_idx, (teacher_cls, teacher_label) in enumerate(data_loader):
+        if rank == 0:
+            xm.master_print(f"\n{'#'*90}")
+            xm.master_print(f"### CHUNK {chunk_idx + 1}/29: Loading data from {current_chunk_filename} ###")
+            xm.master_print(f"{'#'*90}")
+
+        # --- Load Data For Current Chunk (On CPU!) ---
+        data = training_data_download(
+            core_id=rank,
+            filename=current_chunk_filename,
+            max_entries=flags["samples_per_shard"]
+        )
+        
+        if data is None:
+            raise RuntimeError(f"[Core {rank}] Failed to load training data for chunk {chunk_idx}")
+
+        teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
+        teacher_label_full = torch.from_numpy(data['classifications']).long()
+        
+        # Handle layer slicing
+        if teacher_cls_full.shape[1] == 25:
+            teacher_cls_full = teacher_cls_full[:, 1:25, :]
+        elif teacher_cls_full.shape[1] != 24:
+            raise ValueError(f"Unexpected number of layers: {teacher_cls_full.shape[1]}")
+
+        # === Calculate and Apply Class Weighting (Per-Chunk) ===
+        # Calculate the number of samples with label 0 (Negative) and 1 (Positive)
+        # Using tolist()[0] to avoid .item() while extracting scalar value from CPU tensor
+        neg_samples_count = (teacher_label_full == 0).sum().tolist()[0]
+        pos_samples_count = (teacher_label_full == 1).sum().tolist()[0]
+        
+        pos_weight_value = neg_samples_count / pos_samples_count
+        pos_weight_tensor = torch.tensor([pos_weight_value]).float()
+        pos_weight_device = pos_weight_tensor.to(device)
+
+        if rank == 0:
+            xm.master_print(f"[Core {rank}] Chunk {chunk_idx+1} Positive Weight: {pos_weight_value:.4f}")
+
+        # Instantiate BCE loss with the calculated weight (pos_weight)
+        bce_loss_fn = nn.BCEWithLogitsLoss(
+            reduction="none", 
+            pos_weight=pos_weight_device
+        ).to(device)
+
+        # --- Create Dataset and DataLoader (Per-Chunk) ---
+        dataset = TensorDataset(teacher_cls_full, teacher_label_full)
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=num_cores,
+            rank=rank,
+            shuffle=True
+        )
+        data_loader = DataLoader(
+            dataset,
+            sampler=sampler,
+            batch_size=flags["batch_size"],
+            drop_last=True,
+            num_workers=2
+        )
+        
+        # CRITICAL: Wait for all cores to finish data setup for this chunk
+        xm.rendezvous(f"data_prepared_chunk_{chunk_idx}")
+
+        # =========================================================================
+        # 3. MIDDLE LOOP: ITERATE OVER EPOCHS (1 to 10)
+        # =========================================================================
+        for epoch in range(flags["epochs"]):
+            if rank == 0:
+                xm.master_print(f"\n{'='*80}")
+                xm.master_print(f"CHUNK {chunk_idx + 1}/29 | EPOCH {epoch + 1}/{flags['epochs']}")
+                xm.master_print(f"{'='*80}")
             
-            # --- (5) Move *this batch* to the device ---
-            teacher_cls = teacher_cls.to(device)
-            teacher_label = teacher_label.to(device)
-            
-            # --- Loss Calculation (Same as before) ---
-            halting_logits, class_logits, _ = model(teacher_cls)
-            
-            # === Capture diagnostic data on the first batch of rank 0 (MODIFIED) ===
-            if rank == 0 and batch_idx == 0:
-                # Keep existing variables assigned to comply with 'don't delete'
-                sample_logits_cpu = class_logits[0].detach().cpu()
-                sample_label_cpu = teacher_label[0].detach().cpu()
+            # The sampler handles shuffling, so we just iterate
+            # =========================================================================
+            # 4. INNER LOOP: ITERATE OVER BATCHES
+            # =========================================================================
+            for batch_idx, (teacher_cls, teacher_label) in enumerate(data_loader):
                 
-                # NEW: Find and capture one positive and one negative sample
-                positive_indices = (teacher_label == 1).nonzero(as_tuple=True)[0]
-                negative_indices = (teacher_label == 0).nonzero(as_tuple=True)[0]
+                # --- Move *this batch* to the device ---
+                teacher_cls = teacher_cls.to(device)
+                teacher_label = teacher_label.to(device)
+                
+                # --- Forward Pass ---
+                halting_logits, class_logits, _ = model(teacher_cls)
+                
+                # === Capture diagnostic data on the first batch of rank 0 ===
+                if rank == 0 and batch_idx == 0:
+                    
+                    # Find and capture one positive and one negative sample
+                    positive_indices = (teacher_label == 1).nonzero(as_tuple=True)[0]
+                    negative_indices = (teacher_label == 0).nonzero(as_tuple=True)[0]
 
-                # Capture Positive Sample (Label 1)
-                if positive_indices.numel() > 0:
-                    pos_idx = positive_indices[0]
-                    # Logits are (L, 2). Extract the specific sample and move to CPU.
-                    sample_logits_pos_cpu = class_logits[pos_idx].detach().cpu() 
-                    sample_label_pos_cpu = teacher_label[pos_idx].detach().cpu()
-                else:
-                    sample_logits_pos_cpu = None
-                    sample_label_pos_cpu = None
+                    # Capture Positive Sample (Label 1)
+                    if positive_indices.numel() > 0:
+                        pos_idx = positive_indices[0]
+                        sample_logits_pos_cpu = class_logits[pos_idx].detach().cpu() 
+                        sample_label_pos_cpu = teacher_label[pos_idx].detach().cpu()
+                    else:
+                        sample_logits_pos_cpu = None
+                        sample_label_pos_cpu = None
 
-                # Capture Negative Sample (Label 0)
-                if negative_indices.numel() > 0:
-                    neg_idx = negative_indices[0]
-                    # Logits are (L, 2). Extract the specific sample and move to CPU.
-                    sample_logits_neg_cpu = class_logits[neg_idx].detach().cpu()
-                    sample_label_neg_cpu = teacher_label[neg_idx].detach().cpu()
+                    # Capture Negative Sample (Label 0)
+                    if negative_indices.numel() > 0:
+                        neg_idx = negative_indices[0]
+                        sample_logits_neg_cpu = class_logits[neg_idx].detach().cpu()
+                        sample_label_neg_cpu = teacher_label[neg_idx].detach().cpu()
+                    else:
+                        sample_logits_neg_cpu = None
+                        sample_label_neg_cpu = None
+                
+                # --- Loss Calculation ---
+                h = torch.sigmoid(halting_logits)
+                q = compute_q_from_h(h)
+                
+                # Classification loss
+                labels = teacher_label.float().unsqueeze(1).expand(-1, L)
+                
+                if class_logits.size(-1) == 2:
+                    class_logits_positive = class_logits[:, :, 1]
                 else:
-                    sample_logits_neg_cpu = None
-                    sample_label_neg_cpu = None
+                    class_logits_positive = class_logits.squeeze(-1)
+                
+                ce_per_layer = bce_loss_fn(class_logits_positive, labels)
+                # Loss is multiplied by the q vector (cumulative probability of halting later)
+                loss_cls = (q * ce_per_layer).sum(dim=1).mean()
+                
+                # Halting loss
+                depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
+                halt_penalty = (depths * (1 - h)).sum(dim=1)
+                
+                # Progress calculation is now relative to the ENTIRE 29-chunk training job
+                progress = global_step / total_steps
+                lambda_start, lambda_target = flags["lambda_start"], flags["lambda_target"]
+                lambda_now = lambda_start + (lambda_target - lambda_start) * progress
+                loss_halt = lambda_now * halt_penalty.mean()
+                
+                # Total loss
+                loss = loss_cls + loss_halt
+                
+                # --- Backward Pass and Optimization ---
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                xm.optimizer_step(optimizer)
+                
+                xm.mark_step()
+                global_step += 1
             
-            # --- Loss Calculation (Continuing) ---
-            h = torch.sigmoid(halting_logits)
-            q = compute_q_from_h(h)
-            L = 24
-            # Classification loss
-            labels = teacher_label.float().unsqueeze(1).expand(-1, L)
+            # --- End of Epoch Diagnostics ---
+            # All-reduce losses for epoch summary
+            loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
+            loss_cls_sum = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
+            loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
+            h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
             
-            if class_logits.size(-1) == 2:
-                class_logits_positive = class_logits[:, :, 1]
-            else:
-                class_logits_positive = class_logits.squeeze(-1)
-            
-            # NOTE: bce_loss_fn now includes pos_weight
-            ce_per_layer = bce_loss_fn(class_logits_positive, labels)
-            # The q vector ensures only the loss from layers *before* halting is considered.
-            loss_cls = (q * ce_per_layer).sum(dim=1).mean()
-            
-            # Halting loss (re-enabled)
-            depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
-            halt_penalty = (depths * (1 - h)).sum(dim=1)
-            # The progress calculation needs to be relative to a single chunk's training
-            progress = (epoch * num_batches_per_epoch + batch_idx) / total_steps 
-            lambda_now = lambda_start + (lambda_target - lambda_start) * progress
-            loss_halt = lambda_now * halt_penalty.mean()
-            
-            # Total loss
-            loss = loss_cls + loss_halt
-            
-            # --- Backward Pass and Optimization ---
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            xm.optimizer_step(optimizer)
-            
-            # We still need mark_step()!
             xm.mark_step()
             
-            global_step += 1
-        
-        # --- End of Epoch Diagnostics ---
-        # All-reduce losses for epoch summary
-        loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
-        loss_cls_sum = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
-        loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt) # Re-added for logging
-        h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
-        
-        # Weight sync check (keeping for debugging consistency)
-        param_checks = []
-        for i, param in enumerate(model.parameters()):
-            if i >= 3:
-                break
-            param_element = param.flatten()[0]
-            param_sum = xm.all_reduce(xm.REDUCE_SUM, param_element)
-            param_checks.append((param_sum, param_element))
-        
-        xm.mark_step()
-        
-        if rank == 0:
-            
-            # NEW HELPER FUNCTION DEFINITION
-            def format_diagnostic_output(logits_cpu, label_cpu, sample_type):
-                """Helper function to format the prediction vs label output for a single sample."""
-                if logits_cpu is None or label_cpu is None:
-                    return f"  No {sample_type} sample found in the first batch of this core."
-
-                # Logits shape is (24, 2)
-                sample_probs = torch.softmax(logits_cpu, dim=-1)
-                
-                # Get the predicted class index (0 or 1) for each of the 24 layers
-                predicted_classes = torch.argmax(sample_probs, dim=-1).tolist()
-                
-                # Get the maximum confidence for all layers as a tensor (24,)
-                max_confidences = sample_probs.max(dim=-1).values
-                max_confidences_list = max_confidences.tolist()
-                predicted_probs = [f"{p:.4f}" for p in max_confidences_list]
-                
-                true_label_value = label_cpu.item()
-                
-                output = []
-                output.append(f"  --- {sample_type} Sample (True Label: {true_label_value}) ---")
-                output.append(f"  Predicted Class per Layer (0-23): {predicted_classes}")
-                output.append(f"  Max Confidence per Layer: {predicted_probs}")
-                return "\n".join(output)
-            # END NEW HELPER FUNCTION
-            
-            elapsed = time.time() - start_time
-            xm.master_print("-" * 80)
-            xm.master_print(f"EPOCH {epoch+1}/{num_epochs} COMPLETED on {flags['chunk_filename']}")
-            xm.master_print(f"  Total Elapsed Time: {elapsed:.1f}s")
-            xm.master_print("")
-            xm.master_print("FINAL METRICS:")
-            xm.master_print(f"  Step: {global_step}/{total_steps} ({global_step * 100 / total_steps:.1f}%)")
-            xm.master_print(f"  Avg Total Loss: {loss_sum / num_cores}")
-            xm.master_print(f"  Avg Cls Loss: {loss_cls_sum / num_cores}")
-            xm.master_print(f"  Avg Halt Loss: {loss_halt_sum / num_cores}") # Re-added for logging
-            xm.master_print(f"  Avg Mean h: {h_mean / num_cores}")
-            xm.master_print(f"  Lambda: {lambda_start + (lambda_target - lambda_start) * (global_step / total_steps):.6f}")
-            
-            # === SAMPLE CLASSIFICATION DIAGNOSTIC (MODIFIED TO DUAL SAMPLE) ===
-            # The existing check is reused to comply with 'no delete'
-            if sample_logits_cpu is not None and sample_label_cpu is not None:
-                xm.master_print("\nDUAL SAMPLE CLASSIFICATION DIAGNOSTIC (One Positive & One Negative Sample):")
-                
-                # Print Positive Sample Diagnostic
-                pos_output = format_diagnostic_output(sample_logits_pos_cpu, sample_label_pos_cpu, "Positive (Label 1)")
-                xm.master_print(pos_output)
-
-                # Print Negative Sample Diagnostic
-                neg_output = format_diagnostic_output(sample_logits_neg_cpu, sample_label_neg_cpu, "Negative (Label 0)")
-                xm.master_print(neg_output)
-            
-            xm.master_print("")
-            xm.master_print("WEIGHT SYNCHRONIZATION CHECK:")
-            for i, (param_sum, param_element) in enumerate(param_checks):
-                expected_sum = param_element * num_cores
-                diff = param_sum - expected_sum
-                xm.master_print(f"  Parameter {i}: Difference = {diff}")
-            xm.master_print("-" * 80)
-        
-        # --- Checkpointing (Same as before) ---
-        if (epoch + 1) % flags["checkpoint_interval"] == 0:
             if rank == 0:
-                # Use a consistent name for the temporary checkpoint to be loaded in the next chunk loop
-                checkpoint_path = flags["final_checkpoint_path"]
-                torch.save({
-                    'epoch': epoch + 1,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                }, checkpoint_path)
-                xm.master_print(f"✅ Temporary Checkpoint saved: {checkpoint_path}")
-        
-        # Ensure all cores finish the epoch before proceeding
-        xm.rendezvous(f"epoch_end_{epoch}")
+                
+                def format_diagnostic_output(logits_cpu, label_cpu, sample_type):
+                    """Helper function to format the prediction vs label output for a single sample."""
+                    if logits_cpu is None or label_cpu is None:
+                        return f"  No {sample_type} sample found in the first batch of this core's chunk."
 
-    # --- FINAL SUMMARY ---
+                    sample_probs = torch.softmax(logits_cpu, dim=-1)
+                    predicted_classes = torch.argmax(sample_probs, dim=-1).tolist()
+                    max_confidences = sample_probs.max(dim=-1).values
+                    predicted_probs = [f"{p:.4f}" for p in max_confidences.tolist()]
+                    # Using tolist()[0] for XLA-safe extraction of scalar from CPU tensor
+                    true_label_value = label_cpu.tolist()[0]
+                    
+                    output = []
+                    output.append(f"  --- {sample_type} Sample (True Label: {true_label_value}) ---")
+                    output.append(f"  Predicted Class per Layer (0-23): {predicted_classes}")
+                    output.append(f"  Max Confidence per Layer: {predicted_probs}")
+                    return "\n".join(output)
+                
+                elapsed = time.time() - start_time
+                xm.master_print("-" * 80)
+                xm.master_print(f"EPOCH {epoch+1}/{flags['epochs']} COMPLETED for CHUNK {chunk_idx + 1}")
+                xm.master_print(f"  Total Elapsed Time: {elapsed:.1f}s")
+                xm.master_print("FINAL METRICS:")
+                xm.master_print(f"  Global Step: {global_step}/{total_steps} ({global_step * 100 / total_steps:.1f}%)")
+                xm.master_print(f"  Avg Total Loss: {loss_sum / num_cores}")
+                xm.master_print(f"  Avg Cls Loss: {loss_cls_sum / num_cores}")
+                xm.master_print(f"  Avg Halt Loss: {loss_halt_sum / num_cores}")
+                xm.master_print(f"  Avg Mean h: {h_mean / num_cores}")
+                xm.master_print(f"  Lambda: {lambda_now:.6f}")
+                
+                # === SAMPLE CLASSIFICATION DIAGNOSTIC ===
+                if sample_logits_pos_cpu is not None or sample_logits_neg_cpu is not None:
+                    xm.master_print("\nDUAL SAMPLE CLASSIFICATION DIAGNOSTIC (from first batch):")
+                    pos_output = format_diagnostic_output(sample_logits_pos_cpu, sample_label_pos_cpu, "Positive (Label 1)")
+                    xm.master_print(pos_output)
+                    neg_output = format_diagnostic_output(sample_logits_neg_cpu, sample_label_neg_cpu, "Negative (Label 0)")
+                    xm.master_print(neg_output)
+                
+                xm.master_print("-" * 80)
+            
+            # Ensure all cores finish the epoch before proceeding
+            xm.rendezvous(f"epoch_end_chunk_{chunk_idx}_epoch_{epoch}")
+        
+        # --- Checkpointing at the end of each CHUNK (Optional) ---
+        if (chunk_idx + 1) % 5 == 0 and rank == 0:
+            checkpoint_path = f"/tmp/controller_chunk_{chunk_idx+1}_final.pt"
+            torch.save({
+                'chunk': chunk_idx + 1,
+                'global_step': global_step,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }, checkpoint_path)
+            xm.master_print(f"✅ CHUNK Checkpoint saved: {checkpoint_path}")
+        
+        # Ensure all cores finish the chunk before proceeding to the next
+        xm.rendezvous(f"chunk_end_{chunk_idx}")
+
+
+    # --- FINAL SUMMARY (After all 29 chunks are processed) ---
     total_time = time.time() - start_time
     if rank == 0:
         xm.master_print("\n" + "=" * 80)
-        xm.master_print(f"TRAINING FINISHED FOR CHUNK: {flags['chunk_filename']}")
+        xm.master_print("✅ ALL 29 DATA CHUNKS PROCESSED SUCCESSFULLY.")
         xm.master_print(f"Total time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
         xm.master_print(f"Total steps: {global_step}")
-        xm.master_print(f"✅ TRAINING COMPLETED ON ALL CORES. Active cores: {num_cores}/32")
         xm.master_print("=" * 80)
+        
+        # Final Save
+        final_checkpoint_path = "/tmp/controller_final_29_chunks.pt"
+        torch.save({
+            'chunk': 29,
+            'global_step': global_step,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+        }, final_checkpoint_path)
+        xm.master_print(f"✅ FINAL Checkpoint saved: {final_checkpoint_path}")
     
     xm.rendezvous("final_check")
 
-# =========================================================================
-# MP FN - MODIFIED TO INITIALIZE/LOAD MODEL AND CALL TRAIN_LOOP
-# =========================================================================
+# ... (Rest of your _mp_fn and __main__ block) ...
 def _mp_fn(rank, flags):
     try:
+        # NOTE: Model initialization is now inside train_loop, but it is executed only once 
+        # per spawned process (i.e., once on startup), as required.
         torch.set_default_tensor_type('torch.FloatTensor')
-        device = xm.torch_xla.device()
-        
-        # Initialize model and optimizer, loading from the final checkpoint if it exists
-        model, optimizer, _ = initialize_model_and_optimizer(flags, device, flags["initial_checkpoint_path"])
-
-        # CRITICAL: SYNCHRONIZE INITIAL WEIGHTS ACROSS TPUS (Necessary after loading or fresh init)
-        if rank == 0:
-            xm.master_print("Synchronizing weights across all cores...")
-        
-        num_cores = xm.xrt_world_size()
-        for param in model.parameters():
-            # Broadcast the loaded/initialized weights from core 0 to all other cores
-            param.data = xm.all_reduce(xm.REDUCE_SUM, param.data) / num_cores
-        
-        xm.mark_step()
-        xm.rendezvous("weights_synced_for_chunk")
-        
-        # Pass the model and optimizer to the training loop
-        train_loop(rank, flags, model, optimizer)
-        
+        train_loop(rank, flags)
     except Exception as e:
         print(f"[Core {rank}] FATAL ERROR: {e}")
         import traceback
@@ -410,51 +341,21 @@ if __name__ == "__main__":
         "lr": 3e-4,
         "batch_size": 32, # Smaller batch size for 19500 samples
         
-        # Halting loss schedule, halting loss should at first be very small then gradually go to a maximum where it matters about exactly as much as CLS
+        # Halting loss schedule. Reduced lambda_target to prioritize CLS loss more.
         "lambda_start": 0.0001,
-        "lambda_target": 0.025,
+        "lambda_target": 0.0125, # Was 0.025
         
-        # Training, leave at 5 if model seems to be converging, else go to 10
+        # Training, 10 epochs per chunk
         "epochs": 10,
         
         # Data loading
         "samples_per_shard": 19500, # Number of samples per core
         
-        # Checkpoint path for saving/loading weights across chunks
-        "initial_checkpoint_path": "/tmp/controller_latest_weights.pt", 
-        "final_checkpoint_path": "/tmp/controller_latest_weights.pt",
-        
-        # Logging and checkpointing
-        "log_interval": 50, # Log every N steps
-        "checkpoint_interval": 1, # Save checkpoint every N epochs
+        # Logging and checkpointing 
+        "log_interval": 50, # Log every N steps (unused, replaced by epoch logs)
+        "checkpoint_interval": 1, # Save checkpoint every N epochs (unused, saved per chunk)
     }
     
-    # Checkpoint persistence path
-    LATEST_CHECKPOINT_PATH = BASE_FLAGS["final_checkpoint_path"]
-    
-    # ----------------------------------------------------
-    # NEW: Loop over data chunks from 0 to 28
-    # ----------------------------------------------------
-    print(f"Starting training process across {29} data chunks.")
-    
-    for i in range(29): # i iterates from 0 up to and including 28
-        FLAGS = BASE_FLAGS.copy()
-        FLAGS["chunk_filename"] = f"embeddings_chunk_{i}.npz" # Set the current chunk filename
-        
-        # The xmp.spawn call in _mp_fn will handle loading weights from 
-        # LATEST_CHECKPOINT_PATH if it exists, and then saving back to it.
-        print(f"\n========================================================")
-        print(f"Chunk {i+1}/29: Starting training for chunk: {FLAGS['chunk_filename']}")
-        print(f"========================================================\n")
-        
-        # Automatically detect number of TPU cores
-        # This executes the training for one full chunk using the loaded weights
-        xmp.spawn(_mp_fn, args=(FLAGS,), start_method='fork')
-        
-        # After xmp.spawn finishes, the model state is saved to LATEST_CHECKPOINT_PATH.
-        
-    print("\n\n========================================================")
-    print("ALL DATA CHUNKS (0-28) PROCESSED SUCCESSFULLY.")
-    print(f"Final weights saved at: {LATEST_CHECKPOINT_PATH}")
-    print("========================================================")
-    # ----------------------------------------------------
+    print("Starting single XLA spawn job to process all 29 chunks sequentially.")
+    xmp.spawn(_mp_fn, args=(BASE_FLAGS,), start_method='fork')
+    print("XLA spawn job completed.")
