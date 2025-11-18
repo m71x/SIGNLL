@@ -65,16 +65,17 @@ class Controller(nn.Module):
     def _init_weights(self, module):
         """Applies stable weight initialization."""
         if isinstance(module, nn.Linear):
-            # Use Xavier/Glorot uniform initialization for linear layers
-            nn.init.xavier_uniform_(module.weight)
+            # CHANGE: Use Kaiming init instead of Xavier for GELU/ReLU stability
+            # 'fan_in' preserves magnitude in the forward pass.
+            # 'nonlinearity="relu"' is the standard approximation for GELU.
+            nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+            
             if module.bias is not None:
-                # Initialize biases to zero
                 nn.init.constant_(module.bias, 0)
         elif isinstance(module, nn.Embedding):
-            # Use a standard normal distribution for embeddings
+            # Keep small normal init for embeddings
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, nn.LayerNorm):
-            # Initialize LayerNorm weights to 1 and biases to 0
             nn.init.constant_(module.weight, 1.0)
             nn.init.constant_(module.bias, 0.0)
 
