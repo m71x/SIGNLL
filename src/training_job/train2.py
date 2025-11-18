@@ -156,7 +156,7 @@ def train_loop(rank, flags):
             # 4. INNER LOOP: ITERATE OVER BATCHES
             # =========================================================================
             for batch_idx, (teacher_cls, teacher_label) in enumerate(data_loader):
-                global_step += 1
+                global_step += 29
                 # --- Move *this batch* to the device ---
                 teacher_cls = teacher_cls.to(device)
                 teacher_label = teacher_label.to(device)
