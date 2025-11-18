@@ -66,7 +66,7 @@ def train_loop(rank, flags):
     # Calculate total steps across ALL chunks for lambda schedule
     # Note: total steps is calculated based on flags["epochs"] * 29 chunks * batches_per_chunk
     # The number of batches per chunk is (samples_per_shard * num_cores) // batch_size
-    total_samples = flags["samples_per_shard"] * num_cores
+    total_samples = flags["samples_per_shard"] #* num_cores
     num_batches_per_chunk = total_samples // flags["batch_size"]
     total_steps = flags["epochs"] * 29 * num_batches_per_chunk
     
@@ -156,7 +156,7 @@ def train_loop(rank, flags):
             # 4. INNER LOOP: ITERATE OVER BATCHES
             # =========================================================================
             for batch_idx, (teacher_cls, teacher_label) in enumerate(data_loader):
-                
+                global_step += 1
                 # --- Move *this batch* to the device ---
                 teacher_cls = teacher_cls.to(device)
                 teacher_label = teacher_label.to(device)
@@ -225,7 +225,7 @@ def train_loop(rank, flags):
                 xm.optimizer_step(optimizer)
                 
                 xm.mark_step()
-                global_step += 1
+                
             
             # --- End of Epoch Diagnostics ---
             # All-reduce losses for epoch summary
