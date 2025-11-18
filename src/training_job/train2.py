@@ -16,6 +16,9 @@ from training_data_download import training_data_download
 # DO NOT USE .item(), IT WILL FORCE XLA TO RECOMPILE AT EVERY BATCH ITERATION
 # Be wary of using torch.save()
 
+#TODO
+#consider running on 27 chunks and keeping the 28th one for verification as it is the final full chunk for all cores
+
 def train_loop(rank, flags):
     """
     The main training function executed independently on each TPU core.
@@ -346,7 +349,7 @@ if __name__ == "__main__":
         "lambda_target": 0.0125, # Was 0.025
         
         # Training, 10 epochs per chunk
-        "epochs": 10,
+        "epochs": 4,
         
         # Data loading
         "samples_per_shard": 19500, # Number of samples per core
