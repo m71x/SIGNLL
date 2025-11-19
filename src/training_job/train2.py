@@ -341,7 +341,7 @@ if __name__ == "__main__":
         "transformer_layers": 6,
         
         # Optimization
-        "lr": 5e-5,
+        "lr": 2e-5,
         "batch_size": 32, # Smaller batch size for 19500 samples
         
         # Halting loss schedule. Reduced lambda_target to prioritize CLS loss more.
