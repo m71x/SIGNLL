@@ -338,7 +338,7 @@ if __name__ == "__main__":
     BASE_FLAGS = {
         # Model architecture
         "d_ctrl": 256,
-        "transformer_layers": 4,
+        "transformer_layers": 6,
         
         # Optimization
         "lr": 1e-4,

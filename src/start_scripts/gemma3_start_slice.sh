@@ -48,6 +48,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --project=${PROJECT_ID} \
   --worker=all \
   --command="cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/training_job/train2.py"
+  
 #pull changes from git repo
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
