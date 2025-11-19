@@ -80,7 +80,7 @@ def train_loop(rank, flags):
     # =========================================================================
     # 2. OUTER LOOP: ITERATE OVER DATA CHUNKS (0 to 28)
     # =========================================================================
-    for chunk_idx in range(29): 
+    for chunk_idx in range(15): 
         current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
         
         if rank == 0:
