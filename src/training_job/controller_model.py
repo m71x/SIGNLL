@@ -13,7 +13,7 @@ class Controller(nn.Module):
         n_heads: int = 4,
         ffn_dim: int = 1024,
         dropout: float = 0.1,
-        halting_bias_init: float = -2.5,
+        halting_bias_init: float = -4.0,
         num_classes: int = 2,
     ):
         super().__init__()

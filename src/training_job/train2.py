@@ -332,7 +332,7 @@ def train_loop(rank, flags):
                 # MODIFIED: Using squared depth to make the penalty steeper (Geometric Growth)
                 # Old: depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
                 # New: depths = 1, 4, 9, 16...
-                depths = (torch.arange(1, L + 1, device=device).float() ** 2).unsqueeze(0)
+                depths = (torch.arange(1, L + 1, device=device).float()).unsqueeze(0)
                 
                 halt_penalty = (depths * (1 - h)).sum(dim=1)
                 
@@ -498,7 +498,7 @@ if __name__ == "__main__":
         
         # Halting loss schedule. Reduced lambda_target to prioritize CLS loss more.
         "lambda_start": 0.0001,
-        "lambda_target": 0.0125, # Was 0.025
+        "lambda_target": 0.001, # Was 0.025
         
         # Training, 10 epochs per chunk
         "epochs": 4,
