@@ -6,7 +6,7 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 
 # (1) Import new classes
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
 # NOTE: Assuming these imports resolve correctly in the environment
@@ -16,9 +16,126 @@ from training_data_download import training_data_download
 # DO NOT USE .item(), IT WILL FORCE XLA TO RECOMPILE AT EVERY BATCH ITERATION
 # Be wary of using torch.save()
 
+# =========================================================================
+# NEW FUNCTION: Evaluation / Testing
+# =========================================================================
+def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_shard):
+    """
+    Tests the model on a specific chunk using an early-exit strategy.
+    Runs ONLY on Device 0.
+    
+    Args:
+        rank: Core rank.
+        model: The trained model instance.
+        chunk_idx: The chunk number (0-28) to test on.
+        threshold: Confidence threshold (0.0 - 1.0) for early exiting.
+        batch_size: Batch size for dataloader.
+        samples_per_shard: Max entries to load.
+    """
+    # STRICT GUARD: Only run on Rank 0
+    if rank != 0:
+        return
+
+    device = xm.xla_device()
+    
+    xm.master_print(f"\n{'*'*80}")
+    xm.master_print(f"*** STARTING EVALUATION ON CHUNK {chunk_idx} (Device 0 Only) ***")
+    xm.master_print(f"*** Early Exit Threshold: {threshold} ***")
+    xm.master_print(f"{'*'*80}")
+
+    model.eval()
+    
+    # --- Load Data (Reusing logic from train_loop) ---
+    current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
+    
+    # Force loading for core 0
+    data = training_data_download(
+        core_id=0, 
+        filename=current_chunk_filename,
+        max_entries=samples_per_shard
+    )
+    
+    if data is None:
+        xm.master_print(f"[Core {rank}] Failed to load test data for chunk {chunk_idx}")
+        return
+
+    teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
+    teacher_label_full = torch.from_numpy(data['classifications']).long()
+    
+    # Handle layer slicing (Same as train_loop)
+    if teacher_cls_full.shape[1] == 25:
+        teacher_cls_full = teacher_cls_full[:, 1:25, :]
+    
+    dataset = TensorDataset(teacher_cls_full, teacher_label_full)
+    
+    # Use SequentialSampler since we are only running on one device and want to check all loaded data
+    sampler = SequentialSampler(dataset)
+    
+    data_loader = DataLoader(
+        dataset,
+        sampler=sampler,
+        batch_size=batch_size,
+        drop_last=False,
+        num_workers=2
+    )
+    
+    total_samples = 0
+    total_correct = 0
+    # Track which layer triggered the exit
+    layer_exit_counts = torch.zeros(24, device=device) 
+
+    with torch.no_grad():
+        for teacher_cls, teacher_label in data_loader:
+            teacher_cls = teacher_cls.to(device)
+            teacher_label = teacher_label.to(device)
+            
+            # Forward pass
+            halting_logits, class_logits, _ = model(teacher_cls)
+            
+            # --- Early Exit Logic ---
+            # 1. Calculate Halting Probabilities
+            h_probs = torch.sigmoid(halting_logits) # [B, L]
+            
+            # 2. Create mask where probability > threshold
+            threshold_mask = (h_probs > threshold) # [B, L] (Bool)
+            
+            # 3. Find the index of the FIRST layer that exceeds threshold
+            exit_indices = torch.argmax(threshold_mask.long(), dim=1) # [B]
+            
+            # 4. Handle samples that NEVER crossed the threshold
+            row_has_exit = threshold_mask.any(dim=1)
+            exit_indices[~row_has_exit] = 23
+            
+            # --- Classification ---
+            batch_indices = torch.arange(class_logits.size(0), device=device)
+            selected_logits = class_logits[batch_indices, exit_indices]
+            predictions = torch.argmax(selected_logits, dim=-1)
+            
+            # Update Metrics
+            correct = (predictions == teacher_label).sum()
+            total_correct += correct
+            total_samples += teacher_label.size(0)
+            
+            # Update Layer stats
+            unique_exits, counts = torch.unique(exit_indices, return_counts=True)
+            layer_exit_counts.index_add_(0, unique_exits, counts.float())
+            
+    # --- Calculate Results (Local only, no all_reduce) ---
+    # Since we are only on rank 0, we don't need to sync with other cores
+    accuracy = (total_correct.float() / float(total_samples)) * 100.0
+    avg_exit_layer = (layer_exit_counts * torch.arange(24, device=device)).sum() / float(total_samples)
+    
+    xm.master_print(f"RESULTS FOR CHUNK {chunk_idx} (Threshold: {threshold}):")
+    xm.master_print(f"  Accuracy: {accuracy:.2f}% ({total_correct}/{total_samples})")
+    xm.master_print(f"  Average Exit Layer: {avg_exit_layer:.2f} (0-23)")
+    xm.master_print(f"{'*'*80}\n")
+
+    model.train() # Reset to train mode
+
 #TODO
 #consider running on 27 chunks and keeping the 28th one for verification as it is the final full chunk for all cores
-
+#change loss to be adaptive rather than just find global lowest optimum
+#modify cls and halting loss to be independent rather than independent
 def train_loop(rank, flags):
     """
     The main training function executed independently on each TPU core.
@@ -80,7 +197,7 @@ def train_loop(rank, flags):
     # =========================================================================
     # 2. OUTER LOOP: ITERATE OVER DATA CHUNKS (0 to 28)
     # =========================================================================
-    for chunk_idx in range(29): 
+    for chunk_idx in range(28): 
         current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
         
         if rank == 0:
@@ -321,6 +438,24 @@ def train_loop(rank, flags):
             'optimizer_state_dict': optimizer.state_dict(),
         }, final_checkpoint_path)
         xm.master_print(f"✅ FINAL Checkpoint saved: {final_checkpoint_path}")
+        
+    # =========================================================================
+    # CALL EVALUATION FUNCTION
+    # =========================================================================
+    # Run evaluation on the requested chunk with the requested threshold
+    # Using chunk 29 (the final one) as default validation or one specified in flags
+    test_chunk = flags.get("test_chunk", 29) 
+    test_thresh = flags.get("test_threshold", 0.9)
+    
+    evaluate_model(
+        rank=rank,
+        model=model,
+        # NO DEVICE ARG PASSED
+        chunk_idx=test_chunk,
+        threshold=test_thresh,
+        batch_size=flags["batch_size"],
+        samples_per_shard=flags["samples_per_shard"]
+    )
     
     xm.rendezvous("final_check")
 
@@ -361,6 +496,10 @@ if __name__ == "__main__":
         # Logging and checkpointing 
         "log_interval": 50, # Log every N steps (unused, replaced by epoch logs)
         "checkpoint_interval": 1, # Save checkpoint every N epochs (unused, saved per chunk)
+        
+        # Testing Parameters
+        "test_chunk": 28,     # The chunk index to test on
+        "test_threshold": 0.8 # Confidence threshold for early exiting
     }
     
     print("Starting single XLA spawn job to process all 29 chunks sequentially.")
