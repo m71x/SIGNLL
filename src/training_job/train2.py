@@ -489,7 +489,7 @@ def _mp_fn(rank, flags):
 if __name__ == "__main__":
     BASE_FLAGS = {
         # Model architecture
-        "d_ctrl": 256,
+        "d_ctrl": 512,
         "transformer_layers": 4,
         
         # Optimization
