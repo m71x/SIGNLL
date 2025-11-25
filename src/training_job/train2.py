@@ -129,16 +129,12 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
     avg_exit_layer = (layer_exit_counts_cpu * layers).sum() / total_samples
     
     xm.master_print(f"RESULTS FOR CHUNK {chunk_idx} (Threshold: {threshold}):")
-    xm.master_print(f"  Accuracy: {accuracy:.2f}% ({total_correct}/{total_samples})")
-    xm.master_print(f"  Average Exit Layer: {avg_exit_layer:.2f} (0-23)")
+    xm.master_print(f"  Accuracy: {accuracy:.2f}% ({total_correct}/{total_samples})")
+    xm.master_print(f"  Average Exit Layer: {avg_exit_layer:.2f} (0-23)")
     xm.master_print(f"{'*'*80}\n")
 
     model.train() # Reset to train mode
 
-#TODO
-#consider running on 27 chunks and keeping the 28th one for verification as it is the final full chunk for all cores
-#change loss to be adaptive rather than just find global lowest optimum
-#modify cls and halting loss to be independent rather than independent
 def train_loop(rank, flags):
     """
     The main training function executed independently on each TPU core.
@@ -325,14 +321,15 @@ def train_loop(rank, flags):
                     class_logits_positive = class_logits.squeeze(-1)
                 
                 ce_per_layer = bce_loss_fn(class_logits_positive, labels)
-                # Loss is multiplied by the q vector (cumulative probability of halting later)
-                loss_cls = (q * ce_per_layer).sum(dim=1).mean()
+                
+                # MODIFIED: Independent Loss (Anytime Prediction)
+                # We average the loss across all layers so every layer learns to predict,
+                # regardless of where the model halts. This prevents the "chicken and egg" problem.
+                loss_cls = ce_per_layer.mean()
                 
                 # Halting loss
-                # MODIFIED: Using squared depth to make the penalty steeper (Geometric Growth)
-                # Old: depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
-                # New: depths = 1, 4, 9, 16...
-                depths = (torch.arange(1, L + 1, device=device).float()).unsqueeze(0)
+                # LINEAR depth penalty (reverted from squared)
+                depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
                 
                 halt_penalty = (depths * (1 - h)).sum(dim=1)
                 
@@ -368,7 +365,7 @@ def train_loop(rank, flags):
                 def format_diagnostic_output(logits_cpu, label_cpu, sample_type):
                     """Helper function to format the prediction vs label output for a single sample."""
                     if logits_cpu is None or label_cpu is None:
-                        return f"  No {sample_type} sample found in the first batch of this core's chunk."
+                        return f"  No {sample_type} sample found in the first batch of this core's chunk."
 
                     sample_probs = torch.softmax(logits_cpu, dim=-1)
                     predicted_classes = torch.argmax(sample_probs, dim=-1).tolist()
@@ -378,22 +375,22 @@ def train_loop(rank, flags):
                     true_label_value = label_cpu.item()
                     
                     output = []
-                    output.append(f"  --- {sample_type} Sample (True Label: {true_label_value}) ---")
-                    output.append(f"  Predicted Class per Layer (0-23): {predicted_classes}")
-                    output.append(f"  Max Confidence per Layer: {predicted_probs}")
+                    output.append(f"  --- {sample_type} Sample (True Label: {true_label_value}) ---")
+                    output.append(f"  Predicted Class per Layer (0-23): {predicted_classes}")
+                    output.append(f"  Max Confidence per Layer: {predicted_probs}")
                     return "\n".join(output)
                 
                 elapsed = time.time() - start_time
                 xm.master_print("-" * 80)
                 xm.master_print(f"EPOCH {epoch+1}/{flags['epochs']} COMPLETED for CHUNK {chunk_idx + 1}")
-                xm.master_print(f"  Total Elapsed Time: {elapsed:.1f}s")
+                xm.master_print(f"  Total Elapsed Time: {elapsed:.1f}s")
                 xm.master_print("FINAL METRICS:")
-                xm.master_print(f"  Global Step: {global_step}/{total_steps} ({global_step * 100 / total_steps:.1f}%)")
-                xm.master_print(f"  Avg Total Loss: {loss_sum / num_cores}")
-                xm.master_print(f"  Avg Cls Loss: {loss_cls_sum / num_cores}")
-                xm.master_print(f"  Avg Halt Loss: {loss_halt_sum / num_cores}")
-                xm.master_print(f"  Avg Mean h: {h_mean / num_cores}")
-                xm.master_print(f"  Lambda: {lambda_now:.6f}")
+                xm.master_print(f"  Global Step: {global_step}/{total_steps} ({global_step * 100 / total_steps:.1f}%)")
+                xm.master_print(f"  Avg Total Loss: {loss_sum / num_cores}")
+                xm.master_print(f"  Avg Cls Loss: {loss_cls_sum / num_cores}")
+                xm.master_print(f"  Avg Halt Loss: {loss_halt_sum / num_cores}")
+                xm.master_print(f"  Avg Mean h: {h_mean / num_cores}")
+                xm.master_print(f"  Lambda: {lambda_now:.6f}")
                 
                 # === SAMPLE CLASSIFICATION DIAGNOSTIC ===
                 if sample_logits_pos_cpu is not None or sample_logits_neg_cpu is not None:
@@ -511,7 +508,7 @@ if __name__ == "__main__":
         "checkpoint_interval": 1, # Save checkpoint every N epochs (unused, saved per chunk)
         
         # Testing Parameters
-        "test_chunk": 29,     # The chunk index to test on
+        "test_chunk": 28,     # The chunk index to test on
         "test_threshold": 0.8 # Confidence threshold for early exiting
     }
     
