@@ -200,7 +200,7 @@ def train_loop(rank, flags):
     # =========================================================================
     # 2. OUTER LOOP: ITERATE OVER DATA CHUNKS (0 to 28)
     # =========================================================================
-    for chunk_idx in range(29): 
+    for chunk_idx in range(28): 
         current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
         
         if rank == 0:
@@ -447,7 +447,7 @@ def train_loop(rank, flags):
     # =========================================================================
     # Run evaluation on the requested chunk with the requested threshold
     # Using chunk 28 (the final one) as default validation or one specified in flags
-    test_chunk = flags.get("test_chunk", 28) 
+    test_chunk = flags.get("test_chunk", 29) 
     test_thresh = flags.get("test_threshold", 0.9)
     
     evaluate_model(
@@ -511,7 +511,7 @@ if __name__ == "__main__":
         "checkpoint_interval": 1, # Save checkpoint every N epochs (unused, saved per chunk)
         
         # Testing Parameters
-        "test_chunk": 28,     # The chunk index to test on
+        "test_chunk": 29,     # The chunk index to test on
         "test_threshold": 0.8 # Confidence threshold for early exiting
     }
     
