@@ -459,6 +459,16 @@ def train_loop(rank, flags):
         batch_size=flags["batch_size"],
         samples_per_shard=flags["samples_per_shard"]
     )
+
+    evaluate_model(
+        rank=rank,
+        model=model,
+        # NO DEVICE ARG PASSED
+        chunk_idx=test_chunk,
+        threshold=0.9,
+        batch_size=flags["batch_size"],
+        samples_per_shard=flags["samples_per_shard"]
+    )
     
     xm.rendezvous("final_check")
 
@@ -479,7 +489,7 @@ def _mp_fn(rank, flags):
 if __name__ == "__main__":
     BASE_FLAGS = {
         # Model architecture
-        "d_ctrl": 512,
+        "d_ctrl": 256,
         "transformer_layers": 4,
         
         # Optimization
