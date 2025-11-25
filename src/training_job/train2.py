@@ -455,7 +455,7 @@ def train_loop(rank, flags):
         model=model,
         # NO DEVICE ARG PASSED
         chunk_idx=test_chunk,
-        threshold=test_thresh,
+        threshold=0.7,
         batch_size=flags["batch_size"],
         samples_per_shard=flags["samples_per_shard"]
     )
@@ -465,7 +465,7 @@ def train_loop(rank, flags):
         model=model,
         # NO DEVICE ARG PASSED
         chunk_idx=test_chunk,
-        threshold=0.9,
+        threshold=0.95,
         batch_size=flags["batch_size"],
         samples_per_shard=flags["samples_per_shard"]
     )
