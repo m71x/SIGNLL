@@ -23,14 +23,6 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
     """
     Tests the model on a specific chunk using an early-exit strategy.
     Runs ONLY on Device 0.
-    
-    Args:
-        rank: Core rank.
-        model: The trained model instance.
-        chunk_idx: The chunk number (0-28) to test on.
-        threshold: Confidence threshold (0.0 - 1.0) for early exiting.
-        batch_size: Batch size for dataloader.
-        samples_per_shard: Max entries to load.
     """
     # STRICT GUARD: Only run on Rank 0
     if rank != 0:
@@ -62,7 +54,7 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
     teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
     teacher_label_full = torch.from_numpy(data['classifications']).long()
     
-    # Handle layer slicing (Same as train_loop)
+    # Handle layer slicing
     if teacher_cls_full.shape[1] == 25:
         teacher_cls_full = teacher_cls_full[:, 1:25, :]
     
@@ -79,13 +71,15 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
         num_workers=2
     )
     
+    # Initialize accumulators as CPU INTEGERS/FLOATS, not XLA Tensors
     total_samples = 0
     total_correct = 0
-    # Track which layer triggered the exit
-    layer_exit_counts = torch.zeros(24, device=device) 
+    
+    # Track which layer triggered the exit (Keep on CPU)
+    layer_exit_counts_cpu = torch.zeros(24, dtype=torch.float32)
 
     with torch.no_grad():
-        for teacher_cls, teacher_label in data_loader:
+        for i, (teacher_cls, teacher_label) in enumerate(data_loader):
             teacher_cls = teacher_cls.to(device)
             teacher_label = teacher_label.to(device)
             
@@ -93,16 +87,13 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
             halting_logits, class_logits, _ = model(teacher_cls)
             
             # --- Early Exit Logic ---
-            # 1. Calculate Halting Probabilities
-            h_probs = torch.sigmoid(halting_logits) # [B, L]
+            h_probs = torch.sigmoid(halting_logits)
+            threshold_mask = (h_probs > threshold)
             
-            # 2. Create mask where probability > threshold
-            threshold_mask = (h_probs > threshold) # [B, L] (Bool)
+            # Find the index of the FIRST layer that exceeds threshold
+            exit_indices = torch.argmax(threshold_mask.long(), dim=1)
             
-            # 3. Find the index of the FIRST layer that exceeds threshold
-            exit_indices = torch.argmax(threshold_mask.long(), dim=1) # [B]
-            
-            # 4. Handle samples that NEVER crossed the threshold
+            # Handle samples that NEVER crossed the threshold (force to last layer)
             row_has_exit = threshold_mask.any(dim=1)
             exit_indices[~row_has_exit] = 23
             
@@ -111,19 +102,31 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
             selected_logits = class_logits[batch_indices, exit_indices]
             predictions = torch.argmax(selected_logits, dim=-1)
             
-            # Update Metrics
-            correct = (predictions == teacher_label).sum()
-            total_correct += correct
+            # --- Metrics Calculation (FIX FOR HANG) ---
+            correct_tensor = (predictions == teacher_label).sum()
+            
+            # CRITICAL: Move results to CPU immediately to break the XLA graph.
+            # If we keep adding tensors (total_correct += correct_tensor), the graph grows infinitely.
+            total_correct += correct_tensor.item() 
             total_samples += teacher_label.size(0)
             
-            # Update Layer stats
-            unique_exits, counts = torch.unique(exit_indices, return_counts=True)
-            layer_exit_counts.index_add_(0, unique_exits, counts.float())
+            # Move exit indices to CPU for statistics
+            exit_indices_cpu = exit_indices.cpu()
+            unique_exits, counts = torch.unique(exit_indices_cpu, return_counts=True)
+            layer_exit_counts_cpu.index_add_(0, unique_exits, counts.float())
             
-    # --- Calculate Results (Local only, no all_reduce) ---
-    # Since we are only on rank 0, we don't need to sync with other cores
-    accuracy = (total_correct.float() / float(total_samples)) * 100.0
-    avg_exit_layer = (layer_exit_counts * torch.arange(24, device=device)).sum() / float(total_samples)
+            # Trigger execution of this batch
+            xm.mark_step()
+            
+            if i % 100 == 0:
+                print(f"[Eval] Processed batch {i}...")
+            
+    # --- Calculate Results (Local only) ---
+    accuracy = (total_correct / total_samples) * 100.0
+    
+    # Calculate average exit layer using CPU tensors
+    layers = torch.arange(24, dtype=torch.float32)
+    avg_exit_layer = (layer_exit_counts_cpu * layers).sum() / total_samples
     
     xm.master_print(f"RESULTS FOR CHUNK {chunk_idx} (Threshold: {threshold}):")
     xm.master_print(f"  Accuracy: {accuracy:.2f}% ({total_correct}/{total_samples})")
@@ -197,7 +200,7 @@ def train_loop(rank, flags):
     # =========================================================================
     # 2. OUTER LOOP: ITERATE OVER DATA CHUNKS (0 to 28)
     # =========================================================================
-    for chunk_idx in range(28): 
+    for chunk_idx in range(29): 
         current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
         
         if rank == 0:
@@ -443,8 +446,8 @@ def train_loop(rank, flags):
     # CALL EVALUATION FUNCTION
     # =========================================================================
     # Run evaluation on the requested chunk with the requested threshold
-    # Using chunk 29 (the final one) as default validation or one specified in flags
-    test_chunk = flags.get("test_chunk", 29) 
+    # Using chunk 28 (the final one) as default validation or one specified in flags
+    test_chunk = flags.get("test_chunk", 28) 
     test_thresh = flags.get("test_threshold", 0.9)
     
     evaluate_model(
