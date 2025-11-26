@@ -305,10 +305,12 @@ def _mp_fn(rank, flags):
     # 1. Freeze EVERYTHING
     for param in model.parameters():
         param.requires_grad = False
+        xm.mark_step()
         
     # 2. Unfreeze HALTING HEADS
     for param in model.halting_heads.parameters():
         param.requires_grad = True
+        xm.mark_step()
 
     # 3. Create NEW Optimizer (Only for halting heads)
     optimizer_halt = optim.AdamW(
