@@ -142,9 +142,11 @@ def train_loop(rank, flags):
     """
     device = xm.torch_xla.device()
     num_cores = xm.xrt_world_size()
+    stage = flags["training_stage"] # "train_cls" or "train_halt"
 
     if rank == 0:
         xm.master_print(f"Detected {num_cores} active cores")
+        xm.master_print(f"Starting Training in STAGE: {stage.upper()}")
         xm.master_print(f"Starting single-model training across 29 sequential data chunks.")
         
     # =========================================================================
@@ -153,18 +155,38 @@ def train_loop(rank, flags):
     print(f"[Core {rank}] Initializing model...")
     L = 24
     
-    # MODIFIED: Added halting_bias_init=-10.0 to FORCE exploration of deep layers.
-    # This effectively disables halting at the start of training.
+    # Reset bias to standard (-2.5) because we handle flow via stages now
     model = Controller(
         L=L,
         d_teacher=1024,
         d_ctrl=flags["d_ctrl"],
         n_layers=flags["transformer_layers"],
         num_classes=2,
-        halting_bias_init=-10.0 
+        halting_bias_init=-2.5
     ).to(device)
     
-    optimizer = optim.AdamW(model.parameters(), lr=flags["lr"], weight_decay=1e-2)
+    # --- STAGE 2: FREEZING LOGIC ---
+    if stage == "train_halt":
+        if rank == 0:
+            xm.master_print("STAGE 2 DETECTED: Freezing Transformer and Classifiers. Training ONLY Halting Heads.")
+            
+        # Freeze everything first
+        for name, param in model.named_parameters():
+            param.requires_grad = False
+            
+        # Unfreeze ONLY halting heads
+        for name, param in model.halting_heads.named_parameters():
+            param.requires_grad = True
+            if rank == 0:
+                print(f"  -> Unfrozen: {name}")
+                
+        # Optional: Unfreeze projection/embedding if you want them adaptable
+        # usually better to freeze them too so the state is stable.
+    else:
+        if rank == 0:
+            xm.master_print("STAGE 1 DETECTED: Training ALL parameters (Transformer + Classifiers).")
+
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=flags["lr"], weight_decay=1e-2)
     
     # CRITICAL: SYNCHRONIZE INITIAL WEIGHTS ACROSS ALL CORES
     if rank == 0:
@@ -177,6 +199,13 @@ def train_loop(rank, flags):
     xm.mark_step()
     xm.rendezvous("weights_synced")
     
+    # --- STAGE 2: LOAD WEIGHTS (Simulated) ---
+    # In a real run, you would load the checkpoint from Stage 1 here.
+    # For now, we assume you run Stage 1, save, change flag, and restart script loading checkpoint.
+    # if stage == "train_halt":
+    #    checkpoint = torch.load("/tmp/stage1_checkpoint.pt")
+    #    model.load_state_dict(checkpoint['model_state_dict'])
+    
     if rank == 0:
         xm.master_print("✅ Initial weights synchronized across all cores. Starting chunk loop.")
 
@@ -187,8 +216,6 @@ def train_loop(rank, flags):
     sample_label_neg_cpu = None
     
     # Calculate total steps across ALL chunks for lambda schedule
-    # Note: total steps is calculated based on flags["epochs"] * 29 chunks * batches_per_chunk
-    # The number of batches per chunk is (samples_per_shard * num_cores) // batch_size
     total_samples = flags["samples_per_shard"] #* num_cores
     num_batches_per_chunk = total_samples // flags["batch_size"]
     total_steps = flags["epochs"] * 29 * num_batches_per_chunk
@@ -228,8 +255,6 @@ def train_loop(rank, flags):
             raise ValueError(f"Unexpected number of layers: {teacher_cls_full.shape[1]}")
 
         # === Calculate and Apply Class Weighting (Per-Chunk) ===
-        # Calculate the number of samples with label 0 (Negative) and 1 (Positive)
-        # Using tolist()[0] to avoid .item() while extracting scalar value from CPU tensor
         neg_samples_count = (teacher_label_full == 0).sum().item()
         pos_samples_count = (teacher_label_full == 1).sum().item()
         
@@ -274,10 +299,6 @@ def train_loop(rank, flags):
                 xm.master_print(f"CHUNK {chunk_idx + 1}/29 | EPOCH {epoch + 1}/{flags['epochs']}")
                 xm.master_print(f"{'='*80}")
             
-            # The sampler handles shuffling, so we just iterate
-            # =========================================================================
-            # 4. INNER LOOP: ITERATE OVER BATCHES
-            # =========================================================================
             for batch_idx, (teacher_cls, teacher_label) in enumerate(data_loader):
                 global_step += 29
                 # --- Move *this batch* to the device ---
@@ -287,14 +308,11 @@ def train_loop(rank, flags):
                 # --- Forward Pass ---
                 halting_logits, class_logits, _ = model(teacher_cls)
                 
-                # === Capture diagnostic data on the first batch of rank 0 ===
+                # === Capture diagnostic data ===
                 if rank == 0 and batch_idx == 0:
-                    
-                    # Find and capture one positive and one negative sample
                     positive_indices = (teacher_label == 1).nonzero(as_tuple=True)[0]
                     negative_indices = (teacher_label == 0).nonzero(as_tuple=True)[0]
 
-                    # Capture Positive Sample (Label 1)
                     if positive_indices.numel() > 0:
                         pos_idx = positive_indices[0]
                         sample_logits_pos_cpu = class_logits[pos_idx].detach().cpu() 
@@ -303,7 +321,6 @@ def train_loop(rank, flags):
                         sample_logits_pos_cpu = None
                         sample_label_pos_cpu = None
 
-                    # Capture Negative Sample (Label 0)
                     if negative_indices.numel() > 0:
                         neg_idx = negative_indices[0]
                         sample_logits_neg_cpu = class_logits[neg_idx].detach().cpu()
@@ -313,12 +330,7 @@ def train_loop(rank, flags):
                         sample_label_neg_cpu = None
                 
                 # --- Loss Calculation ---
-                h = torch.sigmoid(halting_logits)
-                q = compute_q_from_h(h)
-                
-                # Classification loss
                 labels = teacher_label.float().unsqueeze(1).expand(-1, L)
-                
                 if class_logits.size(-1) == 2:
                     class_logits_positive = class_logits[:, :, 1]
                 else:
@@ -326,24 +338,32 @@ def train_loop(rank, flags):
                 
                 ce_per_layer = bce_loss_fn(class_logits_positive, labels)
                 
-                # MODIFIED: Independent Loss (Anytime Prediction)
-                # We average the loss across all layers so every layer learns to predict,
-                # regardless of where the model halts. This prevents the "chicken and egg" problem.
-                loss_cls = ce_per_layer.mean()
-                
-                # Halting loss
-                # LINEAR depth penalty (reverted from squared)
-                depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
-                
-                halt_penalty = (depths * (1 - h)).sum(dim=1)
-                
-                # Progress calculation is now relative to the ENTIRE 29-chunk training job
-                progress = global_step / total_steps
-                lambda_start, lambda_target = flags["lambda_start"], flags["lambda_target"]
-                lambda_now = lambda_start + (lambda_target - lambda_start) * progress
-                loss_halt = lambda_now * halt_penalty.mean()
-                
-                # Total loss
+                # --- STAGE-SPECIFIC LOSS ---
+                if stage == "train_cls":
+                    # STAGE 1: Train ALL classifiers. Ignore halting.
+                    loss_cls = ce_per_layer.mean()
+                    loss_halt = torch.tensor(0.0, device=device)
+                    # We compute h just for logs, but don't use it for loss
+                    h = torch.sigmoid(halting_logits) 
+                    
+                elif stage == "train_halt":
+                    # STAGE 2: Train Halting Heads to match Classifier performance
+                    h = torch.sigmoid(halting_logits)
+                    q = compute_q_from_h(h)
+                    
+                    # We multiply q * error.
+                    # Since classifiers are frozen, we are optimizing q to put mass where error is LOW.
+                    loss_cls = (q * ce_per_layer).sum(dim=1).mean()
+                    
+                    # Add Depth Penalty
+                    depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
+                    halt_penalty = (depths * (1 - h)).sum(dim=1)
+                    
+                    progress = global_step / total_steps
+                    lambda_start, lambda_target = flags["lambda_start"], flags["lambda_target"]
+                    lambda_now = lambda_start + (lambda_target - lambda_start) * progress
+                    loss_halt = lambda_now * halt_penalty.mean()
+
                 loss = loss_cls + loss_halt
                 
                 # --- Backward Pass and Optimization ---
@@ -353,10 +373,8 @@ def train_loop(rank, flags):
                 xm.optimizer_step(optimizer)
                 
                 xm.mark_step()
-                
             
             # --- End of Epoch Diagnostics ---
-            # All-reduce losses for epoch summary
             loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
             loss_cls_sum = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
             loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
@@ -365,19 +383,14 @@ def train_loop(rank, flags):
             xm.mark_step()
             
             if rank == 0:
-                
                 def format_diagnostic_output(logits_cpu, label_cpu, sample_type):
-                    """Helper function to format the prediction vs label output for a single sample."""
                     if logits_cpu is None or label_cpu is None:
-                        return f"  No {sample_type} sample found in the first batch of this core's chunk."
-
+                        return f"  No {sample_type} sample found in the first batch."
                     sample_probs = torch.softmax(logits_cpu, dim=-1)
                     predicted_classes = torch.argmax(sample_probs, dim=-1).tolist()
                     max_confidences = sample_probs.max(dim=-1).values
                     predicted_probs = [f"{p:.4f}" for p in max_confidences.tolist()]
-                    # Using tolist()[0] for XLA-safe extraction of scalar from CPU tensor
                     true_label_value = label_cpu.item()
-                    
                     output = []
                     output.append(f"  --- {sample_type} Sample (True Label: {true_label_value}) ---")
                     output.append(f"  Predicted Class per Layer (0-23): {predicted_classes}")
@@ -387,17 +400,16 @@ def train_loop(rank, flags):
                 elapsed = time.time() - start_time
                 xm.master_print("-" * 80)
                 xm.master_print(f"EPOCH {epoch+1}/{flags['epochs']} COMPLETED for CHUNK {chunk_idx + 1}")
-                xm.master_print(f"  Total Elapsed Time: {elapsed:.1f}s")
+                xm.master_print(f"  Stage: {stage}")
                 xm.master_print("FINAL METRICS:")
-                xm.master_print(f"  Global Step: {global_step}/{total_steps} ({global_step * 100 / total_steps:.1f}%)")
                 xm.master_print(f"  Avg Total Loss: {loss_sum / num_cores}")
                 xm.master_print(f"  Avg Cls Loss: {loss_cls_sum / num_cores}")
-                xm.master_print(f"  Avg Halt Loss: {loss_halt_sum / num_cores}")
+                if stage == "train_halt":
+                    xm.master_print(f"  Avg Halt Loss: {loss_halt_sum / num_cores}")
+                    xm.master_print(f"  Lambda: {lambda_now:.6f}")
                 xm.master_print(f"  Avg Mean h: {h_mean / num_cores}")
-                xm.master_print(f"  Lambda: {lambda_now:.6f}")
                 
-                # === SAMPLE CLASSIFICATION DIAGNOSTIC ===
-                if sample_logits_pos_cpu is not None or sample_logits_neg_cpu is not None:
+                if sample_logits_pos_cpu is not None:
                     xm.master_print("\nDUAL SAMPLE CLASSIFICATION DIAGNOSTIC (from first batch):")
                     pos_output = format_diagnostic_output(sample_logits_pos_cpu, sample_label_pos_cpu, "Positive (Label 1)")
                     xm.master_print(pos_output)
@@ -406,12 +418,11 @@ def train_loop(rank, flags):
                 
                 xm.master_print("-" * 80)
             
-            # Ensure all cores finish the epoch before proceeding
             xm.rendezvous(f"epoch_end_chunk_{chunk_idx}_epoch_{epoch}")
         
-        # --- Checkpointing at the end of each CHUNK (Optional) ---
+        # --- Checkpointing ---
         if (chunk_idx + 1) % 5 == 0 and rank == 0:
-            checkpoint_path = f"/tmp/controller_chunk_{chunk_idx+1}_final.pt"
+            checkpoint_path = f"/tmp/controller_{stage}_chunk_{chunk_idx+1}_final.pt"
             torch.save({
                 'chunk': chunk_idx + 1,
                 'global_step': global_step,
@@ -420,21 +431,13 @@ def train_loop(rank, flags):
             }, checkpoint_path)
             xm.master_print(f"✅ CHUNK Checkpoint saved: {checkpoint_path}")
         
-        # Ensure all cores finish the chunk before proceeding to the next
         xm.rendezvous(f"chunk_end_{chunk_idx}")
 
-
-    # --- FINAL SUMMARY (After all 29 chunks are processed) ---
+    # --- FINAL SUMMARY ---
     total_time = time.time() - start_time
     if rank == 0:
-        xm.master_print("\n" + "=" * 80)
-        xm.master_print("✅ ALL 29 DATA CHUNKS PROCESSED SUCCESSFULLY.")
-        xm.master_print(f"Total time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
-        xm.master_print(f"Total steps: {global_step}")
-        xm.master_print("=" * 80)
-        
-        # Final Save
-        final_checkpoint_path = "/tmp/controller_final_29_chunks.pt"
+        xm.master_print(f"✅ STAGE {stage} COMPLETED.")
+        final_checkpoint_path = f"/tmp/controller_{stage}_final_29_chunks.pt"
         torch.save({
             'chunk': 29,
             'global_step': global_step,
@@ -446,38 +449,19 @@ def train_loop(rank, flags):
     # =========================================================================
     # CALL EVALUATION FUNCTION
     # =========================================================================
-    # Run evaluation on the requested chunk with the requested threshold
-    # Using chunk 28 (the final one) as default validation or one specified in flags
-    test_chunk = flags.get("test_chunk", 28) 
-    test_thresh = flags.get("test_threshold", 0.9)
-    
     evaluate_model(
         rank=rank,
         model=model,
-        # NO DEVICE ARG PASSED
-        chunk_idx=test_chunk,
+        chunk_idx=flags.get("test_chunk", 28),
         threshold=0.7,
-        batch_size=flags["batch_size"],
-        samples_per_shard=flags["samples_per_shard"]
-    )
-
-    evaluate_model(
-        rank=rank,
-        model=model,
-        # NO DEVICE ARG PASSED
-        chunk_idx=test_chunk,
-        threshold=0.95,
         batch_size=flags["batch_size"],
         samples_per_shard=flags["samples_per_shard"]
     )
     
     xm.rendezvous("final_check")
 
-# ... (Rest of your _mp_fn and __main__ block) ...
 def _mp_fn(rank, flags):
     try:
-        # NOTE: Model initialization is now inside train_loop, but it is executed only once 
-        # per spawned process (i.e., once on startup), as required.
         torch.set_default_tensor_type('torch.FloatTensor')
         train_loop(rank, flags)
     except Exception as e:
@@ -486,37 +470,27 @@ def _mp_fn(rank, flags):
         traceback.print_exc()
         raise
 
-
 if __name__ == "__main__":
     BASE_FLAGS = {
-        # Model architecture
+        # --- TRAINING STAGE CONTROL ---
+        # OPTIONS: "train_cls" (First) OR "train_halt" (Second)
+        "training_stage": "train_cls", 
+        
         "d_ctrl": 512,
         "transformer_layers": 4,
-        
-        # Optimization
         "lr": 1e-4,
-        "batch_size": 32, # Smaller batch size for 19500 samples
+        "batch_size": 32, 
         
-        # Halting loss schedule. Reduced lambda_target to prioritize CLS loss more.
-        # CHANGED: lambda_start = 0.0 to prevent immediate collapse
-        "lambda_start": 0.0,
-        "lambda_target": 0.001, # Was 0.025
+        "lambda_start": 0.0001,
+        "lambda_target": 0.005, # Higher target is safe in Stage 2
         
-        # Training, 10 epochs per chunk
         "epochs": 4,
+        "samples_per_shard": 19500, 
         
-        # Data loading
-        "samples_per_shard": 19500, # Number of samples per core
-        
-        # Logging and checkpointing 
-        "log_interval": 50, # Log every N steps (unused, replaced by epoch logs)
-        "checkpoint_interval": 1, # Save checkpoint every N epochs (unused, saved per chunk)
-        
-        # Testing Parameters
-        "test_chunk": 28,     # The chunk index to test on
-        "test_threshold": 0.8 # Confidence threshold for early exiting
+        "test_chunk": 28,     
+        "test_threshold": 0.8 
     }
     
-    print("Starting single XLA spawn job to process all 29 chunks sequentially.")
+    print(f"Starting single XLA spawn job. STAGE: {BASE_FLAGS['training_stage']}")
     xmp.spawn(_mp_fn, args=(BASE_FLAGS,), start_method='fork')
     print("XLA spawn job completed.")
