@@ -1,4 +1,4 @@
-import os, time
+import os, time, gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,7 +6,7 @@ import torch.optim as optim
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 
-from torch.utils.data import TensorDataset, DataLoader, SequentialSampler
+from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
 from controller_model import Controller, compute_q_from_h
@@ -115,8 +115,10 @@ def run_stage(rank, flags, model, optimizer, stage):
     num_cores = xm.xrt_world_size()
     
     L = 24
-    # Ensure this matches your download limit
     total_samples = flags["samples_per_shard"]
+    
+    # Pre-calculate constant tensors to avoid recreation in loop (Optimization)
+    depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
     
     # Track steps continuously
     total_steps = flags["epochs"] * 29 * (total_samples // flags["batch_size"])
@@ -131,6 +133,9 @@ def run_stage(rank, flags, model, optimizer, stage):
             xm.master_print(f"\n### STAGE: {stage} | CHUNK {chunk_idx + 1}/29 ###")
 
         # --- Load Data ---
+        # Ensure garbage collection runs to free CPU RAM from previous chunk
+        gc.collect() 
+        
         data = training_data_download(
             core_id=rank, 
             filename=current_chunk_filename,
@@ -146,35 +151,44 @@ def run_stage(rank, flags, model, optimizer, stage):
             teacher_cls_full = teacher_cls_full[:, 1:25, :]
 
         # =====================================================================
-        # [FIX 1] GLOBAL WEIGHT SYNCHRONIZATION (prevents math errors)
+        # [FIX 1] STATIC WEIGHT CALCULATION (Prevents OOM)
         # =====================================================================
-        # 1. Convert counts to tensors on the DEVICE immediately
-        neg_count = torch.tensor((teacher_label_full == 0).sum(), device=device, dtype=torch.float32)
-        pos_count = torch.tensor((teacher_label_full == 1).sum(), device=device, dtype=torch.float32)
+        # Calculate sums on CPU first to avoid unnecessary device transfers
+        neg_count_cpu = (teacher_label_full == 0).sum().float()
+        pos_count_cpu = (teacher_label_full == 1).sum().float()
         
-        # 2. Sync across all cores so everyone agrees on the count
-        neg_count_global = xm.all_reduce(xm.REDUCE_SUM, neg_count)
-        pos_count_global = xm.all_reduce(xm.REDUCE_SUM, pos_count)
+        # Move to device for reduction
+        neg_count_dev = torch.tensor(neg_count_cpu, device=device)
+        pos_count_dev = torch.tensor(pos_count_cpu, device=device)
         
-        # 3. Calculate weight using the synchronized global counts
-        pos_weight_val = neg_count_global / (pos_count_global + 1e-6)
+        # Sync across all cores
+        neg_count_global = xm.all_reduce(xm.REDUCE_SUM, neg_count_dev)
+        pos_count_global = xm.all_reduce(xm.REDUCE_SUM, pos_count_dev)
         
-        # 4. Create the criterion with the static global weight
-        bce_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_val.view(1), reduction='none')
+        # CRITICAL FIX: Break the graph here.
+        # Use .item() to get a standard Python float. 
+        # This prevents XLA from trying to compile a dynamic tensor into the loss function.
+        pos_weight_static = neg_count_global.item() / (pos_count_global.item() + 1e-6)
+        
+        # Create a new constant tensor on device
+        pos_weight_tensor = torch.tensor([pos_weight_static], device=device)
+        
+        # Criterion uses the static tensor (treated as constant by compiler)
+        bce_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor, reduction='none')
 
         if rank == 0:
-            xm.master_print(f"[Chunk {chunk_idx}] Global Pos Weight: {pos_weight_val.item():.4f}")
+            xm.master_print(f"[Chunk {chunk_idx}] Global Pos Weight: {pos_weight_static:.4f}")
 
         dataset = TensorDataset(teacher_cls_full, teacher_label_full)
         
         # =====================================================================
-        # [FIX 2] CORRECT SAMPLER (Fixes Double Sharding)
+        # [FIX 2] CORRECT SAMPLER FOR UNIQUE DATA
         # =====================================================================
-        # Since data is ALREADY unique per core (via training_data_download),
-        # we use RandomSampler to use ALL data loaded on this core.
-        sampler = DistributedSampler(
-            dataset, num_replicas=num_cores, rank=rank, shuffle=True
-        )
+        # Since 'training_data_download' uses core_id=rank, the data is likely
+        # already unique to this core. Using DistributedSampler would split it 
+        # AGAIN by 32, leaving you with 1/32th of the data. 
+        # Use RandomSampler to use all local data.
+        sampler = RandomSampler(dataset)
         
         data_loader = DataLoader(
             dataset, sampler=sampler, batch_size=flags["batch_size"],
@@ -184,13 +198,8 @@ def run_stage(rank, flags, model, optimizer, stage):
         xm.rendezvous(f"data_ready_{stage}_{chunk_idx}")
 
         for epoch in range(flags["epochs"]):
-            # We will track loss locally for logging
-            epoch_loss_accum = 0.0
-            num_batches = 0
-            
             for batch_idx, (teacher_cls, teacher_label) in enumerate(data_loader):
                 global_step += 1
-                num_batches += 1
                 
                 teacher_cls = teacher_cls.to(device)
                 teacher_label = teacher_label.to(device)
@@ -198,14 +207,13 @@ def run_stage(rank, flags, model, optimizer, stage):
                 optimizer.zero_grad()
                 halting_logits, class_logits, _ = model(teacher_cls)
                 
-                # Prepare labels
                 labels = teacher_label.float().unsqueeze(1).expand(-1, L)
+                
                 if class_logits.size(-1) == 2:
                     class_logits_positive = class_logits[:, :, 1]
                 else:
                     class_logits_positive = class_logits.squeeze(-1)
                 
-                # Calculate Loss
                 ce_per_layer = bce_criterion(class_logits_positive, labels)
                 
                 if stage == "train_cls":
@@ -214,9 +222,11 @@ def run_stage(rank, flags, model, optimizer, stage):
                 elif stage == "train_halt":
                     h = torch.sigmoid(halting_logits)
                     q = compute_q_from_h(h)
+                    
+                    # Ensure shapes match for broadcast
                     loss_cls = (q * ce_per_layer).sum(dim=1).mean()
                     
-                    depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
+                    # Use the pre-calculated depths tensor
                     halt_penalty = (depths * (1 - h)).sum(dim=1)
                     
                     progress = float(global_step) / float(total_steps)
@@ -229,26 +239,13 @@ def run_stage(rank, flags, model, optimizer, stage):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 xm.optimizer_step(optimizer)
 
-                # =============================================================
-                # [FIX 3] DEADLOCK PREVENTION
-                # =============================================================
-                # REMOVED: print(loss.item())
-                # Instead, we just let the TPU run. 
-                # If you need to debug, rely on the epoch log below.
-
-            # End of Epoch: Safe to sync and print now
-            # We take the loss from the LAST batch of the epoch as a proxy, 
-            # or you can accumulate properly (but that requires more code).
-            # Here we just sync the loss from the final batch to check health.
+            # Sync loss for logging at end of epoch
             loss_reduced = xm.all_reduce(xm.REDUCE_SUM, loss) / num_cores
-            
-            # This .item() is SAFE because it happens on all cores simultaneously
             loss_val = loss_reduced.item() 
             
             if rank == 0:
-                xm.master_print(f"[{stage}] Chunk {chunk_idx+1} | Epoch {epoch+1} | Loss (Last Batch): {loss_val:.4f}")
+                xm.master_print(f"[{stage}] Chunk {chunk_idx+1} | Epoch {epoch+1} | Loss: {loss_val:.4f}")
 
-        # Ensure all cores finish the chunk before moving to the next
         xm.rendezvous(f"chunk_end_{stage}_{chunk_idx}")
 
 # =========================================================================
