@@ -117,7 +117,7 @@ def run_stage(rank, flags, model, optimizer, stage):
     L = 24
     total_samples = flags["samples_per_shard"]
     
-    # Pre-calculate constant tensors to avoid recreation in loop (Optimization)
+    # Pre-calculate constant tensors
     depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
     
     # Track steps continuously
@@ -133,7 +133,6 @@ def run_stage(rank, flags, model, optimizer, stage):
             xm.master_print(f"\n### STAGE: {stage} | CHUNK {chunk_idx + 1}/29 ###")
 
         # --- Load Data ---
-        # Ensure garbage collection runs to free CPU RAM from previous chunk
         gc.collect() 
         
         data = training_data_download(
@@ -150,62 +149,53 @@ def run_stage(rank, flags, model, optimizer, stage):
         if teacher_cls_full.shape[1] == 25:
             teacher_cls_full = teacher_cls_full[:, 1:25, :]
 
-        # =====================================================================
-        # [FIX 1] STATIC WEIGHT CALCULATION (Prevents OOM)
-        # =====================================================================
-        # Calculate sums on CPU first to avoid unnecessary device transfers
+        # --- Weight Calculation ---
         neg_count_cpu = (teacher_label_full == 0).sum().float()
         pos_count_cpu = (teacher_label_full == 1).sum().float()
         
-        # Move to device for reduction
         neg_count_dev = torch.tensor(neg_count_cpu, device=device)
         pos_count_dev = torch.tensor(pos_count_cpu, device=device)
         
-        # Sync across all cores
         neg_count_global = xm.all_reduce(xm.REDUCE_SUM, neg_count_dev)
         pos_count_global = xm.all_reduce(xm.REDUCE_SUM, pos_count_dev)
         
-        # CRITICAL FIX: Break the graph here.
-        # Use .item() to get a standard Python float. 
-        # This prevents XLA from trying to compile a dynamic tensor into the loss function.
         pos_weight_static = neg_count_global.item() / (pos_count_global.item() + 1e-6)
-        
-        # Create a new constant tensor on device
         pos_weight_tensor = torch.tensor([pos_weight_static], device=device)
-        
-        # Criterion uses the static tensor (treated as constant by compiler)
         bce_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor, reduction='none')
 
         if rank == 0:
             xm.master_print(f"[Chunk {chunk_idx}] Global Pos Weight: {pos_weight_static:.4f}")
 
         dataset = TensorDataset(teacher_cls_full, teacher_label_full)
-        
-        # =====================================================================
-        # [FIX 2] CORRECT SAMPLER FOR UNIQUE DATA
-        # =====================================================================
-        # Since 'training_data_download' uses core_id=rank, the data is likely
-        # already unique to this core. Using DistributedSampler would split it 
-        # AGAIN by 32, leaving you with 1/32th of the data. 
-        # Use RandomSampler to use all local data.
         sampler = RandomSampler(dataset)
         
+        # =====================================================================
+        # FIX: num_workers=0 to prevent deadlock
+        # =====================================================================
         data_loader = DataLoader(
-            dataset, sampler=sampler, batch_size=flags["batch_size"],
-            drop_last=True, num_workers=2
+            dataset, 
+            sampler=sampler, 
+            batch_size=flags["batch_size"],
+            drop_last=True, 
+            num_workers=0  # CRITICAL CHANGE: Must be 0 on this setup
         )
 
         if rank == 0:
-            xm.master_print("data loader finished")
+            xm.master_print("Data Loader initialized. Syncing...")
         
+        # Force a synchronization to ensure memory is clean before loop
+        xm.mark_step()
         xm.rendezvous(f"data_ready_{stage}_{chunk_idx}")
 
         for epoch in range(flags["epochs"]):
             if rank == 0:
-                xm.master_print(f"starting epoch {epoch}")
+                xm.master_print(f"Starting Epoch {epoch}...")
+
             for batch_idx, (teacher_cls, teacher_label) in enumerate(data_loader):
-                if rank == 0:
-                    xm.master_print(f"starting batch {batch_idx}")
+                # DEBUG PRINT: Verify we actually got data
+                if batch_idx == 0 and rank == 0:
+                    xm.master_print("  > First batch retrieved. Beginning forward pass (Compiling)...")
+
                 global_step += 1
                 
                 teacher_cls = teacher_cls.to(device)
@@ -229,11 +219,7 @@ def run_stage(rank, flags, model, optimizer, stage):
                 elif stage == "train_halt":
                     h = torch.sigmoid(halting_logits)
                     q = compute_q_from_h(h)
-                    
-                    # Ensure shapes match for broadcast
                     loss_cls = (q * ce_per_layer).sum(dim=1).mean()
-                    
-                    # Use the pre-calculated depths tensor
                     halt_penalty = (depths * (1 - h)).sum(dim=1)
                     
                     progress = float(global_step) / float(total_steps)
@@ -245,6 +231,10 @@ def run_stage(rank, flags, model, optimizer, stage):
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 xm.optimizer_step(optimizer)
+
+                # DEBUG PRINT: Confirm compilation finished
+                if batch_idx == 0 and rank == 0:
+                     xm.master_print("  > First Step / Compilation Complete. Training running.")
 
             # Sync loss for logging at end of epoch
             loss_reduced = xm.all_reduce(xm.REDUCE_SUM, loss) / num_cores

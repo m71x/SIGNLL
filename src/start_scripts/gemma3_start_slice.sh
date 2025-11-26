@@ -56,6 +56,13 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all \
   --command="cd ~/SIGNLL && git fetch origin && git reset --hard origin/main"
 
+#kill on all workers
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="pkill -f -u mikexi python3"
+  
 #clone xla onto all workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
@@ -90,12 +97,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --project=${PROJECT_ID} \
     --worker=all \
     --command="pip install torch~=2.6.0 torch_xla[tpu]~=2.6.0 torchvision -f https://storage.googleapis.com/libtpu-releases/index.html"
-#kill on all workers
-gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
-  --zone=${ZONE} \
-  --project=${PROJECT_ID} \
-  --worker=all \
-  --command="pkill -f -u mikexi python3"
+
 
   #kill all user run processes: pkill -f -u mikexi python3
 
