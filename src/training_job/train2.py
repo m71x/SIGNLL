@@ -333,7 +333,7 @@ if __name__ == "__main__":
         "d_ctrl": 512,
         "transformer_layers": 4,
         "lr": 1e-4,
-        "batch_size": 16, 
+        "batch_size": 8, 
         
         "lambda_start": 0.0001,
         "lambda_target": 0.005,
