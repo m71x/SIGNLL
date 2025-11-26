@@ -152,12 +152,16 @@ def train_loop(rank, flags):
     # =========================================================================
     print(f"[Core {rank}] Initializing model...")
     L = 24
+    
+    # MODIFIED: Added halting_bias_init=-10.0 to FORCE exploration of deep layers.
+    # This effectively disables halting at the start of training.
     model = Controller(
         L=L,
         d_teacher=1024,
         d_ctrl=flags["d_ctrl"],
         n_layers=flags["transformer_layers"],
-        num_classes=2
+        num_classes=2,
+        halting_bias_init=-10.0 
     ).to(device)
     
     optimizer = optim.AdamW(model.parameters(), lr=flags["lr"], weight_decay=1e-2)
@@ -196,7 +200,7 @@ def train_loop(rank, flags):
     # =========================================================================
     # 2. OUTER LOOP: ITERATE OVER DATA CHUNKS (0 to 28)
     # =========================================================================
-    for chunk_idx in range(28): 
+    for chunk_idx in range(29): 
         current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
         
         if rank == 0:
@@ -444,7 +448,7 @@ def train_loop(rank, flags):
     # =========================================================================
     # Run evaluation on the requested chunk with the requested threshold
     # Using chunk 28 (the final one) as default validation or one specified in flags
-    test_chunk = flags.get("test_chunk", 29) 
+    test_chunk = flags.get("test_chunk", 28) 
     test_thresh = flags.get("test_threshold", 0.9)
     
     evaluate_model(
@@ -494,7 +498,8 @@ if __name__ == "__main__":
         "batch_size": 32, # Smaller batch size for 19500 samples
         
         # Halting loss schedule. Reduced lambda_target to prioritize CLS loss more.
-        "lambda_start": 0.0001,
+        # CHANGED: lambda_start = 0.0 to prevent immediate collapse
+        "lambda_start": 0.0,
         "lambda_target": 0.001, # Was 0.025
         
         # Training, 10 epochs per chunk
