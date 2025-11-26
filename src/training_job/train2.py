@@ -1,23 +1,19 @@
 import os, time
 import torch
 import torch.nn as nn
-import torch.nn.functional as F # ADDED: Required for functional loss
+import torch.nn.functional as F
 import torch.optim as optim
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 
-# (1) Import new classes
 from torch.utils.data import TensorDataset, DataLoader, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
-# NOTE: Assuming these imports resolve correctly in the environment
 from controller_model import Controller, compute_q_from_h
 from training_data_download import training_data_download
 
-# DO NOT USE .item(), IT WILL FORCE XLA TO RECOMPILE AT EVERY BATCH ITERATION
-
 # =========================================================================
-# EVALUATION FUNCTION (LEFT UNTOUCHED AS REQUESTED)
+# EVALUATION FUNCTION
 # =========================================================================
 def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_shard):
     """
@@ -37,7 +33,6 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
     
     current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
     
-    # Force loading for core 0
     data = training_data_download(
         core_id=0, 
         filename=current_chunk_filename,
@@ -51,7 +46,6 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
     teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
     teacher_label_full = torch.from_numpy(data['classifications']).long()
     
-    # Handle layer slicing
     if teacher_cls_full.shape[1] == 25:
         teacher_cls_full = teacher_cls_full[:, 1:25, :]
     
@@ -77,7 +71,6 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
             
             halting_logits, class_logits, _ = model(teacher_cls)
             
-            # --- Early Exit Logic ---
             h_probs = torch.sigmoid(halting_logits)
             threshold_mask = (h_probs > threshold)
             
@@ -85,12 +78,10 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
             row_has_exit = threshold_mask.any(dim=1)
             exit_indices[~row_has_exit] = 23
             
-            # --- Classification ---
             batch_indices = torch.arange(class_logits.size(0), device=device)
             selected_logits = class_logits[batch_indices, exit_indices]
             predictions = torch.argmax(selected_logits, dim=-1)
             
-            # --- Metrics ---
             correct_tensor = (predictions == teacher_label).sum()
             total_correct += correct_tensor.item() 
             total_samples += teacher_label.size(0)
@@ -119,7 +110,7 @@ def run_stage(rank, flags, model, optimizer, stage):
     """
     Executes a full pass over all 29 chunks for a specific stage (CLS or HALT).
     """
-    device = xm.xla_device() # Fixed: Use standard xm accessor
+    device = xm.xla_device()
     num_cores = xm.xrt_world_size()
     
     L = 24
@@ -158,17 +149,6 @@ def run_stage(rank, flags, model, optimizer, stage):
         if teacher_cls_full.shape[1] == 25:
             teacher_cls_full = teacher_cls_full[:, 1:25, :]
 
-        # --- Class Weighting (FIXED) ---
-        neg_samples_count = (teacher_label_full == 0).sum().item()
-        pos_samples_count = (teacher_label_full == 1).sum().item()
-        
-        # Calculate weight value
-        pos_weight_value = neg_samples_count / (pos_samples_count + 1e-6) # Added epsilon safety
-        
-        # FIXED: Create tensor directly on device. 
-        # We DO NOT create a new nn.BCEWithLogitsLoss() object here, as that triggers recompilation.
-        pos_weight_tensor = torch.tensor([pos_weight_value], device=device, dtype=torch.float32)
-
         # --- DataLoader ---
         dataset = TensorDataset(teacher_cls_full, teacher_label_full)
         sampler = DistributedSampler(
@@ -177,7 +157,6 @@ def run_stage(rank, flags, model, optimizer, stage):
             rank=rank,
             shuffle=True
         )
-        # ensure drop_last=True to avoid recompiling for small last batches
         data_loader = DataLoader(
             dataset,
             sampler=sampler,
@@ -192,7 +171,8 @@ def run_stage(rank, flags, model, optimizer, stage):
         for epoch in range(flags["epochs"]):
             
             for batch_idx, (teacher_cls, teacher_label) in enumerate(data_loader):
-                global_step += num_cores # Fixed step increment logic
+                # FIXED: Increment global_step by 1 per batch (not by num_cores)
+                global_step += 1
                 
                 teacher_cls = teacher_cls.to(device)
                 teacher_label = teacher_label.to(device)
@@ -210,13 +190,16 @@ def run_stage(rank, flags, model, optimizer, stage):
                 else:
                     class_logits_positive = class_logits.squeeze(-1)
                 
-                # FIXED: Use Functional API with dynamic weight tensor
-                # This prevents graph recompilation because the graph topology (F.binary_cross_entropy) 
-                # stays the same, only the input tensor (pos_weight_tensor) changes values.
+                # FIXED: Calculate pos_weight per batch to avoid graph recompilation
+                neg_count = (teacher_label == 0).sum().float()
+                pos_count = (teacher_label == 1).sum().float()
+                batch_pos_weight = (neg_count / (pos_count + 1e-6)).detach()
+                
+                # Reshape pos_weight for broadcasting: [1, 1] to broadcast across [batch, layers]
                 ce_per_layer = F.binary_cross_entropy_with_logits(
                     class_logits_positive, 
                     labels, 
-                    pos_weight=pos_weight_tensor,
+                    pos_weight=batch_pos_weight.view(1, 1),
                     reduction='none'
                 )
                 
@@ -234,12 +217,11 @@ def run_stage(rank, flags, model, optimizer, stage):
                     loss_cls = (q * ce_per_layer).sum(dim=1).mean()
                     
                     # Depth Penalty
-                    # Create depths tensor only once per batch logic (or reuse global if static)
                     depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
                     halt_penalty = (depths * (1 - h)).sum(dim=1)
                     
-                    # Calculate Lambda without item() or CPU syncs
-                    progress = float(global_step) / float(total_steps) # Python float math is fine here
+                    # FIXED: Calculate lambda without using .item()
+                    progress = float(global_step) / float(total_steps)
                     lambda_start, lambda_target = flags["lambda_start"], flags["lambda_target"]
                     lambda_now = lambda_start + (lambda_target - lambda_start) * progress
                     
@@ -249,19 +231,20 @@ def run_stage(rank, flags, model, optimizer, stage):
                 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                xm.optimizer_step(optimizer) # Includes mark_step barrier
+                xm.optimizer_step(optimizer)
             
-            # --- Logging ---
-            # Only log at the end of epoch to reduce print/sync frequency
+            # --- Logging (FIXED: Only at epoch end, reduce sync frequency) ---
             if rank == 0:
                 elapsed = time.time() - start_time
-                # Reduce loss for printing (this causes a barrier sync)
-                loss_val = xm.mesh_reduce('loss_reduce', loss.item(), lambda x: sum(x) / len(x)) 
+                # Only sync losses at epoch boundaries
+                xm.mark_step()  # Ensure computation is done
+                loss_val = loss.item()  # Safe to call now since mark_step was called
                 xm.master_print(f"[{stage.upper()}] CHUNK {chunk_idx+1} | EPOCH {epoch+1} | Loss: {loss_val:.4f} | Time: {elapsed:.0f}s")
 
         # --- Checkpoint per chunk ---
         if (chunk_idx + 1) % 5 == 0 and rank == 0:
             checkpoint_path = f"/tmp/controller_{stage}_chunk_{chunk_idx+1}.pt"
+            xm.mark_step()  # Ensure all operations complete before saving
             torch.save({
                 'chunk': chunk_idx + 1,
                 'model_state_dict': model.state_dict(),
@@ -283,8 +266,9 @@ def _mp_fn(rank, flags):
     num_cores = xm.xrt_world_size()
     
     # 1. Initialize Model ONCE
-    if rank == 0: print("Initializing Controller Model...")
-    # NOTE: bias initialized to -2.5 (standard) because we rely on Stage 1 training, not forced bias
+    if rank == 0: 
+        xm.master_print("Initializing Controller Model...")
+    
     model = Controller(
         L=24,
         d_teacher=1024,
@@ -294,24 +278,25 @@ def _mp_fn(rank, flags):
         halting_bias_init=-2.5 
     ).to(device)
 
-    # Sync initial weights
-    # xm.broadcast_master_param(model) is often cleaner, but manual reduce works too
+    # FIXED: Proper weight synchronization
     for param in model.parameters():
         param.data = xm.all_reduce(xm.REDUCE_SUM, param.data) / num_cores
+    xm.mark_step()
     xm.rendezvous("init_sync")
 
     # =========================================================================
     # STAGE 1: TRAIN TRANSFORMER + CLASSIFIERS (IGNORE HALTING)
     # =========================================================================
-    if rank == 0: xm.master_print("\n>>> ENTERING STAGE 1: TRAIN CLASSIFIERS <<<")
+    if rank == 0: 
+        xm.master_print("\n>>> ENTERING STAGE 1: TRAIN CLASSIFIERS <<<")
     
-    # Optimizer for Stage 1: All parameters
     optimizer_cls = optim.AdamW(model.parameters(), lr=flags["lr"], weight_decay=1e-2)
     
     run_stage(rank, flags, model, optimizer_cls, stage="train_cls")
     
     # Save Stage 1 result
     if rank == 0:
+        xm.mark_step()
         torch.save(model.state_dict(), "/tmp/model_stage1_finished.pt")
         xm.master_print("✅ Stage 1 Complete. Model saved.")
     xm.rendezvous("stage1_done")
@@ -319,20 +304,21 @@ def _mp_fn(rank, flags):
     # =========================================================================
     # STAGE 2: TRAIN HALTING HEADS (FREEZE TRANSFORMER/CLS)
     # =========================================================================
-    if rank == 0: xm.master_print("\n>>> ENTERING STAGE 2: TRAIN HALTING HEADS <<<")
+    if rank == 0: 
+        xm.master_print("\n>>> ENTERING STAGE 2: TRAIN HALTING HEADS <<<")
 
-    # 1. Freeze EVERYTHING
+    # FIXED: Proper freezing with synchronization
     for param in model.parameters():
         param.requires_grad = False
         
-    # 2. Unfreeze HALTING HEADS
     for param in model.halting_heads.parameters():
         param.requires_grad = True
-        
-    # Mark step to ensure freeze status propagates
+    
+    # CRITICAL: Ensure freeze state propagates before creating optimizer
     xm.mark_step()
+    xm.rendezvous("freeze_sync")
 
-    # 3. Create NEW Optimizer (Only for halting heads)
+    # Create NEW Optimizer (Only for halting heads)
     optimizer_halt = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()), 
         lr=flags["lr"], 
@@ -342,6 +328,7 @@ def _mp_fn(rank, flags):
     run_stage(rank, flags, model, optimizer_halt, stage="train_halt")
     
     if rank == 0:
+        xm.mark_step()
         torch.save(model.state_dict(), "/tmp/model_stage2_final.pt")
         xm.master_print("✅ ALL STAGES COMPLETE. Final model saved.")
     xm.rendezvous("job_done")
@@ -360,8 +347,9 @@ if __name__ == "__main__":
         "epochs": 4,
         "samples_per_shard": 19500, 
         
-        "test_chunk": 29
+        "test_chunk": 28
     }
     
     print("Starting XLA Two-Stage Training Job...")
     xmp.spawn(_mp_fn, args=(BASE_FLAGS,), start_method='fork')
+    print("Training complete!")
