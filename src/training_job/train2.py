@@ -194,11 +194,18 @@ def run_stage(rank, flags, model, optimizer, stage):
             dataset, sampler=sampler, batch_size=flags["batch_size"],
             drop_last=True, num_workers=2
         )
+
+        if rank == 0:
+            xm.master_print("data loader finished")
         
         xm.rendezvous(f"data_ready_{stage}_{chunk_idx}")
 
         for epoch in range(flags["epochs"]):
+            if rank == 0:
+                xm.master_print(f"starting epoch {epoch}")
             for batch_idx, (teacher_cls, teacher_label) in enumerate(data_loader):
+                if rank == 0:
+                    xm.master_print(f"starting batch {batch_idx}")
                 global_step += 1
                 
                 teacher_cls = teacher_cls.to(device)
