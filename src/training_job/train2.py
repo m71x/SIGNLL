@@ -145,17 +145,22 @@ def run_stage(rank, flags, model, optimizer, stage):
 
         # [FIX 2] Calculate Pos_Weight ONCE per chunk on CPU
         # This prevents XLA recompilation loop
+        if rank == 0:
+            xm.master_print("reached before class weighting")
         neg_count = (teacher_label_full == 0).sum().item()
         pos_count = (teacher_label_full == 1).sum().item()
         pos_weight_val = neg_count / (pos_count + 1e-6)
         
         # Create a static tensor on device
         pos_weight_tensor = torch.tensor([pos_weight_val], device=device)
-        
+        if rank == 0:
+            xm.master_print("finished creating tensor")
         # Define Loss Function with static weight
         # Using reduction='none' to keep your specific logic later
         bce_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor, reduction='none')
-
+        if rank == 0:
+            xm.master_print("created bce loss object")
+        
         dataset = TensorDataset(teacher_cls_full, teacher_label_full)
         
         # [NOTE] DistributedSampler here splits your 19500 samples by 4 again.
