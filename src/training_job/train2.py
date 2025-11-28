@@ -321,6 +321,8 @@ def train_loop(rank, flags):
         xm.master_print("✅ Training Complete.")
 
     test_chunk = flags.get("test_chunk", 29) 
+    evaluate_model(rank, model, test_chunk, 0.5, flags["batch_size"], flags["samples_per_shard"])
+    evaluate_model(rank, model, test_chunk, 0.6, flags["batch_size"], flags["samples_per_shard"])
     evaluate_model(rank, model, test_chunk, 0.7, flags["batch_size"], flags["samples_per_shard"])
     evaluate_model(rank, model, test_chunk, 0.95, flags["batch_size"], flags["samples_per_shard"])
     
@@ -343,7 +345,7 @@ if __name__ == "__main__":
         "lr": 1e-4,
         "batch_size": 32, 
         "lambda_start": 0.0001,
-        "lambda_target": 0.001,
+        "lambda_target": 0.005,
         "epochs": 4,
         "samples_per_shard": 19500,
         "test_chunk": 29, 
