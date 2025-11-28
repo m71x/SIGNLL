@@ -12,14 +12,13 @@ from controller_model import Controller, compute_q_from_h
 from training_data_download import training_data_download
 
 # =========================================================================
-# EVALUATION FUNCTION (Unchanged)
+# EVALUATION FUNCTION
 # =========================================================================
 def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_shard):
     """
     Tests the model on a specific chunk using an early-exit strategy.
     Runs ONLY on Device 0.
     """
-    # NOTE: Evaluation logic is left unchanged as it's not the hanging point.
     if rank != 0:
         return
 
@@ -28,9 +27,9 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
     xm.master_print(f"\n{'*'*80}")
     xm.master_print(f"*** STARTING EVALUATION ON CHUNK {chunk_idx} (Device 0 Only) ***")
     xm.master_print(f"{'*'*80}")
-    
-    # ... (Evaluation body remains the same)
+
     model.eval()
+    
     current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
     data = training_data_download(
         core_id=0, 
@@ -106,7 +105,7 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
     model.train() 
 
 # =========================================================================
-# TRAINING LOOP (Modified for Two-Stage Training and Debugging)
+# TRAINING LOOP
 # =========================================================================
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
@@ -123,30 +122,31 @@ def train_loop(rank, flags):
     ).to(device)
     
     # Sync initial weights
-    print(f"[Core {rank}] DEBUG: Starting initial weight sync.")
     if rank == 0: xm.master_print("Synchronizing initial weights...")
     for param in model.parameters():
         param.data = xm.all_reduce(xm.REDUCE_SUM, param.data) / num_cores
     xm.mark_step()
-    print(f"[Core {rank}] DEBUG: Finished initial weight sync. Waiting for rendezvous.")
     
-    # Initial Rendezvous to ensure all cores start the training together
+    # Initial Rendezvous
     xm.rendezvous("weights_synced") 
-    print(f"[Core {rank}] DEBUG: Initial rendezvous ('weights_synced') complete. Starting stage loop.")
 
-    # Calculate step counts for lambda schedule (used in Stage 2)
+    # Calculate step counts
     total_samples = flags["samples_per_shard"]
     num_batches_per_chunk = total_samples // flags["batch_size"]
     total_steps_stage_2 = flags["epochs"] * 29 * num_batches_per_chunk
     global_step = 0
     start_time = time.time()
 
+    # Placeholders for sample diagnostics (Rank 0 only)
+    diag_sample_pos = None
+    diag_sample_neg = None
+
     # =========================================================================
     # STAGE LOOP: 1 -> Backbone/Classifiers, 2 -> Halting Heads
     # =========================================================================
     for stage in [1, 2]:
         
-        # --- PHASE SETUP: FREEZING AND OPTIMIZER ---
+        # --- PHASE SETUP ---
         if stage == 1:
             stage_name = "STAGE 1: Backbone & Classifiers (Halting IGNORED)"
             for param in model.parameters(): param.requires_grad = True
@@ -165,7 +165,6 @@ def train_loop(rank, flags):
         params_to_optimize = [p for p in model.parameters() if p.requires_grad]
         optimizer = optim.AdamW(params_to_optimize, lr=flags["lr"], weight_decay=1e-2)
 
-        # Iterate over all chunks for this stage
         for chunk_idx in range(28): 
             current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
             
@@ -199,13 +198,14 @@ def train_loop(rank, flags):
             sampler = DistributedSampler(dataset, num_replicas=num_cores, rank=rank, shuffle=True)
             data_loader = DataLoader(dataset, sampler=sampler, batch_size=flags["batch_size"], drop_last=True, num_workers=2)
             
-            # NOTE: Removed the extra xm.rendezvous here that was causing the hang.
-            
+            # --- Epoch Loop ---
             for epoch in range(flags["epochs"]):
                 model.train()
                 
-                print(f"[Core {rank}] DEBUG: St{stage} Ch{chunk_idx} Ep{epoch}. Starting batch loop.")
-                
+                # Reset diagnostic holders for this epoch
+                diag_sample_pos = None
+                diag_sample_neg = None
+
                 for batch_idx, (teacher_cls, teacher_label) in enumerate(data_loader):
                     if stage == 2: global_step += 29 
                     
@@ -215,7 +215,24 @@ def train_loop(rank, flags):
                     # Forward Pass
                     halting_logits, class_logits, _ = model(teacher_cls)
                     
-                    # --- LOSS CALCULATION VARIES BY STAGE ---
+                    # --- Capture Diagnostics (Rank 0, First Batch Only) ---
+                    if rank == 0 and batch_idx == 0:
+                        # Helper to extract one sample data
+                        def extract_sample(label_val):
+                            indices = (teacher_label == label_val).nonzero(as_tuple=True)[0]
+                            if indices.numel() > 0:
+                                idx = indices[0]
+                                return {
+                                    'cls': class_logits[idx].detach().cpu(),
+                                    'halt': halting_logits[idx].detach().cpu(),
+                                    'lbl': teacher_label[idx].detach().cpu()
+                                }
+                            return None
+                        
+                        diag_sample_pos = extract_sample(1)
+                        diag_sample_neg = extract_sample(0)
+
+                    # --- LOSS CALCULATION ---
                     labels = teacher_label.float().unsqueeze(1).expand(-1, L)
                     if class_logits.size(-1) == 2:
                         class_logits_positive = class_logits[:, :, 1]
@@ -228,7 +245,7 @@ def train_loop(rank, flags):
                         loss_cls = ce_per_layer.mean()
                         loss_halt = torch.tensor(0.0, device=device)
                         loss = loss_cls
-                        h = torch.zeros_like(halting_logits) 
+                        h = torch.zeros_like(halting_logits) # Dummy for all_reduce
 
                     elif stage == 2:
                         h = torch.sigmoid(halting_logits)
@@ -247,53 +264,55 @@ def train_loop(rank, flags):
                     # Optimization
                     optimizer.zero_grad()
                     loss.backward()
-                    
-                    print(f"[Core {rank}] DEBUG: St{stage} Ch{chunk_idx} Ep{epoch} Batch{batch_idx}. Before clip_grad_norm.")
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    
-                    print(f"[Core {rank}] DEBUG: St{stage} Ch{chunk_idx} Ep{epoch} Batch{batch_idx}. Before xm.optimizer_step.")
                     xm.optimizer_step(optimizer)
-                    
-                    print(f"[Core {rank}] DEBUG: St{stage} Ch{chunk_idx} Ep{epoch} Batch{batch_idx}. Before xm.mark_step (end of batch).")
                     xm.mark_step()
-                    
-                    if batch_idx % 100 == 0:
-                         print(f"[Core {rank}] DEBUG: St{stage} Ch{chunk_idx} Ep{epoch} Batch{batch_idx}. Checkpoint print.")
 
-
-                # --- End of Epoch Diagnostics ---
-                print(f"[Core {rank}] DEBUG: St{stage} Ch{chunk_idx} Ep{epoch}. Starting All-Reduce for losses.")
+                # --- End of Epoch Aggregation ---
                 loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
                 loss_cls_sum = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
+                loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
                 
-                if stage == 2:
-                    loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
-                    h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
-                
-                print(f"[Core {rank}] DEBUG: St{stage} Ch{chunk_idx} Ep{epoch}. Finished All-Reduce for losses. Waiting for epoch end rendezvous.")
-                
-                # Rendezvous at the end of the epoch
+                # Sync before printing
                 xm.rendezvous(f"ep_end_st{stage}_ch{chunk_idx}_ep{epoch}")
-                print(f"[Core {rank}] DEBUG: St{stage} Ch{chunk_idx} Ep{epoch}. Epoch end rendezvous complete.")
                 
+                # --- Rank 0 Logging ---
                 if rank == 0:
-                    # Logging details (using loss sums from all_reduce)
                     elapsed = time.time() - start_time
-                    xm.master_print("-" * 40)
+                    xm.master_print("-" * 60)
                     xm.master_print(f"STAGE {stage} | CHUNK {chunk_idx+1} | EPOCH {epoch+1}")
                     xm.master_print(f"  Total Loss: {loss_sum / num_cores:.4f}")
                     xm.master_print(f"  Cls Loss:   {loss_cls_sum / num_cores:.4f}")
-                    if stage == 2:
-                        xm.master_print(f"  Halt Loss:  {loss_halt_sum/num_cores:.4f}")
+                    xm.master_print(f"  Halt Loss:  {loss_halt_sum / num_cores:.4f}")
+                    
+                    # Helper function to format diagnostic string
+                    def format_sample(data, name):
+                        if data is None: return f"  {name}: No sample found in first batch."
+                        
+                        out = [f"  > {name} (Label {data['lbl'].item()}):"]
+                        
+                        if stage == 1:
+                            # Show Classification Confidence
+                            probs = torch.softmax(data['cls'], dim=-1) # [L, 2]
+                            # Assuming binary classification, get prob of class 1
+                            cls1_probs = probs[:, 1]
+                            out.append(f"    CLS Probs (Class 1): {[f'{p:.2f}' for p in cls1_probs.tolist()]}")
+                        else:
+                            # Show Halting Probability
+                            h_probs = torch.sigmoid(data['halt'])
+                            out.append(f"    HALT Probs: {[f'{p:.2f}' for p in h_probs.tolist()]}")
+                        return "\n".join(out)
+
+                    xm.master_print("  DIAGNOSTICS (Layer 0->23):")
+                    xm.master_print(format_sample(diag_sample_pos, "Sample POS"))
+                    xm.master_print(format_sample(diag_sample_neg, "Sample NEG"))
 
             # Checkpoint at end of chunk
             if (chunk_idx + 1) % 5 == 0 and rank == 0:
                 torch.save(model.state_dict(), f"/tmp/controller_stage{stage}_chunk{chunk_idx+1}.pt")
                 xm.master_print("Saved Checkpoint.")
 
-            print(f"[Core {rank}] DEBUG: St{stage} Ch{chunk_idx}. Waiting for chunk end rendezvous.")
             xm.rendezvous(f"chunk_end_st{stage}_ch{chunk_idx}")
-            print(f"[Core {rank}] DEBUG: St{stage} Ch{chunk_idx}. Chunk end rendezvous complete. Moving to next chunk.")
 
 
     # Final Save and Evaluation...
@@ -301,14 +320,11 @@ def train_loop(rank, flags):
         torch.save(model.state_dict(), "/tmp/controller_final_stage2.pt")
         xm.master_print("✅ Training Complete.")
 
-    print(f"[Core {rank}] DEBUG: Starting final evaluation.")
     test_chunk = flags.get("test_chunk", 29) 
     evaluate_model(rank, model, test_chunk, 0.7, flags["batch_size"], flags["samples_per_shard"])
     evaluate_model(rank, model, test_chunk, 0.95, flags["batch_size"], flags["samples_per_shard"])
     
     xm.rendezvous("final_check")
-
-# ... (Rest of your _mp_fn and __main__ block remains the same) ...
 
 def _mp_fn(rank, flags):
     try:
