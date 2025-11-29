@@ -10,14 +10,9 @@ from torch.utils.data.distributed import DistributedSampler
 
 from controller_model import Controller, compute_q_from_h
 from training_data_download import training_data_download
-#NOTES
-#CLS loss seems to be plateauing at around 0.16 in chunks 13-19, and plateaus to around 0.14 in chunks 20>. 
-#however, this is expected because at some layers it is impossible to tell the correct CLS because the context is simply not enough-shouldn't be an issue
-#CLS seems to be very well classifying positive samples with confidence >0.5 at almost every layer and negative samples with confidence < 0.5 at almost every layer
-#the goal right now is to improve halting probabilities to be earlier and be more adaptive
 
 # =========================================================================
-# EVALUATION FUNCTION
+# EVALUATION FUNCTION (Modified)
 # =========================================================================
 def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_shard):
     """
@@ -99,12 +94,22 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
                 print(f"[Eval] Processed batch {i}...")
             
     accuracy = (total_correct / total_samples) * 100.0
+    
+    # --- Statistics Calculation ---
     layers = torch.arange(24, dtype=torch.float32)
+    
+    # 1. Mean
     avg_exit_layer = (layer_exit_counts_cpu * layers).sum() / total_samples
+    
+    # 2. Standard Deviation
+    # Variance = mean(x^2) - mean(x)^2 OR sum(count * (x - mean)^2) / N
+    variance = (layer_exit_counts_cpu * (layers - avg_exit_layer).pow(2)).sum() / total_samples
+    std_exit_layer = torch.sqrt(variance)
     
     xm.master_print(f"RESULTS FOR CHUNK {chunk_idx} (Threshold: {threshold}):")
     xm.master_print(f"  Accuracy: {accuracy:.2f}% ({total_correct}/{total_samples})")
-    xm.master_print(f"  Average Exit Layer: {avg_exit_layer:.2f} (0-23)")
+    # MODIFIED PRINT STATEMENT
+    xm.master_print(f"  Average Exit Layer: {avg_exit_layer:.2f} +/- {std_exit_layer:.2f} (0-23)")
     xm.master_print(f"{'*'*80}\n")
 
     model.train() 
@@ -257,7 +262,9 @@ def train_loop(rank, flags):
                         q = compute_q_from_h(h)
                         loss_cls = (q * ce_per_layer).sum(dim=1).mean()
                         
-                        depths = (torch.arange(1, L + 1, device=device).float()).unsqueeze(0)
+                        # MODIFIED: Aggressive Squared Depth Penalty
+                        # Using .pow(2) forces the model to treat deeper layers as significantly more expensive
+                        depths = (torch.arange(1, L + 1, device=device).float().pow(2)).unsqueeze(0)
                         halt_penalty = (depths * (1 - h)).sum(dim=1)
                         
                         progress = global_step / total_steps_stage_2
