@@ -357,7 +357,7 @@ if __name__ == "__main__":
         "lr": 1e-4,
         "batch_size": 32, 
         "lambda_start": 0.0001,
-        "lambda_target": 0.006,
+        "lambda_target": 0.005,
         "epochs": 4,
         "samples_per_shard": 19500,
         "test_chunk": 29, 
