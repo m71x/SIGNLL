@@ -10,6 +10,11 @@ from torch.utils.data.distributed import DistributedSampler
 
 from controller_model import Controller, compute_q_from_h
 from training_data_download import training_data_download
+#NOTES
+#CLS loss seems to be plateauing at around 0.16 in chunks 13-19, and plateaus to around 0.14 in chunks 20>. 
+#however, this is expected because at some layers it is impossible to tell the correct CLS because the context is simply not enough-shouldn't be an issue
+#CLS seems to be very well classifying positive samples with confidence >0.5 at almost every layer and negative samples with confidence < 0.5 at almost every layer
+#the goal right now is to improve halting probabilities to be earlier and be more adaptive
 
 # =========================================================================
 # EVALUATION FUNCTION
@@ -345,7 +350,7 @@ if __name__ == "__main__":
         "lr": 1e-4,
         "batch_size": 32, 
         "lambda_start": 0.0001,
-        "lambda_target": 0.005,
+        "lambda_target": 0.008,
         "epochs": 4,
         "samples_per_shard": 19500,
         "test_chunk": 29, 
