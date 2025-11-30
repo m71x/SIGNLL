@@ -262,9 +262,8 @@ def train_loop(rank, flags):
                         q = compute_q_from_h(h)
                         loss_cls = (q * ce_per_layer).sum(dim=1).mean()
                         
-                        # MODIFIED: Aggressive Squared Depth Penalty
-                        # Using .pow(2) forces the model to treat deeper layers as significantly more expensive
-                        depths = (torch.arange(1, L + 1, device=device).float().pow(2)).unsqueeze(0)
+                        # Linear Depth Penalty (Reverted from Squared)
+                        depths = (torch.arange(1, L + 1, device=device).float()).unsqueeze(0)
                         halt_penalty = (depths * (1 - h)).sum(dim=1)
                         
                         progress = global_step / total_steps_stage_2
