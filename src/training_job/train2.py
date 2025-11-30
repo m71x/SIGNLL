@@ -5,14 +5,14 @@ import torch.optim as optim
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 
-from torch.utils.data import TensorDataset, DataLoader, SequentialSampler
+from torch.utils.data import TensorDataset, DataLoader, SequentialSampler, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
 
 from controller_model import Controller, compute_q_from_h
 from training_data_download import training_data_download
 
 # =========================================================================
-# EVALUATION FUNCTION (Modified)
+# EVALUATION FUNCTION (Unchanged)
 # =========================================================================
 def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_shard):
     """
@@ -97,25 +97,19 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
     
     # --- Statistics Calculation ---
     layers = torch.arange(24, dtype=torch.float32)
-    
-    # 1. Mean
     avg_exit_layer = (layer_exit_counts_cpu * layers).sum() / total_samples
-    
-    # 2. Standard Deviation
-    # Variance = mean(x^2) - mean(x)^2 OR sum(count * (x - mean)^2) / N
     variance = (layer_exit_counts_cpu * (layers - avg_exit_layer).pow(2)).sum() / total_samples
     std_exit_layer = torch.sqrt(variance)
     
     xm.master_print(f"RESULTS FOR CHUNK {chunk_idx} (Threshold: {threshold}):")
     xm.master_print(f"  Accuracy: {accuracy:.2f}% ({total_correct}/{total_samples})")
-    # MODIFIED PRINT STATEMENT
     xm.master_print(f"  Average Exit Layer: {avg_exit_layer:.2f} +/- {std_exit_layer:.2f} (0-23)")
     xm.master_print(f"{'*'*80}\n")
 
     model.train() 
 
 # =========================================================================
-# TRAINING LOOP
+# TRAINING LOOP (Modified for Data Slicing)
 # =========================================================================
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
@@ -195,6 +189,19 @@ def train_loop(rank, flags):
             
             if teacher_cls_full.shape[1] == 25:
                 teacher_cls_full = teacher_cls_full[:, 1:25, :]
+            
+            # --- START MODIFICATION: Data Slicing to 6.25% ---
+            N_total_local = teacher_cls_full.shape[0]
+            # 1/16 of the data = 6.25% (twice the old 3.125%)
+            N_target = N_total_local // 16 
+
+            # Apply the slice
+            teacher_cls_full = teacher_cls_full[:N_target]
+            teacher_label_full = teacher_label_full[:N_target]
+
+            if rank == 0:
+                xm.master_print(f"Data Sliced: Using {N_target}/{N_total_local} samples ({N_target/N_total_local:.2%}) for 6.25% utilization.")
+            # --- END MODIFICATION ---
 
             # Class Weighting
             neg_samples = (teacher_label_full == 0).sum().item()
@@ -205,7 +212,10 @@ def train_loop(rank, flags):
             bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight_tensor).to(device)
 
             dataset = TensorDataset(teacher_cls_full, teacher_label_full)
-            sampler = DistributedSampler(dataset, num_replicas=num_cores, rank=rank, shuffle=True)
+            
+            # Use RandomSampler to shuffle the reduced dataset (essential fix)
+            sampler = RandomSampler(dataset)
+            
             data_loader = DataLoader(dataset, sampler=sampler, batch_size=flags["batch_size"], drop_last=True, num_workers=2)
             
             # --- Epoch Loop ---
@@ -227,7 +237,6 @@ def train_loop(rank, flags):
                     
                     # --- Capture Diagnostics (Rank 0, First Batch Only) ---
                     if rank == 0 and batch_idx == 0:
-                        # Helper to extract one sample data
                         def extract_sample(label_val):
                             indices = (teacher_label == label_val).nonzero(as_tuple=True)[0]
                             if indices.numel() > 0:
@@ -255,15 +264,15 @@ def train_loop(rank, flags):
                         loss_cls = ce_per_layer.mean()
                         loss_halt = torch.tensor(0.0, device=device)
                         loss = loss_cls
-                        h = torch.zeros_like(halting_logits) # Dummy for all_reduce
+                        h = torch.zeros_like(halting_logits) 
 
                     elif stage == 2:
                         h = torch.sigmoid(halting_logits)
                         q = compute_q_from_h(h)
                         loss_cls = (q * ce_per_layer).sum(dim=1).mean()
                         
-                        # Linear Depth Penalty (Reverted from Squared)
-                        depths = (torch.arange(1, L + 1, device=device).float()).unsqueeze(0)
+                        # Aggressive Squared Depth Penalty (Retained)
+                        depths = (torch.arange(1, L + 1, device=device).float().pow(2)).unsqueeze(0)
                         halt_penalty = (depths * (1 - h)).sum(dim=1)
                         
                         progress = global_step / total_steps_stage_2
@@ -284,7 +293,6 @@ def train_loop(rank, flags):
                 loss_cls_sum = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
                 loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
                 
-                # Sync before printing
                 xm.rendezvous(f"ep_end_st{stage}_ch{chunk_idx}_ep{epoch}")
                 
                 # --- Rank 0 Logging ---
@@ -296,20 +304,14 @@ def train_loop(rank, flags):
                     xm.master_print(f"  Cls Loss:   {loss_cls_sum / num_cores:.4f}")
                     xm.master_print(f"  Halt Loss:  {loss_halt_sum / num_cores:.4f}")
                     
-                    # Helper function to format diagnostic string
                     def format_sample(data, name):
                         if data is None: return f"  {name}: No sample found in first batch."
-                        
                         out = [f"  > {name} (Label {data['lbl'].item()}):"]
-                        
                         if stage == 1:
-                            # Show Classification Confidence
-                            probs = torch.softmax(data['cls'], dim=-1) # [L, 2]
-                            # Assuming binary classification, get prob of class 1
+                            probs = torch.softmax(data['cls'], dim=-1) 
                             cls1_probs = probs[:, 1]
                             out.append(f"    CLS Probs (Class 1): {[f'{p:.2f}' for p in cls1_probs.tolist()]}")
                         else:
-                            # Show Halting Probability
                             h_probs = torch.sigmoid(data['halt'])
                             out.append(f"    HALT Probs: {[f'{p:.2f}' for p in h_probs.tolist()]}")
                         return "\n".join(out)
@@ -318,7 +320,7 @@ def train_loop(rank, flags):
                     xm.master_print(format_sample(diag_sample_pos, "Sample POS"))
                     xm.master_print(format_sample(diag_sample_neg, "Sample NEG"))
 
-            # Checkpoint at end of chunk
+            # Checkpoint
             if (chunk_idx + 1) % 5 == 0 and rank == 0:
                 torch.save(model.state_dict(), f"/tmp/controller_stage{stage}_chunk{chunk_idx+1}.pt")
                 xm.master_print("Saved Checkpoint.")
@@ -326,7 +328,7 @@ def train_loop(rank, flags):
             xm.rendezvous(f"chunk_end_st{stage}_ch{chunk_idx}")
 
 
-    # Final Save and Evaluation...
+    # Final Save and Evaluation
     if rank == 0:
         torch.save(model.state_dict(), "/tmp/controller_final_stage2.pt")
         xm.master_print("✅ Training Complete.")
@@ -358,7 +360,7 @@ if __name__ == "__main__":
         "lambda_start": 0.0001,
         "lambda_target": 0.005,
         "epochs": 4,
-        "samples_per_shard": 19500,
+        "samples_per_shard": 39000, 
         "test_chunk": 29, 
         "test_threshold": 0.8
     }
