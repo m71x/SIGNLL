@@ -190,17 +190,18 @@ def train_loop(rank, flags):
             if teacher_cls_full.shape[1] == 25:
                 teacher_cls_full = teacher_cls_full[:, 1:25, :]
             
-            # --- START MODIFICATION: Data Slicing to 6.25% ---
+            # --- START MODIFICATION: Data Slicing to 9.375% (3/32) ---
             N_total_local = teacher_cls_full.shape[0]
-            # 1/16 of the data = 6.25% (twice the old 3.125%)
-            N_target = N_total_local // 16 
+            # N_total_local // 32 is the original 3.125% batch size
+            # Multiply by 3 for 9.375% utilization
+            N_target = (N_total_local // num_cores) * 3 
 
             # Apply the slice
             teacher_cls_full = teacher_cls_full[:N_target]
             teacher_label_full = teacher_label_full[:N_target]
 
             if rank == 0:
-                xm.master_print(f"Data Sliced: Using {N_target}/{N_total_local} samples ({N_target/N_total_local:.2%}) for 6.25% utilization.")
+                xm.master_print(f"Data Sliced: Using {N_target}/{N_total_local} samples ({N_target/N_total_local:.2%}) for 9.375% utilization.")
             # --- END MODIFICATION ---
 
             # Class Weighting
@@ -271,7 +272,7 @@ def train_loop(rank, flags):
                         q = compute_q_from_h(h)
                         loss_cls = (q * ce_per_layer).sum(dim=1).mean()
                         
-                        # MODIFIED: Linear Depth Penalty (Reverting from Squared)
+                        # Linear Depth Penalty
                         depths = (torch.arange(1, L + 1, device=device).float()).unsqueeze(0)
                         halt_penalty = (depths * (1 - h)).sum(dim=1)
                         
@@ -360,6 +361,7 @@ if __name__ == "__main__":
         "lambda_start": 0.0001,
         "lambda_target": 0.005,
         "epochs": 4,
+        # Samples_per_shard is kept at 39000 (from previous instruction)
         "samples_per_shard": 39000, 
         "test_chunk": 29, 
         "test_threshold": 0.8
