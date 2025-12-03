@@ -12,7 +12,7 @@ from controller_model import Controller, compute_q_from_h
 from training_data_download import training_data_download
 
 # =========================================================================
-# EVALUATION FUNCTION (Unchanged)
+# EVALUATION FUNCTION (Modified to include MAD)
 # =========================================================================
 def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_shard):
     """
@@ -100,10 +100,19 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
     avg_exit_layer = (layer_exit_counts_cpu * layers).sum() / total_samples
     variance = (layer_exit_counts_cpu * (layers - avg_exit_layer).pow(2)).sum() / total_samples
     std_exit_layer = torch.sqrt(variance)
+
+    # --- MAD Calculation (NEW) ---
+    # Reconstruct the full list of exit layers from the histogram counts
+    counts_int = layer_exit_counts_cpu.long()
+    all_exit_layers = torch.repeat_interleave(layers, counts_int)
+    med_exit_layer = all_exit_layers.median()
+    abs_dev = torch.abs(all_exit_layers - med_exit_layer)
+    mad_exit_layer = abs_dev.median()
     
     xm.master_print(f"RESULTS FOR CHUNK {chunk_idx} (Threshold: {threshold}):")
     xm.master_print(f"  Accuracy: {accuracy:.2f}% ({total_correct}/{total_samples})")
     xm.master_print(f"  Average Exit Layer: {avg_exit_layer:.2f} +/- {std_exit_layer:.2f} (0-23)")
+    xm.master_print(f"  Median Exit Layer:  {med_exit_layer:.2f} (MAD: {mad_exit_layer:.2f})")
     xm.master_print(f"{'*'*80}\n")
 
     model.train() 
