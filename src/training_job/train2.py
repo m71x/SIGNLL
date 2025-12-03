@@ -12,7 +12,7 @@ from controller_model import Controller, compute_q_from_h
 from training_data_download import training_data_download
 
 # =========================================================================
-# EVALUATION FUNCTION (Modified to include Histogram)
+# EVALUATION FUNCTION (Unchanged)
 # =========================================================================
 def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_shard):
     """
@@ -100,7 +100,7 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
     avg_exit_layer = (layer_exit_counts_cpu * layers).sum() / total_samples
     variance = (layer_exit_counts_cpu * (layers - avg_exit_layer).pow(2)).sum() / total_samples
     std_exit_layer = torch.sqrt(variance)
-
+    
     # --- MAD Calculation ---
     counts_int = layer_exit_counts_cpu.long()
     all_exit_layers = torch.repeat_interleave(layers, counts_int)
@@ -202,18 +202,17 @@ def train_loop(rank, flags):
             if teacher_cls_full.shape[1] == 25:
                 teacher_cls_full = teacher_cls_full[:, 1:25, :]
             
-            # --- START MODIFICATION: Data Slicing to 9.375% (3/32) ---
+            # --- START MODIFICATION: Data Slicing to 12.5% (4/32) ---
             N_total_local = teacher_cls_full.shape[0]
-            # N_total_local // 32 is the original 3.125% batch size
-            # Multiply by 3 for 9.375% utilization
-            N_target = (N_total_local // num_cores) * 3 
+            # Calculate 1/32 of the local data (original usage) and multiply by 4
+            N_target = (N_total_local // num_cores) * 4 
 
             # Apply the slice
             teacher_cls_full = teacher_cls_full[:N_target]
             teacher_label_full = teacher_label_full[:N_target]
 
             if rank == 0:
-                xm.master_print(f"Data Sliced: Using {N_target}/{N_total_local} samples ({N_target/N_total_local:.2%}) for 9.375% utilization.")
+                xm.master_print(f"Data Sliced: Using {N_target}/{N_total_local} samples ({N_target/N_total_local:.2%}) for 12.50% utilization.")
             # --- END MODIFICATION ---
 
             # Class Weighting
@@ -371,9 +370,8 @@ if __name__ == "__main__":
         "lr": 1e-4,
         "batch_size": 32, 
         "lambda_start": 0.0001,
-        "lambda_target": 0.005,
+        "lambda_target": 0.004,
         "epochs": 4,
-        # Samples_per_shard is kept at 39000 (from previous instruction)
         "samples_per_shard": 39000, 
         "test_chunk": 29, 
         "test_threshold": 0.8
