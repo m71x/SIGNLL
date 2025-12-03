@@ -275,7 +275,7 @@ def train_loop(rank, flags):
                     if stage == 1:
                         loss_cls = ce_per_layer.mean()
                         loss_halt = torch.tensor(0.0, device=device)
-                        loss = loss_cls
+                        loss = loss_cls * 2
                         h = torch.zeros_like(halting_logits) 
 
                     elif stage == 2:
@@ -370,7 +370,7 @@ if __name__ == "__main__":
         "lr": 1e-4,
         "batch_size": 32, 
         "lambda_start": 0.0001,
-        "lambda_target": 0.004,
+        "lambda_target": 0.0035,
         "epochs": 4,
         "samples_per_shard": 39000, 
         "test_chunk": 29, 
