@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts #
 
 from torch.utils.data import TensorDataset, DataLoader, SequentialSampler, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
@@ -181,6 +182,24 @@ def train_loop(rank, flags):
         params_to_optimize = [p for p in model.parameters() if p.requires_grad]
         optimizer = optim.AdamW(params_to_optimize, lr=flags["lr"], weight_decay=1e-2)
 
+        # --- SCHEDULER SETUP (NEW) ---
+        # Calculate approximate total steps for the stage
+        # 28 chunks * epochs * batches per chunk
+        total_steps_in_stage = 28 * flags["epochs"] * num_batches_per_chunk
+        
+        # Define T_0: We want roughly 4 restarts per stage.
+        # So T_0 is total steps divided by 4.
+        T_0 = total_steps_in_stage // 4
+        
+        scheduler = CosineAnnealingWarmRestarts(
+            optimizer, 
+            T_0=T_0, 
+            T_mult=1,   # Cycle length remains constant
+            eta_min=1e-6 # Minimum LR
+        )
+        if rank == 0:
+            xm.master_print(f"Scheduler Initialized: CosineAnnealingWarmRestarts with T_0={T_0} steps")
+
         for chunk_idx in range(28): 
             current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
             
@@ -298,6 +317,10 @@ def train_loop(rank, flags):
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     xm.optimizer_step(optimizer)
+                    
+                    # --- SCHEDULER STEP (NEW) ---
+                    scheduler.step()
+                    
                     xm.mark_step()
 
                 # --- End of Epoch Aggregation ---
@@ -310,8 +333,10 @@ def train_loop(rank, flags):
                 # --- Rank 0 Logging ---
                 if rank == 0:
                     elapsed = time.time() - start_time
+                    current_lr = scheduler.get_last_lr()[0]
                     xm.master_print("-" * 60)
                     xm.master_print(f"STAGE {stage} | CHUNK {chunk_idx+1} | EPOCH {epoch+1}")
+                    xm.master_print(f"  LR:         {current_lr:.2e}")
                     xm.master_print(f"  Total Loss: {loss_sum / num_cores:.4f}")
                     xm.master_print(f"  Cls Loss:   {loss_cls_sum / num_cores:.4f}")
                     xm.master_print(f"  Halt Loss:  {loss_halt_sum / num_cores:.4f}")
