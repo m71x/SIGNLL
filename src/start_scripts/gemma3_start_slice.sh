@@ -23,7 +23,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --project=${PROJECT_ID} \
     --worker=all \
     --command="git clone https://github.com/m71x/SIGNLL"
-
+#ssh into worker 2
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
