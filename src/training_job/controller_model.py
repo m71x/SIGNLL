@@ -8,7 +8,7 @@ class Controller(nn.Module):
         self,
         L: int = 24,
         d_teacher: int = 1024,
-        d_ctrl: int = 512, #consider changing to 512
+        d_ctrl: int = 256, #consider changing to 512 later
         n_layers: int = 12,
         n_heads: int = 4,
         ffn_dim: int = 1024,
@@ -23,6 +23,7 @@ class Controller(nn.Module):
         self.num_classes = num_classes
 
         # 1. Inputs and Embeddings
+        self.input_ln = nn.LayerNorm(d_teacher) # NEW: Input Normalization Layer
         self.proj = nn.Linear(d_teacher, d_ctrl)
         self.layer_embed = nn.Embedding(L, d_ctrl)
         
@@ -97,7 +98,8 @@ class Controller(nn.Module):
         
         
         # 1. Controller Body Computation (Same as before)
-        x = self.proj(teacher_cls)
+        x = self.input_ln(teacher_cls) # MODIFIED: Apply LayerNorm before projection
+        x = self.proj(x)
         idx = torch.arange(self.L, device=teacher_cls.device).unsqueeze(0).expand(B, -1)
         x = x + self.layer_embed(idx)
         x = self.pre_ln(x)
