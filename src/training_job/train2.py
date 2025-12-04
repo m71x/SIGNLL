@@ -371,7 +371,7 @@ if __name__ == "__main__":
         "batch_size": 32, 
         "lambda_start": 0.0001,
         "lambda_target": 0.003,
-        "epochs": 4,
+        "epochs": 5,
         "samples_per_shard": 39000, 
         "test_chunk": 29, 
         "test_threshold": 0.8
