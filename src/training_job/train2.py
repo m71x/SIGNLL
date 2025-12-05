@@ -265,10 +265,9 @@ def train_loop(rank, flags):
             # 1. Hard Label Loss (BCE)
             bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight_tensor).to(device)
             
-            # 2. Knowledge Distillation Loss (KL Div) [FIXED: log_target=True]
-            # Now takes student log_softmax (input) and teacher log_probs (target)
-            kd_loss_fn = nn.KLDivLoss(reduction="none", log_target=True).to(device)
-
+            # 2. Knowledge Distillation Loss (REPLACED WITH MANUAL XLA COMPATIBLE VERSION IN LOOP)
+            # We previously used nn.KLDivLoss here, but it caused Autograd warnings on XLA.
+            
             # Create Dataset with Log Soft Targets
             dataset = TensorDataset(teacher_cls_full, teacher_label_full, teacher_log_probs_full)
             
@@ -330,13 +329,15 @@ def train_loop(rank, flags):
                     
                     loss_hard = bce_loss_fn(class_logits_positive, labels) # [B, L]
 
-                    # B. Knowledge Distillation Loss [FIXED]
+                    # B. Knowledge Distillation Loss [FIXED FOR XLA]
                     # Expand teacher log_probs to match student layers: [B, 2] -> [B, L, 2]
                     teacher_log_probs_expanded = teacher_log_probs.unsqueeze(1).expand(-1, L, -1)
                     
-                    # KLDiv(StudentLogSoftmax, TeacherLogProbs) with log_target=True
-                    # Sum over classes (dim=-1) to get scalar per token
-                    loss_soft = kd_loss_fn(student_log_probs, teacher_log_probs_expanded).sum(dim=-1) # [B, L]
+                    # MANUAL KL Divergence for log_target=True
+                    # Formula: exp(target) * (target - input)
+                    # This replaces nn.KLDivLoss to avoid XLA Autograd warnings.
+                    kl_elementwise = teacher_log_probs_expanded.exp() * (teacher_log_probs_expanded - student_log_probs)
+                    loss_soft = kl_elementwise.sum(dim=-1) # [B, L]
 
                     # Combined Classification Loss per layer
                     alpha = 0.5
