@@ -392,7 +392,7 @@ if __name__ == "__main__":
     BASE_FLAGS = {
         "d_ctrl": 512,
         "transformer_layers": 4,
-        "lr": 1.5e-4,
+        "lr": 2e-4,
         "batch_size": 32,   
         "lambda_start": 0.0001,
         "lambda_target": 0.003,
