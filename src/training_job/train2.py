@@ -123,7 +123,7 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
     model.train() 
 
 # =========================================================================
-# TRAINING LOOP (Modified for KD and Data Slicing)
+# TRAINING LOOP 
 # =========================================================================
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
@@ -220,10 +220,11 @@ def train_loop(rank, flags):
                 t_logits = torch.from_numpy(data['teacher_logits']).float()
                 # Apply Temperature T=2.0 for distillation
                 T_distill = 2.0
-                teacher_probs_full = F.softmax(t_logits / T_distill, dim=-1)
+                # Use log_softmax for target preparation (for log_target=True)
+                teacher_log_probs_full = F.log_softmax(t_logits / T_distill, dim=-1)
                 using_real_logits = True
             else:
-                # Fallback: Create smoothed labels from hard labels
+                # Fallback: Create log-smoothed labels from hard labels
                 # (Standard Label Smoothing acts as "distillation from uniform noise")
                 num_classes = 2
                 smoothing = 0.1
@@ -231,6 +232,8 @@ def train_loop(rank, flags):
                 t_one_hot = torch.zeros(teacher_label_full.size(0), num_classes).scatter_(1, teacher_label_full.unsqueeze(1), 1)
                 # Smooth
                 teacher_probs_full = t_one_hot * (1.0 - smoothing) + (smoothing / num_classes)
+                # Convert to log probabilities for log_target=True
+                teacher_log_probs_full = torch.log(teacher_probs_full)
                 using_real_logits = False
                 
                 if rank == 0 and chunk_idx == 0:
@@ -247,7 +250,7 @@ def train_loop(rank, flags):
             # Apply the slice to inputs, hard labels, AND soft targets
             teacher_cls_full = teacher_cls_full[:N_target]
             teacher_label_full = teacher_label_full[:N_target]
-            teacher_probs_full = teacher_probs_full[:N_target]
+            teacher_log_probs_full = teacher_log_probs_full[:N_target] # Slicing the log_probs
 
             if rank == 0:
                 xm.master_print(f"Data Sliced: Using {N_target}/{N_total_local} samples ({N_target/N_total_local:.2%}) for 12.50% utilization.")
@@ -262,12 +265,12 @@ def train_loop(rank, flags):
             # 1. Hard Label Loss (BCE)
             bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight_tensor).to(device)
             
-            # 2. Knowledge Distillation Loss (KL Div) [NEW]
-            # reduction='none' so we can apply masking/weighting later if needed
-            kd_loss_fn = nn.KLDivLoss(reduction="none", log_target=False).to(device)
+            # 2. Knowledge Distillation Loss (KL Div) [FIXED: log_target=True]
+            # Now takes student log_softmax (input) and teacher log_probs (target)
+            kd_loss_fn = nn.KLDivLoss(reduction="none", log_target=True).to(device)
 
-            # Create Dataset with Soft Targets
-            dataset = TensorDataset(teacher_cls_full, teacher_label_full, teacher_probs_full)
+            # Create Dataset with Log Soft Targets
+            dataset = TensorDataset(teacher_cls_full, teacher_label_full, teacher_log_probs_full)
             
             # Use RandomSampler to shuffle
             sampler = RandomSampler(dataset)
@@ -282,12 +285,12 @@ def train_loop(rank, flags):
                 diag_sample_pos = None
                 diag_sample_neg = None
 
-                for batch_idx, (teacher_cls, teacher_label, teacher_probs) in enumerate(data_loader):
+                for batch_idx, (teacher_cls, teacher_label, teacher_log_probs) in enumerate(data_loader):
                     if stage == 2: global_step += 29 
                     
                     teacher_cls = teacher_cls.to(device)
                     teacher_label = teacher_label.to(device)
-                    teacher_probs = teacher_probs.to(device) # [B, 2]
+                    teacher_log_probs = teacher_log_probs.to(device) # [B, 2]
                     
                     # Forward Pass
                     halting_logits, class_logits, _ = model(teacher_cls) # class_logits: [B, L, 2]
@@ -319,25 +322,23 @@ def train_loop(rank, flags):
                         student_log_probs = F.log_softmax(class_logits, dim=-1)
                     else:
                         class_logits_positive = class_logits.squeeze(-1)
-                        # Construct 2-class logits for KD if only 1 output node
-                        # (Not expected given your code uses num_classes=2, but safe fallback)
+                        # Fallback for log_probs (should not happen with num_classes=2)
                         student_log_probs = F.log_softmax(
-                            torch.stack([-class_logits_positive, class_logits_positive], dim=-1), 
-                            dim=-1
-                        )
+                             torch.stack([-class_logits_positive, class_logits_positive], dim=-1),
+                             dim=-1
+                         )
                     
                     loss_hard = bce_loss_fn(class_logits_positive, labels) # [B, L]
 
-                    # B. Knowledge Distillation Loss [NEW]
-                    # Expand teacher probs to match student layers: [B, 2] -> [B, L, 2]
-                    teacher_probs_expanded = teacher_probs.unsqueeze(1).expand(-1, L, -1)
+                    # B. Knowledge Distillation Loss [FIXED]
+                    # Expand teacher log_probs to match student layers: [B, 2] -> [B, L, 2]
+                    teacher_log_probs_expanded = teacher_log_probs.unsqueeze(1).expand(-1, L, -1)
                     
-                    # KLDiv(StudentLogSoftmax, TeacherProbs)
+                    # KLDiv(StudentLogSoftmax, TeacherLogProbs) with log_target=True
                     # Sum over classes (dim=-1) to get scalar per token
-                    loss_soft = kd_loss_fn(student_log_probs, teacher_probs_expanded).sum(dim=-1) # [B, L]
+                    loss_soft = kd_loss_fn(student_log_probs, teacher_log_probs_expanded).sum(dim=-1) # [B, L]
 
                     # Combined Classification Loss per layer
-                    # Alpha: Balance between Hard and Soft. 0.5 is a standard starting point.
                     alpha = 0.5
                     ce_per_layer = (alpha * loss_hard) + ((1 - alpha) * loss_soft)
 
