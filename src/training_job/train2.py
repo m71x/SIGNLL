@@ -1,10 +1,11 @@
 import os, time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts #
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts 
 
 from torch.utils.data import TensorDataset, DataLoader, SequentialSampler, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
@@ -114,7 +115,7 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
     xm.master_print(f"  Average Exit Layer: {avg_exit_layer:.2f} +/- {std_exit_layer:.2f} (0-23)")
     xm.master_print(f"  Median Exit Layer:  {med_exit_layer:.2f} (MAD: {mad_exit_layer:.2f})")
     
-    # --- Histogram Log (NEW) ---
+    # --- Histogram Log ---
     xm.master_print(f"  Exit Layer Distribution (0-23): {layer_exit_counts_cpu.long().tolist()}")
     
     xm.master_print(f"{'*'*80}\n")
@@ -122,7 +123,7 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
     model.train() 
 
 # =========================================================================
-# TRAINING LOOP (Modified for Data Slicing)
+# TRAINING LOOP (Modified for KD and Data Slicing)
 # =========================================================================
 def train_loop(rank, flags):
     device = xm.torch_xla.device()
@@ -182,20 +183,14 @@ def train_loop(rank, flags):
         params_to_optimize = [p for p in model.parameters() if p.requires_grad]
         optimizer = optim.AdamW(params_to_optimize, lr=flags["lr"], weight_decay=1e-2)
 
-        # --- SCHEDULER SETUP (NEW) ---
-        # Calculate approximate total steps for the stage
-        # 28 chunks * epochs * batches per chunk
+        # --- SCHEDULER SETUP ---
         total_steps_in_stage = 28 * flags["epochs"] * num_batches_per_chunk
-        
-        # Define T_0: We want roughly 4 restarts per stage.
-        # So T_0 is total steps divided by 4.
         T_0 = total_steps_in_stage // 4
-        
         scheduler = CosineAnnealingWarmRestarts(
             optimizer, 
             T_0=T_0, 
-            T_mult=1,   # Cycle length remains constant
-            eta_min=1e-6 # Minimum LR
+            T_mult=1,   
+            eta_min=1e-6
         )
         if rank == 0:
             xm.master_print(f"Scheduler Initialized: CosineAnnealingWarmRestarts with T_0={T_0} steps")
@@ -218,33 +213,63 @@ def train_loop(rank, flags):
             teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
             teacher_label_full = torch.from_numpy(data['classifications']).long()
             
+            # --- START ENHANCEMENT 9: Soft Targets Loading/Synthesis ---
+            # Try to find logits in the data. If missing, synthesize smoothed targets.
+            if 'teacher_logits' in data:
+                # Assuming logits are [N, 2] or [N, num_classes]
+                t_logits = torch.from_numpy(data['teacher_logits']).float()
+                # Apply Temperature T=2.0 for distillation
+                T_distill = 2.0
+                teacher_probs_full = F.softmax(t_logits / T_distill, dim=-1)
+                using_real_logits = True
+            else:
+                # Fallback: Create smoothed labels from hard labels
+                # (Standard Label Smoothing acts as "distillation from uniform noise")
+                num_classes = 2
+                smoothing = 0.1
+                # Create one-hot
+                t_one_hot = torch.zeros(teacher_label_full.size(0), num_classes).scatter_(1, teacher_label_full.unsqueeze(1), 1)
+                # Smooth
+                teacher_probs_full = t_one_hot * (1.0 - smoothing) + (smoothing / num_classes)
+                using_real_logits = False
+                
+                if rank == 0 and chunk_idx == 0:
+                    xm.master_print("  [Note] 'teacher_logits' not found. Using synthesized Soft Targets (Label Smoothing=0.1).")
+            # ----------------------------------------------------------
+
             if teacher_cls_full.shape[1] == 25:
                 teacher_cls_full = teacher_cls_full[:, 1:25, :]
             
-            # --- START MODIFICATION: Data Slicing to 12.5% (4/32) ---
+            # --- Data Slicing (12.5%) ---
             N_total_local = teacher_cls_full.shape[0]
-            # Calculate 1/32 of the local data (original usage) and multiply by 4
             N_target = (N_total_local // num_cores) * 4 
 
-            # Apply the slice
+            # Apply the slice to inputs, hard labels, AND soft targets
             teacher_cls_full = teacher_cls_full[:N_target]
             teacher_label_full = teacher_label_full[:N_target]
+            teacher_probs_full = teacher_probs_full[:N_target]
 
             if rank == 0:
                 xm.master_print(f"Data Sliced: Using {N_target}/{N_total_local} samples ({N_target/N_total_local:.2%}) for 12.50% utilization.")
-            # --- END MODIFICATION ---
 
-            # Class Weighting
+            # Class Weighting for Hard Labels
             neg_samples = (teacher_label_full == 0).sum().item()
             pos_samples = (teacher_label_full == 1).sum().item()
             pos_weight_val = neg_samples / (pos_samples + 1e-6)
             pos_weight_tensor = torch.tensor([pos_weight_val]).float().to(device)
 
+            # Define Losses
+            # 1. Hard Label Loss (BCE)
             bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight_tensor).to(device)
-
-            dataset = TensorDataset(teacher_cls_full, teacher_label_full)
             
-            # Use RandomSampler to shuffle the reduced dataset (essential fix)
+            # 2. Knowledge Distillation Loss (KL Div) [NEW]
+            # reduction='none' so we can apply masking/weighting later if needed
+            kd_loss_fn = nn.KLDivLoss(reduction="none", log_target=False).to(device)
+
+            # Create Dataset with Soft Targets
+            dataset = TensorDataset(teacher_cls_full, teacher_label_full, teacher_probs_full)
+            
+            # Use RandomSampler to shuffle
             sampler = RandomSampler(dataset)
             
             data_loader = DataLoader(dataset, sampler=sampler, batch_size=flags["batch_size"], drop_last=True, num_workers=2)
@@ -253,18 +278,19 @@ def train_loop(rank, flags):
             for epoch in range(flags["epochs"]):
                 model.train()
                 
-                # Reset diagnostic holders for this epoch
+                # Reset diagnostic holders
                 diag_sample_pos = None
                 diag_sample_neg = None
 
-                for batch_idx, (teacher_cls, teacher_label) in enumerate(data_loader):
+                for batch_idx, (teacher_cls, teacher_label, teacher_probs) in enumerate(data_loader):
                     if stage == 2: global_step += 29 
                     
                     teacher_cls = teacher_cls.to(device)
                     teacher_label = teacher_label.to(device)
+                    teacher_probs = teacher_probs.to(device) # [B, 2]
                     
                     # Forward Pass
-                    halting_logits, class_logits, _ = model(teacher_cls)
+                    halting_logits, class_logits, _ = model(teacher_cls) # class_logits: [B, L, 2]
                     
                     # --- Capture Diagnostics (Rank 0, First Batch Only) ---
                     if rank == 0 and batch_idx == 0:
@@ -283,13 +309,37 @@ def train_loop(rank, flags):
                         diag_sample_neg = extract_sample(0)
 
                     # --- LOSS CALCULATION ---
+                    
+                    # A. Hard Label Loss (Standard)
                     labels = teacher_label.float().unsqueeze(1).expand(-1, L)
+                    # Use class 1 logits for BCE
                     if class_logits.size(-1) == 2:
                         class_logits_positive = class_logits[:, :, 1]
+                        # For KD, we need the full Log Softmax [B, L, 2]
+                        student_log_probs = F.log_softmax(class_logits, dim=-1)
                     else:
                         class_logits_positive = class_logits.squeeze(-1)
+                        # Construct 2-class logits for KD if only 1 output node
+                        # (Not expected given your code uses num_classes=2, but safe fallback)
+                        student_log_probs = F.log_softmax(
+                            torch.stack([-class_logits_positive, class_logits_positive], dim=-1), 
+                            dim=-1
+                        )
                     
-                    ce_per_layer = bce_loss_fn(class_logits_positive, labels)
+                    loss_hard = bce_loss_fn(class_logits_positive, labels) # [B, L]
+
+                    # B. Knowledge Distillation Loss [NEW]
+                    # Expand teacher probs to match student layers: [B, 2] -> [B, L, 2]
+                    teacher_probs_expanded = teacher_probs.unsqueeze(1).expand(-1, L, -1)
+                    
+                    # KLDiv(StudentLogSoftmax, TeacherProbs)
+                    # Sum over classes (dim=-1) to get scalar per token
+                    loss_soft = kd_loss_fn(student_log_probs, teacher_probs_expanded).sum(dim=-1) # [B, L]
+
+                    # Combined Classification Loss per layer
+                    # Alpha: Balance between Hard and Soft. 0.5 is a standard starting point.
+                    alpha = 0.5
+                    ce_per_layer = (alpha * loss_hard) + ((1 - alpha) * loss_soft)
 
                     if stage == 1:
                         loss_cls = ce_per_layer.mean()
@@ -318,7 +368,7 @@ def train_loop(rank, flags):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     xm.optimizer_step(optimizer)
                     
-                    # --- SCHEDULER STEP (NEW) ---
+                    # Scheduler Step
                     scheduler.step()
                     
                     xm.mark_step()
@@ -338,7 +388,7 @@ def train_loop(rank, flags):
                     xm.master_print(f"STAGE {stage} | CHUNK {chunk_idx+1} | EPOCH {epoch+1}")
                     xm.master_print(f"  LR:         {current_lr:.2e}")
                     xm.master_print(f"  Total Loss: {loss_sum / num_cores:.4f}")
-                    xm.master_print(f"  Cls Loss:   {loss_cls_sum / num_cores:.4f}")
+                    xm.master_print(f"  Cls Loss:   {loss_cls_sum / num_cores:.4f} (Hybrid Hard+Soft)")
                     xm.master_print(f"  Halt Loss:  {loss_halt_sum / num_cores:.4f}")
                     
                     def format_sample(data, name):
