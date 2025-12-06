@@ -456,14 +456,14 @@ if __name__ == "__main__":
         "d_ctrl": 512,
         "transformer_layers": 4,
         "lr": 3e-4,
-        "batch_size": 32,   
+        "batch_size": 64,   
         "lambda_start": 0.0001,
         "lambda_target": 0.0025,
         "epochs": 5,
         "samples_per_shard": 39000, 
         "test_chunk": 29, 
         "test_threshold": 0.8
-    }
+    }  
     
     print("Starting Two-Stage XLA Job.")
-    xmp.spawn(_mp_fn, args=(BASE_FLAGS,), start_method='fork')
+    xmp.spawn(_mp_fn, args=(BASE_FLAGS,), start_method='fork') 
