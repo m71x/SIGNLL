@@ -14,7 +14,7 @@ from controller_model import Controller, compute_q_from_h
 from training_data_download import training_data_download
 
 # =========================================================================
-# EVALUATION FUNCTION (Unchanged)
+# EVALUATION FUNCTION (Optimized for XLA)
 # =========================================================================
 def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_shard):
     """
@@ -69,23 +69,33 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
             teacher_cls = teacher_cls.to(device)
             teacher_label = teacher_label.to(device)
             
+            # Forward pass
             halting_logits, class_logits, _ = model(teacher_cls)
             
             h_probs = torch.sigmoid(halting_logits)
             threshold_mask = (h_probs > threshold)
             
-            exit_indices = torch.argmax(threshold_mask.long(), dim=1)
+            # Argmax is generally safe in Eval, but gather is safer for indexing
+            exit_indices = torch.argmax(threshold_mask.long(), dim=1) # [B]
             row_has_exit = threshold_mask.any(dim=1)
             exit_indices[~row_has_exit] = 23
             
-            batch_indices = torch.arange(class_logits.size(0), device=device)
-            selected_logits = class_logits[batch_indices, exit_indices]
+            # --- SAFE XLA INDEXING (Replaces Advanced Indexing) ---
+            # We want class_logits[b, exit_indices[b], :]
+            # Expand indices to [B, 1, C]
+            B, L, C = class_logits.shape
+            gather_indices = exit_indices.view(B, 1, 1).expand(B, 1, C)
+            # Gather along dim 1 (Layers) -> [B, 1, C] -> squeeze -> [B, C]
+            selected_logits = torch.gather(class_logits, 1, gather_indices).squeeze(1)
+            # ------------------------------------------------------
+
             predictions = torch.argmax(selected_logits, dim=-1)
             
             correct_tensor = (predictions == teacher_label).sum()
             total_correct += correct_tensor.item() 
             total_samples += teacher_label.size(0)
             
+            # Move only stats to CPU
             exit_indices_cpu = exit_indices.cpu()
             unique_exits, counts = torch.unique(exit_indices_cpu, return_counts=True)
             layer_exit_counts_cpu.index_add_(0, unique_exits, counts.float())
@@ -114,10 +124,7 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
     xm.master_print(f"  Accuracy: {accuracy:.2f}% ({total_correct}/{total_samples})")
     xm.master_print(f"  Average Exit Layer: {avg_exit_layer:.2f} +/- {std_exit_layer:.2f} (0-23)")
     xm.master_print(f"  Median Exit Layer:  {med_exit_layer:.2f} (MAD: {mad_exit_layer:.2f})")
-    
-    # --- Histogram Log (NEW) ---
     xm.master_print(f"  Exit Layer Distribution (0-23): {layer_exit_counts_cpu.long().tolist()}")
-    
     xm.master_print(f"{'*'*80}\n")
 
     model.train() 
@@ -154,10 +161,6 @@ def train_loop(rank, flags):
     total_steps_stage_2 = flags["epochs"] * 29 * num_batches_per_chunk
     global_step = 0
     start_time = time.time()
-
-    # Placeholders for sample diagnostics (Rank 0 only)
-    diag_sample_pos = None
-    diag_sample_neg = None
 
     # =========================================================================
     # STAGE LOOP: 1 -> Backbone/Classifiers, 2 -> Halting Heads
@@ -213,7 +216,7 @@ def train_loop(rank, flags):
             teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
             teacher_label_full = torch.from_numpy(data['classifications']).long()
             
-            # --- START ENHANCEMENT 9: Soft Targets Loading/Synthesis ---
+            # --- Soft Targets Loading/Synthesis (Safe for XLA) ---
             if 'teacher_logits' in data:
                 t_logits = torch.from_numpy(data['teacher_logits']).float()
                 T_distill = 2.0
@@ -227,7 +230,6 @@ def train_loop(rank, flags):
                 
                 if rank == 0 and chunk_idx == 0:
                     xm.master_print("  [Note] 'teacher_logits' not found. Using synthesized Soft Targets (Label Smoothing=0.1).")
-            # ----------------------------------------------------------
 
             if teacher_cls_full.shape[1] == 25:
                 teacher_cls_full = teacher_cls_full[:, 1:25, :]
@@ -236,6 +238,7 @@ def train_loop(rank, flags):
             N_total_local = teacher_cls_full.shape[0]
             N_target = (N_total_local // num_cores) * 5 
 
+            # Static Slicing: Safe as long as batch_size in DataLoader is fixed via drop_last=True
             teacher_cls_full = teacher_cls_full[:N_target]
             teacher_label_full = teacher_label_full[:N_target]
             teacher_log_probs_full = teacher_log_probs_full[:N_target] 
@@ -243,7 +246,7 @@ def train_loop(rank, flags):
             if rank == 0:
                 xm.master_print(f"Data Sliced: Using {N_target}/{N_total_local} samples ({N_target/N_total_local:.2%}) for 15.625% utilization.")
 
-            # Class Weighting for Hard Labels
+            # Class Weighting
             neg_samples = (teacher_label_full == 0).sum().item()
             pos_samples = (teacher_label_full == 1).sum().item()
             pos_weight_val = neg_samples / (pos_samples + 1e-6)
@@ -251,50 +254,34 @@ def train_loop(rank, flags):
 
             bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight_tensor).to(device)
             
-            # Create Dataset with Log Soft Targets
             dataset = TensorDataset(teacher_cls_full, teacher_label_full, teacher_log_probs_full)
-            
             sampler = RandomSampler(dataset)
             
+            # drop_last=True is CRITICAL for XLA to prevent recompilation on the last small batch
             data_loader = DataLoader(dataset, sampler=sampler, batch_size=flags["batch_size"], drop_last=True, num_workers=2)
             
             # --- Epoch Loop ---
             for epoch in range(flags["epochs"]):
                 model.train()
                 
-                # Reset diagnostic holders
-                diag_sample_pos = None
-                diag_sample_neg = None
-
+                # Removed 'diag_sample' holders to prevent dynamic tensor logic
+                
                 for batch_idx, (teacher_cls, teacher_label, teacher_log_probs) in enumerate(data_loader):
                     if stage == 2: global_step += 29 
                     
                     teacher_cls = teacher_cls.to(device)
                     teacher_label = teacher_label.to(device)
-                    teacher_log_probs = teacher_log_probs.to(device) # [B, 2]
+                    teacher_log_probs = teacher_log_probs.to(device)
                     
-                    # Forward Pass - NOW CAPTURING 'z' FOR CONTRASTIVE LOSS
-                    halting_logits, class_logits, z = model(teacher_cls) # class_logits: [B, L, 2], z: [B, L, D]
+                    # Forward Pass - Capture 'z' for Contrastive Loss
+                    halting_logits, class_logits, z = model(teacher_cls)
                     
-                    # --- Capture Diagnostics (Rank 0, First Batch Only) ---
-                    if rank == 0 and batch_idx == 0:
-                        def extract_sample(label_val):
-                            indices = (teacher_label == label_val).nonzero(as_tuple=True)[0]
-                            if indices.numel() > 0:
-                                idx = indices[0]
-                                return {
-                                    'cls': class_logits[idx].detach().cpu(),
-                                    'halt': halting_logits[idx].detach().cpu(),
-                                    'lbl': teacher_label[idx].detach().cpu()
-                                }
-                            return None
-                        
-                        diag_sample_pos = extract_sample(1)
-                        diag_sample_neg = extract_sample(0)
-
+                    # --- REMOVED DYNAMIC DIAGNOSTICS HERE (FIXED FREEZING ISSUE) ---
+                    # Calling (teacher_label == 1).nonzero() causes massive recompilation/freezing on XLA.
+                    
                     # --- LOSS CALCULATION ---
                     
-                    # A. Hard Label Loss (Standard)
+                    # A. Hard Label Loss
                     labels = teacher_label.float().unsqueeze(1).expand(-1, L)
                     if class_logits.size(-1) == 2:
                         class_logits_positive = class_logits[:, :, 1]
@@ -306,21 +293,22 @@ def train_loop(rank, flags):
                              dim=-1
                          )
                     
-                    loss_hard = bce_loss_fn(class_logits_positive, labels) # [B, L]
+                    loss_hard = bce_loss_fn(class_logits_positive, labels)
 
                     # B. Knowledge Distillation Loss (Manual KL for XLA)
                     teacher_log_probs_expanded = teacher_log_probs.unsqueeze(1).expand(-1, L, -1)
+                    # exp(target) * (target - input)
                     kl_elementwise = teacher_log_probs_expanded.exp() * (teacher_log_probs_expanded - student_log_probs)
-                    loss_soft = kl_elementwise.sum(dim=-1) # [B, L]
+                    loss_soft = kl_elementwise.sum(dim=-1)
 
-                    # Combined Classification Loss per layer
+                    # Combined Classification Loss
                     alpha = 0.5
                     ce_per_layer = (alpha * loss_hard) + ((1 - alpha) * loss_soft)
 
-                    # C. Contrastive Layer Learning (Fix #4)
-                    # Force smoothness in latent space: maximize CosSim(z_t, z_{t+1})
+                    # C. Contrastive Layer Learning (Fix #4: Smoothness)
+                    # Maximize Cosine Similarity between z[t] and z[t+1]
+                    # This logic uses static slicing and is XLA safe.
                     z_norm = F.normalize(z, p=2, dim=-1)
-                    # Dot product of adjacent vectors [B, L-1]
                     cos_sim = (z_norm[:, :-1, :] * z_norm[:, 1:, :]).sum(dim=-1) 
                     loss_contrast = (1.0 - cos_sim).mean()
 
@@ -328,7 +316,7 @@ def train_loop(rank, flags):
                         loss_cls = ce_per_layer.mean()
                         loss_halt = torch.tensor(0.0, device=device)
                         
-                        # Add contrastive loss to Stage 1
+                        # Add contrastive loss (Fix #4)
                         loss = (loss_cls * 2) + (0.1 * loss_contrast)
                         
                         h = torch.zeros_like(halting_logits) 
@@ -346,8 +334,6 @@ def train_loop(rank, flags):
                         lambda_now = flags["lambda_start"] + (flags["lambda_target"] - flags["lambda_start"]) * progress
                         loss_halt = lambda_now * halt_penalty.mean()
                         
-                        # Note: We do NOT typically add contrastive loss in Stage 2 (Frozen Backbone)
-                        # because 'z' is frozen. Only halting heads train here.
                         loss = loss_cls + loss_halt
 
                     # Optimization
@@ -355,10 +341,7 @@ def train_loop(rank, flags):
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     xm.optimizer_step(optimizer)
-                    
-                    # Scheduler Step
                     scheduler.step()
-                    
                     xm.mark_step()
 
                 # --- End of Epoch Aggregation ---
@@ -370,7 +353,6 @@ def train_loop(rank, flags):
                 
                 # --- Rank 0 Logging ---
                 if rank == 0:
-                    elapsed = time.time() - start_time
                     current_lr = scheduler.get_last_lr()[0]
                     xm.master_print("-" * 60)
                     xm.master_print(f"STAGE {stage} | CHUNK {chunk_idx+1} | EPOCH {epoch+1}")
@@ -381,22 +363,6 @@ def train_loop(rank, flags):
                     if stage == 1:
                         loss_contrast_sum = xm.all_reduce(xm.REDUCE_SUM, loss_contrast)
                         xm.master_print(f"  Contr Loss: {loss_contrast_sum / num_cores:.4f}")
-                    
-                    def format_sample(data, name):
-                        if data is None: return f"  {name}: No sample found in first batch."
-                        out = [f"  > {name} (Label {data['lbl'].item()}):"]
-                        if stage == 1:
-                            probs = torch.softmax(data['cls'], dim=-1) 
-                            cls1_probs = probs[:, 1]
-                            out.append(f"    CLS Probs (Class 1): {[f'{p:.2f}' for p in cls1_probs.tolist()]}")
-                        else:
-                            h_probs = torch.sigmoid(data['halt'])
-                            out.append(f"    HALT Probs: {[f'{p:.2f}' for p in h_probs.tolist()]}")
-                        return "\n".join(out)
-
-                    xm.master_print("  DIAGNOSTICS (Layer 0->23):")
-                    xm.master_print(format_sample(diag_sample_pos, "Sample POS"))
-                    xm.master_print(format_sample(diag_sample_neg, "Sample NEG"))
 
             # Checkpoint
             if (chunk_idx + 1) % 5 == 0 and rank == 0:
