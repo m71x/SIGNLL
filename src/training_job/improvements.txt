@@ -1,0 +1,21 @@
+1. CLS loss is plateauing at around 0.1-0.15, you need to come up with a way to fix this
+2. halting loss is good but at chunk 24 cls loss starts ticking up, which might be a concern
+
+6. The "Ponder Loss" (Geometric Prior)
+Impact: High (Alternative to Linear Penalty) Your current penalty is depth * (1-h). This is a linear penalty. The original Adaptive Computation Time (ACT) paper uses a Ponder Cost.
+
+Concept: Instead of just penalizing depth, you penalize the cumulative probability mass that extends beyond a point.
+
+Refinement: You can use a Lagrangian formulation. Instead of a fixed lambda, make lambda a learnable parameter that automatically adjusts to keep the average depth near a target (e.g., "Target 12 layers").
+    
+Python
+
+# Pseudo-code for Lagrangian update
+# loss = classification_loss + self.lambda_param * (average_depth - target_depth)
+# self.lambda_param is updated via gradient ascent (maximize penalty if constraint violated)
+7. Weighted Softmax (Gumbel-Softmax)
+Impact: High (Refining the Halting Decision) Currently, you use compute_q_from_h which approximates a discrete stop using cumulative products.
+
+Enhancement: Use the Gumbel-Softmax trick.
+
+It allows you to sample a "hard" exit layer during the forward pass (keeping memory low) while remaining differentiable during the backward pass. This is often more stable than the cumulative product method for deep sequences.

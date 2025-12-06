@@ -358,16 +358,21 @@ def train_loop(rank, flags):
                         # Add Contrastive Loss (Smoothness) to Stage 1
                         loss = (loss_cls * 2) + (0.1 * loss_contrast)
 
-                        h = torch.zeros_like(halting_logits) 
-
                     elif stage == 2:
-                        h = torch.sigmoid(halting_logits)
-                        q = compute_q_from_h(h)
+                        # --- GUMBEL-SOFTMAX FIX (#7) ---
+                        # Use Gumbel-Softmax to sample exit layer probability distribution
+                        # q shape: [B, L] - acts as probability mass function over layers
+                        q = F.gumbel_softmax(halting_logits, tau=1.0, hard=False, dim=-1)
+                        
+                        # Weighted Classification Loss (Expected Loss)
                         loss_cls = (q * ce_per_layer).sum(dim=1).mean()
                         
-                        # Linear Depth Penalty
+                        # Linear Depth Penalty (Expected Depth)
+                        # Depths: [1, 2, ..., L]
                         depths = (torch.arange(1, L + 1, device=device).float()).unsqueeze(0)
-                        halt_penalty = (depths * (1 - h)).sum(dim=1)
+                        
+                        # Penalty = Expected Value of Depth
+                        halt_penalty = (q * depths).sum(dim=1)
                         
                         progress = global_step / total_steps_stage_2
                         lambda_now = flags["lambda_start"] + (flags["lambda_target"] - flags["lambda_start"]) * progress
@@ -466,4 +471,4 @@ if __name__ == "__main__":
     }  
     
     print("Starting Two-Stage XLA Job.")
-    xmp.spawn(_mp_fn, args=(BASE_FLAGS,), start_method='fork') 
+    xmp.spawn(_mp_fn, args=(BASE_FLAGS,), start_method='fork')
