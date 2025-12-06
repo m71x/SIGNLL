@@ -214,27 +214,16 @@ def train_loop(rank, flags):
             teacher_label_full = torch.from_numpy(data['classifications']).long()
             
             # --- START ENHANCEMENT 9: Soft Targets Loading/Synthesis ---
-            # Try to find logits in the data. If missing, synthesize smoothed targets.
             if 'teacher_logits' in data:
-                # Assuming logits are [N, 2] or [N, num_classes]
                 t_logits = torch.from_numpy(data['teacher_logits']).float()
-                # Apply Temperature T=2.0 for distillation
                 T_distill = 2.0
-                # Use log_softmax for target preparation (for log_target=True)
                 teacher_log_probs_full = F.log_softmax(t_logits / T_distill, dim=-1)
-                using_real_logits = True
             else:
-                # Fallback: Create log-smoothed labels from hard labels
-                # (Standard Label Smoothing acts as "distillation from uniform noise")
                 num_classes = 2
                 smoothing = 0.1
-                # Create one-hot
                 t_one_hot = torch.zeros(teacher_label_full.size(0), num_classes).scatter_(1, teacher_label_full.unsqueeze(1), 1)
-                # Smooth
                 teacher_probs_full = t_one_hot * (1.0 - smoothing) + (smoothing / num_classes)
-                # Convert to log probabilities for log_target=True
                 teacher_log_probs_full = torch.log(teacher_probs_full)
-                using_real_logits = False
                 
                 if rank == 0 and chunk_idx == 0:
                     xm.master_print("  [Note] 'teacher_logits' not found. Using synthesized Soft Targets (Label Smoothing=0.1).")
@@ -247,10 +236,9 @@ def train_loop(rank, flags):
             N_total_local = teacher_cls_full.shape[0]
             N_target = (N_total_local // num_cores) * 5 
 
-            # Apply the slice to inputs, hard labels, AND soft targets
             teacher_cls_full = teacher_cls_full[:N_target]
             teacher_label_full = teacher_label_full[:N_target]
-            teacher_log_probs_full = teacher_log_probs_full[:N_target] # Slicing the log_probs
+            teacher_log_probs_full = teacher_log_probs_full[:N_target] 
 
             if rank == 0:
                 xm.master_print(f"Data Sliced: Using {N_target}/{N_total_local} samples ({N_target/N_total_local:.2%}) for 15.625% utilization.")
@@ -261,17 +249,11 @@ def train_loop(rank, flags):
             pos_weight_val = neg_samples / (pos_samples + 1e-6)
             pos_weight_tensor = torch.tensor([pos_weight_val]).float().to(device)
 
-            # Define Losses
-            # 1. Hard Label Loss (BCE)
             bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight_tensor).to(device)
-            
-            # 2. Knowledge Distillation Loss (REPLACED WITH MANUAL XLA COMPATIBLE VERSION IN LOOP)
-            # We previously used nn.KLDivLoss here, but it caused Autograd warnings on XLA.
             
             # Create Dataset with Log Soft Targets
             dataset = TensorDataset(teacher_cls_full, teacher_label_full, teacher_log_probs_full)
             
-            # Use RandomSampler to shuffle
             sampler = RandomSampler(dataset)
             
             data_loader = DataLoader(dataset, sampler=sampler, batch_size=flags["batch_size"], drop_last=True, num_workers=2)
@@ -291,8 +273,8 @@ def train_loop(rank, flags):
                     teacher_label = teacher_label.to(device)
                     teacher_log_probs = teacher_log_probs.to(device) # [B, 2]
                     
-                    # Forward Pass
-                    halting_logits, class_logits, _ = model(teacher_cls) # class_logits: [B, L, 2]
+                    # Forward Pass - NOW CAPTURING 'z' FOR CONTRASTIVE LOSS
+                    halting_logits, class_logits, z = model(teacher_cls) # class_logits: [B, L, 2], z: [B, L, D]
                     
                     # --- Capture Diagnostics (Rank 0, First Batch Only) ---
                     if rank == 0 and batch_idx == 0:
@@ -314,28 +296,20 @@ def train_loop(rank, flags):
                     
                     # A. Hard Label Loss (Standard)
                     labels = teacher_label.float().unsqueeze(1).expand(-1, L)
-                    # Use class 1 logits for BCE
                     if class_logits.size(-1) == 2:
                         class_logits_positive = class_logits[:, :, 1]
-                        # For KD, we need the full Log Softmax [B, L, 2]
                         student_log_probs = F.log_softmax(class_logits, dim=-1)
                     else:
                         class_logits_positive = class_logits.squeeze(-1)
-                        # Fallback for log_probs (should not happen with num_classes=2)
                         student_log_probs = F.log_softmax(
                              torch.stack([-class_logits_positive, class_logits_positive], dim=-1),
                              dim=-1
-                          )
+                         )
                     
                     loss_hard = bce_loss_fn(class_logits_positive, labels) # [B, L]
 
-                    # B. Knowledge Distillation Loss [FIXED FOR XLA]
-                    # Expand teacher log_probs to match student layers: [B, 2] -> [B, L, 2]
+                    # B. Knowledge Distillation Loss (Manual KL for XLA)
                     teacher_log_probs_expanded = teacher_log_probs.unsqueeze(1).expand(-1, L, -1)
-                    
-                    # MANUAL KL Divergence for log_target=True
-                    # Formula: exp(target) * (target - input)
-                    # This replaces nn.KLDivLoss to avoid XLA Autograd warnings.
                     kl_elementwise = teacher_log_probs_expanded.exp() * (teacher_log_probs_expanded - student_log_probs)
                     loss_soft = kl_elementwise.sum(dim=-1) # [B, L]
 
@@ -343,10 +317,20 @@ def train_loop(rank, flags):
                     alpha = 0.5
                     ce_per_layer = (alpha * loss_hard) + ((1 - alpha) * loss_soft)
 
+                    # C. Contrastive Layer Learning (Fix #4)
+                    # Force smoothness in latent space: maximize CosSim(z_t, z_{t+1})
+                    z_norm = F.normalize(z, p=2, dim=-1)
+                    # Dot product of adjacent vectors [B, L-1]
+                    cos_sim = (z_norm[:, :-1, :] * z_norm[:, 1:, :]).sum(dim=-1) 
+                    loss_contrast = (1.0 - cos_sim).mean()
+
                     if stage == 1:
                         loss_cls = ce_per_layer.mean()
                         loss_halt = torch.tensor(0.0, device=device)
-                        loss = loss_cls * 2
+                        
+                        # Add contrastive loss to Stage 1
+                        loss = (loss_cls * 2) + (0.1 * loss_contrast)
+                        
                         h = torch.zeros_like(halting_logits) 
 
                     elif stage == 2:
@@ -362,6 +346,8 @@ def train_loop(rank, flags):
                         lambda_now = flags["lambda_start"] + (flags["lambda_target"] - flags["lambda_start"]) * progress
                         loss_halt = lambda_now * halt_penalty.mean()
                         
+                        # Note: We do NOT typically add contrastive loss in Stage 2 (Frozen Backbone)
+                        # because 'z' is frozen. Only halting heads train here.
                         loss = loss_cls + loss_halt
 
                     # Optimization
@@ -390,8 +376,11 @@ def train_loop(rank, flags):
                     xm.master_print(f"STAGE {stage} | CHUNK {chunk_idx+1} | EPOCH {epoch+1}")
                     xm.master_print(f"  LR:         {current_lr:.2e}")
                     xm.master_print(f"  Total Loss: {loss_sum / num_cores:.4f}")
-                    xm.master_print(f"  Cls Loss:   {loss_cls_sum / num_cores:.4f} (Hybrid Hard+Soft)")
+                    xm.master_print(f"  Cls Loss:   {loss_cls_sum / num_cores:.4f}")
                     xm.master_print(f"  Halt Loss:  {loss_halt_sum / num_cores:.4f}")
+                    if stage == 1:
+                        loss_contrast_sum = xm.all_reduce(xm.REDUCE_SUM, loss_contrast)
+                        xm.master_print(f"  Contr Loss: {loss_contrast_sum / num_cores:.4f}")
                     
                     def format_sample(data, name):
                         if data is None: return f"  {name}: No sample found in first batch."
