@@ -115,7 +115,7 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
     xm.master_print(f"  Average Exit Layer: {avg_exit_layer:.2f} +/- {std_exit_layer:.2f} (0-23)")
     xm.master_print(f"  Median Exit Layer:  {med_exit_layer:.2f} (MAD: {mad_exit_layer:.2f})")
     
-    # --- Histogram Log ---
+    # --- Histogram Log (NEW) ---
     xm.master_print(f"  Exit Layer Distribution (0-23): {layer_exit_counts_cpu.long().tolist()}")
     
     xm.master_print(f"{'*'*80}\n")
@@ -243,9 +243,9 @@ def train_loop(rank, flags):
             if teacher_cls_full.shape[1] == 25:
                 teacher_cls_full = teacher_cls_full[:, 1:25, :]
             
-            # --- Data Slicing (12.5%) ---
+            # --- Data Slicing (15.6%) ---
             N_total_local = teacher_cls_full.shape[0]
-            N_target = (N_total_local // num_cores) * 4 
+            N_target = (N_total_local // num_cores) * 5 
 
             # Apply the slice to inputs, hard labels, AND soft targets
             teacher_cls_full = teacher_cls_full[:N_target]
@@ -253,7 +253,7 @@ def train_loop(rank, flags):
             teacher_log_probs_full = teacher_log_probs_full[:N_target] # Slicing the log_probs
 
             if rank == 0:
-                xm.master_print(f"Data Sliced: Using {N_target}/{N_total_local} samples ({N_target/N_total_local:.2%}) for 12.50% utilization.")
+                xm.master_print(f"Data Sliced: Using {N_target}/{N_total_local} samples ({N_target/N_total_local:.2%}) for 15.625% utilization.")
 
             # Class Weighting for Hard Labels
             neg_samples = (teacher_label_full == 0).sum().item()
@@ -325,7 +325,7 @@ def train_loop(rank, flags):
                         student_log_probs = F.log_softmax(
                              torch.stack([-class_logits_positive, class_logits_positive], dim=-1),
                              dim=-1
-                         )
+                          )
                     
                     loss_hard = bce_loss_fn(class_logits_positive, labels) # [B, L]
 
