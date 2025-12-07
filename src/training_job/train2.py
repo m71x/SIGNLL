@@ -362,7 +362,7 @@ def train_loop(rank, flags):
                         # --- GUMBEL-SOFTMAX FIX (#7) ---
                         # Use Gumbel-Softmax to sample exit layer probability distribution
                         # q shape: [B, L] - acts as probability mass function over layers
-                        q = F.gumbel_softmax(halting_logits, tau=1.0, hard=False, dim=-1)
+                        q = F.gumbel_softmax(halting_logits, tau=7.0, hard=False, dim=-1)
                         
                         # Weighted Classification Loss (Expected Loss)
                         loss_cls = (q * ce_per_layer).sum(dim=1).mean()
@@ -461,7 +461,7 @@ if __name__ == "__main__":
         "d_ctrl": 512,
         "transformer_layers": 4,
         "lr": 3e-4,
-        "batch_size": 64,   
+        "batch_size": 32,   
         "lambda_start": 0.0001,
         "lambda_target": 0.003,
         "epochs": 5,
