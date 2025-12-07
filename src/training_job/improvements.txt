@@ -19,3 +19,6 @@ Impact: High (Refining the Halting Decision) Currently, you use compute_q_from_h
 Enhancement: Use the Gumbel-Softmax trick.
 
 It allows you to sample a "hard" exit layer during the forward pass (keeping memory low) while remaining differentiable during the backward pass. This is often more stable than the cumulative product method for deep sequences.
+
+Next, start the new phase of training: use gumbel softmax to make the layer distribution less uniform, removing attention to layers that have close to 0 stopping samples.
+Once those layers are pruned, train again on the remaining layers
