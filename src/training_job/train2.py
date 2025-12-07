@@ -463,7 +463,7 @@ if __name__ == "__main__":
         "lr": 3e-4,
         "batch_size": 64,   
         "lambda_start": 0.0001,
-        "lambda_target": 0.003,
+        "lambda_target": 0.0025,
         "epochs": 5,
         "samples_per_shard": 39000, 
         "test_chunk": 29, 
