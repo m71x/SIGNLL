@@ -1,0 +1,1 @@
+1. sometimes, halting model plateaus (likely got stuck in a valley) and averages at layer 20 exit
