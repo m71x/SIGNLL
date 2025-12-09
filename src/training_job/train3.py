@@ -184,14 +184,21 @@ def train_loop(rank, flags):
         # Initialize log_lambda to correspond to a small start value (e.g. 0.001)
         # We perform a learnable update to find the optimal penalty.
         log_lambda = torch.tensor(torch.log(torch.tensor(0.001)), device=device, requires_grad=True)
-        target_depth = torch.tensor(15, device=device) # Target average depth of 12
+        target_depth = torch.tensor(15.0, device=device) # Target average depth of 15
         
-        # Add log_lambda to optimizer
-        params_to_optimize = [p for p in model.parameters() if p.requires_grad]
+        # --- OPTIMIZER FIX: Parameter Groups ---
+        # Apply weight decay to model weights, but NOT to log_lambda
+        
+        model_params = [p for p in model.parameters() if p.requires_grad]
+        optim_groups = [
+            {'params': model_params, 'weight_decay': 1e-2},
+        ]
+        
         if stage == 2:
-            params_to_optimize.append(log_lambda)
+            # Add log_lambda with 0.0 weight decay and potentially higher LR
+            optim_groups.append({'params': [log_lambda], 'weight_decay': 0.0, 'lr': 1e-2})
 
-        optimizer = optim.AdamW(params_to_optimize, lr=flags["lr"], weight_decay=1e-2) 
+        optimizer = optim.AdamW(optim_groups, lr=flags["lr"])
 
         # --- SCHEDULER SETUP ---
         total_steps_in_stage = 28 * flags["epochs"] * num_batches_per_chunk
@@ -263,7 +270,7 @@ def train_loop(rank, flags):
             teacher_log_probs_full = teacher_log_probs_full[:N_target] # Slicing the log_probs
 
             if rank == 0:
-                xm.master_print(f"Data Sliced: Using {N_target}/{N_total_local} samples ({N_target/N_total_local:.2%}) for 15.625% utilization.")
+                xm.master_print(f"Data Sliced: Using {N_target}/{N_total_local} samples ({N_target/N_total_local:.2%}) for 18.75% utilization.")
 
             # Class Weighting for Hard Labels
             neg_samples = (teacher_label_full == 0).sum().item()
@@ -371,7 +378,8 @@ def train_loop(rank, flags):
                     elif stage == 2:
                         # --- GUMBEL-SOFTMAX (Fix #7) ---
                         # Sample exit distribution
-                        q = F.gumbel_softmax(halting_logits, tau=22.0, hard=False, dim=-1)
+                        # Lowered Tau to 1.0 to avoid washout
+                        q = F.gumbel_softmax(halting_logits, tau=1.0, hard=False, dim=-1)
                         
                         # Weighted Classification Loss (Expected Loss)
                         loss_cls = (q * ce_per_layer).sum(dim=1).mean()
