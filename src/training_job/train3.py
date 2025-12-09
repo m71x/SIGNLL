@@ -253,9 +253,9 @@ def train_loop(rank, flags):
             if teacher_cls_full.shape[1] == 25:
                 teacher_cls_full = teacher_cls_full[:, 1:25, :]
             
-            # --- Data Slicing (15.6%) ---
+            # --- Data Slicing (18.75%) ---
             N_total_local = teacher_cls_full.shape[0]
-            N_target = (N_total_local // num_cores) * 5 
+            N_target = (N_total_local // num_cores) * 6 
 
             # Apply the slice to inputs, hard labels, AND soft targets
             teacher_cls_full = teacher_cls_full[:N_target]

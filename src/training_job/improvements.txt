@@ -23,4 +23,4 @@ It allows you to sample a "hard" exit layer during the forward pass (keeping mem
 Next, start the new phase of training: use gumbel softmax to make the layer distribution less uniform, removing attention to layers that have close to 0 stopping samples.
 Once those layers are pruned, train again on the remaining layers
 
-1. add contrastive loss to the halting function too
+1. add contrastive loss to the halting function too, using orthagonality regularization
