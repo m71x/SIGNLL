@@ -184,7 +184,7 @@ def train_loop(rank, flags):
         # Initialize log_lambda to correspond to a small start value (e.g. 0.001)
         # We perform a learnable update to find the optimal penalty.
         log_lambda = torch.tensor(torch.log(torch.tensor(0.001)), device=device, requires_grad=True)
-        target_depth = torch.tensor(7.75, device=device) # Target average depth of 12
+        target_depth = torch.tensor(9, device=device) # Target average depth of 12
         
         # Add log_lambda to optimizer
         params_to_optimize = [p for p in model.parameters() if p.requires_grad]
@@ -371,7 +371,7 @@ def train_loop(rank, flags):
                     elif stage == 2:
                         # --- GUMBEL-SOFTMAX (Fix #7) ---
                         # Sample exit distribution
-                        q = F.gumbel_softmax(halting_logits, tau=24.0, hard=False, dim=-1)
+                        q = F.gumbel_softmax(halting_logits, tau=22.0, hard=False, dim=-1)
                         
                         # Weighted Classification Loss (Expected Loss)
                         loss_cls = (q * ce_per_layer).sum(dim=1).mean()
