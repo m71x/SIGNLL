@@ -371,7 +371,7 @@ def train_loop(rank, flags):
                     elif stage == 2:
                         # --- GUMBEL-SOFTMAX (Fix #7) ---
                         # Sample exit distribution
-                        q = F.gumbel_softmax(halting_logits, tau=22.0, hard=False, dim=-1)
+                        q = F.gumbel_softmax(halting_logits, tau=20.0, hard=False, dim=-1)
                         
                         # Weighted Classification Loss (Expected Loss)
                         loss_cls = (q * ce_per_layer).sum(dim=1).mean()
