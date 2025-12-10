@@ -26,3 +26,4 @@ Once those layers are pruned, train again on the remaining layers
 1. add contrastive loss to the halting function too, using orthagonality regularization
 2. orthagonality reg seems to be messing up stage 2
 3. some class probabilities are a little bit concerning in stage 1
+4. still need to fix negative halting, it is not very diverse and seems to mainly exit at one layer toward the end
