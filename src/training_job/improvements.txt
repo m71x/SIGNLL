@@ -24,3 +24,5 @@ Next, start the new phase of training: use gumbel softmax to make the layer dist
 Once those layers are pruned, train again on the remaining layers
 
 1. add contrastive loss to the halting function too, using orthagonality regularization
+2. orthagonality reg seems to be messing up stage 2
+3. some class probabilities are a little bit concerning in stage 1
