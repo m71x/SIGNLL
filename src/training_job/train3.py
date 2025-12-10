@@ -182,7 +182,7 @@ def train_loop(rank, flags):
         
         # --- LAGRANGIAN PARAMETER ---
         log_lambda = torch.tensor(torch.log(torch.tensor(0.001)), device=device, requires_grad=True)
-        target_depth = torch.tensor(15.0, device=device) 
+        target_depth = torch.tensor(8.0, device=device) 
         
         # --- OPTIMIZER FIX: Parameter Groups ---
         model_params = [p for p in model.parameters() if p.requires_grad]
