@@ -182,7 +182,7 @@ def train_loop(rank, flags):
         
         # --- LAGRANGIAN PARAMETER ---
         log_lambda = torch.tensor(torch.log(torch.tensor(0.001)), device=device, requires_grad=True)
-        target_depth = torch.tensor(6.0, device=device) # Keeping this consistent with your setup
+        target_depth = torch.tensor(15.0, device=device) 
         
         # --- OPTIMIZER FIX: Parameter Groups ---
         model_params = [p for p in model.parameters() if p.requires_grad]
@@ -225,7 +225,7 @@ def train_loop(rank, flags):
             teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
             teacher_label_full = torch.from_numpy(data['classifications']).long()
             
-            # --- Soft Targets Loading/Synthesis ---
+            # --- START ENHANCEMENT 9: Soft Targets Loading/Synthesis ---
             if 'teacher_logits' in data:
                 t_logits = torch.from_numpy(data['teacher_logits']).float()
                 T_distill = 2.0
@@ -284,7 +284,6 @@ def train_loop(rank, flags):
                     # Forward Pass
                     halting_logits, class_logits, z = model(teacher_cls) 
                     
-                    # --- Diagnostics ---
                     if rank == 0 and batch_idx == 0:
                         def extract_sample(label_val):
                             indices = (teacher_label == label_val).nonzero(as_tuple=True)[0]
@@ -296,12 +295,12 @@ def train_loop(rank, flags):
                                     'lbl': teacher_label[idx].detach().cpu()
                                 }
                             return None
+                        
                         diag_sample_pos = extract_sample(1)
                         diag_sample_neg = extract_sample(0)
 
                     # --- LOSS CALCULATION ---
                     
-                    # A. Hard Label Loss
                     labels = teacher_label.float().unsqueeze(1).expand(-1, L)
                     if class_logits.size(-1) == 2:
                         class_logits_positive = class_logits[:, :, 1]
@@ -315,7 +314,6 @@ def train_loop(rank, flags):
                     
                     loss_hard = bce_loss_fn(class_logits_positive, labels)
 
-                    # B. Knowledge Distillation Loss
                     teacher_log_probs_expanded = teacher_log_probs.unsqueeze(1).expand(-1, L, -1)
                     kl_elementwise = teacher_log_probs_expanded.exp() * (teacher_log_probs_expanded - student_log_probs)
                     loss_soft = kl_elementwise.sum(dim=-1)
@@ -323,7 +321,6 @@ def train_loop(rank, flags):
                     alpha = 0.5
                     ce_per_layer = (alpha * loss_hard) + ((1 - alpha) * loss_soft)
 
-                    # C. Contrastive Layer Learning (Smoothness)
                     loss_contrast = F.mse_loss(z[:, 1:, :], z[:, :-1, :])
 
                     if stage == 1:
@@ -332,41 +329,30 @@ def train_loop(rank, flags):
                         loss = (loss_cls * 2) + (0.1 * loss_contrast)
 
                     elif stage == 2:
-                        # --- ENHANCEMENT 1: Increased Temperature ---
-                        # Tau=5.0 softens the distribution, allowing more layers to get gradients
+                        # --- ENHANCEMENT 1: Increased Temperature (Tau=5.0) ---
+                        # Softens the distribution to spread probability mass
                         q = F.gumbel_softmax(halting_logits, tau=5.0, hard=False, dim=-1)
                         
                         loss_cls = (q * ce_per_layer).sum(dim=1).mean()
                         
                         # --- ENHANCEMENT 2: Entropy Regularization ---
-                        # Penalize low entropy to discourage "spiky" single-layer choices
-                        # Maximize Entropy H(q) = - sum(q * log(q))
-                        # Loss term = - H(q) = sum(q * log(q))
-                        # We calculate entropy on the PROBABILITIES from the halting_logits
-                        """
+                        # Penalize low entropy to discourage "spiky" distributions
                         h_probs = F.softmax(halting_logits, dim=-1)
                         entropy = - (h_probs * (h_probs + 1e-9).log()).sum(dim=-1).mean()
-                        # We subtract entropy from loss (minimize negative entropy)
-                        loss_entropy = - 0.05 * entropy # Weight 0.05
-                        """
+                        loss_entropy = - 0.05 * entropy 
+
                         # --- LAGRANGIAN PONDER LOSS ---
                         depths = (torch.arange(1, L + 1, device=device).float()).unsqueeze(0)
                         expected_depth = (q * depths).sum(dim=1).mean()
                         
                         lambda_val = torch.exp(log_lambda)
+                        
                         loss_ponder = lambda_val.detach() * expected_depth
                         loss_constraint = - lambda_val * (expected_depth.detach() - target_depth)
                         
-                        # --- ENHANCEMENT 3: Orthogonality Regularization ---
-                        # Force halting heads to learn distinct features
-                        # Stack all halting head weights: Shape [L, d_ctrl]
-                        head_weights = torch.cat([head.weight for head in model.halting_heads], dim=0)
-                        head_weights_norm = F.normalize(head_weights, p=2, dim=1)
-                        sim_matrix = torch.mm(head_weights_norm, head_weights_norm.t())
-                        identity = torch.eye(model.L, device=device)
-                        loss_ortho = ((sim_matrix - identity) ** 2).sum() * 0.1
+                        # (Orthogonality Regularization REMOVED as requested)
 
-                        loss = loss_cls + loss_ponder + loss_constraint + loss_ortho
+                        loss = loss_cls + loss_ponder + loss_constraint + loss_entropy
 
                     optimizer.zero_grad()
                     loss.backward()
@@ -375,7 +361,6 @@ def train_loop(rank, flags):
                     scheduler.step()
                     xm.mark_step()
 
-                # --- End of Epoch Aggregation ---
                 loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
                 loss_cls_sum = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
                 
@@ -386,7 +371,6 @@ def train_loop(rank, flags):
                 
                 xm.rendezvous(f"ep_end_st{stage}_ch{chunk_idx}_ep{epoch}")
                 
-                # --- Rank 0 Logging ---
                 if rank == 0:
                     elapsed = time.time() - start_time
                     current_lr = scheduler.get_last_lr()[0]
@@ -397,7 +381,7 @@ def train_loop(rank, flags):
                     xm.master_print(f"  Cls Loss:   {loss_cls_sum / num_cores:.4f}")
                     if stage == 2:
                         curr_lambda = torch.exp(log_lambda).item()
-                        xm.master_print(f"  Lambda:     {curr_lambda:.6f}")
+                        xm.master_print(f"  Lambda:     {curr_lambda:.6f} (Dynamic)")
                         xm.master_print(f"  Ponder:     {loss_halt_sum / num_cores:.4f}")
                     else:
                         xm.master_print(f"  Halt Loss:  {loss_halt_sum / num_cores:.4f}")
