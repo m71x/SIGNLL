@@ -63,6 +63,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all \
   --command="pkill -f -u mikexi python3"
   
+
 #clone xla onto all workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
