@@ -379,7 +379,7 @@ def train_loop(rank, flags):
                         # --- GUMBEL-SOFTMAX (Fix #7) ---
                         # Sample exit distribution
                         # Lowered Tau to 1.0 to avoid washout
-                        q = F.gumbel_softmax(halting_logits, tau=1.0, hard=False, dim=-1)
+                        q = F.gumbel_softmax(halting_logits, tau=5.0, hard=False, dim=-1)
                         
                         # Weighted Classification Loss (Expected Loss)
                         loss_cls = (q * ce_per_layer).sum(dim=1).mean()
