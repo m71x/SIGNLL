@@ -343,11 +343,12 @@ def train_loop(rank, flags):
                         # Maximize Entropy H(q) = - sum(q * log(q))
                         # Loss term = - H(q) = sum(q * log(q))
                         # We calculate entropy on the PROBABILITIES from the halting_logits
+                        """
                         h_probs = F.softmax(halting_logits, dim=-1)
                         entropy = - (h_probs * (h_probs + 1e-9).log()).sum(dim=-1).mean()
                         # We subtract entropy from loss (minimize negative entropy)
                         loss_entropy = - 0.05 * entropy # Weight 0.05
-
+                        """
                         # --- LAGRANGIAN PONDER LOSS ---
                         depths = (torch.arange(1, L + 1, device=device).float()).unsqueeze(0)
                         expected_depth = (q * depths).sum(dim=1).mean()
@@ -365,7 +366,7 @@ def train_loop(rank, flags):
                         identity = torch.eye(model.L, device=device)
                         loss_ortho = ((sim_matrix - identity) ** 2).sum() * 0.1
 
-                        loss = loss_cls + loss_ponder + loss_constraint + loss_entropy + loss_ortho
+                        loss = loss_cls + loss_ponder + loss_constraint + loss_ortho
 
                     optimizer.zero_grad()
                     loss.backward()
