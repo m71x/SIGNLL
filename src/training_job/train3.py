@@ -180,22 +180,17 @@ def train_loop(rank, flags):
             xm.master_print(f"STARTING {stage_name}")
             xm.master_print(f"{'#'*80}")
         
-        # --- LAGRANGIAN PARAMETER (Fix #6) ---
-        # Initialize log_lambda to correspond to a small start value (e.g. 0.001)
-        # We perform a learnable update to find the optimal penalty.
+        # --- LAGRANGIAN PARAMETER ---
         log_lambda = torch.tensor(torch.log(torch.tensor(0.001)), device=device, requires_grad=True)
-        target_depth = torch.tensor(12.0, device=device) # Target average depth of 15
+        target_depth = torch.tensor(15.0, device=device) # Keeping this consistent with your setup
         
         # --- OPTIMIZER FIX: Parameter Groups ---
-        # Apply weight decay to model weights, but NOT to log_lambda
-        
         model_params = [p for p in model.parameters() if p.requires_grad]
         optim_groups = [
             {'params': model_params, 'weight_decay': 1e-2},
         ]
         
         if stage == 2:
-            # Add log_lambda with 0.0 weight decay and potentially higher LR
             optim_groups.append({'params': [log_lambda], 'weight_decay': 0.0, 'lr': 1e-2})
 
         optimizer = optim.AdamW(optim_groups, lr=flags["lr"])
@@ -230,32 +225,20 @@ def train_loop(rank, flags):
             teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
             teacher_label_full = torch.from_numpy(data['classifications']).long()
             
-            # --- START ENHANCEMENT 9: Soft Targets Loading/Synthesis ---
-            # Try to find logits in the data. If missing, synthesize smoothed targets.
+            # --- Soft Targets Loading/Synthesis ---
             if 'teacher_logits' in data:
-                # Assuming logits are [N, 2] or [N, num_classes]
                 t_logits = torch.from_numpy(data['teacher_logits']).float()
-                # Apply Temperature T=2.0 for distillation
                 T_distill = 2.0
-                # Use log_softmax for target preparation (for log_target=True)
                 teacher_log_probs_full = F.log_softmax(t_logits / T_distill, dim=-1)
-                using_real_logits = True
             else:
-                # Fallback: Create log-smoothed labels from hard labels
-                # (Standard Label Smoothing acts as "distillation from uniform noise")
                 num_classes = 2
                 smoothing = 0.1
-                # Create one-hot
                 t_one_hot = torch.zeros(teacher_label_full.size(0), num_classes).scatter_(1, teacher_label_full.unsqueeze(1), 1)
-                # Smooth
                 teacher_probs_full = t_one_hot * (1.0 - smoothing) + (smoothing / num_classes)
-                # Convert to log probabilities for log_target=True
                 teacher_log_probs_full = torch.log(teacher_probs_full)
-                using_real_logits = False
                 
                 if rank == 0 and chunk_idx == 0:
                     xm.master_print("  [Note] 'teacher_logits' not found. Using synthesized Soft Targets (Label Smoothing=0.1).")
-            # ----------------------------------------------------------
 
             if teacher_cls_full.shape[1] == 25:
                 teacher_cls_full = teacher_cls_full[:, 1:25, :]
@@ -264,31 +247,22 @@ def train_loop(rank, flags):
             N_total_local = teacher_cls_full.shape[0]
             N_target = (N_total_local // num_cores) * 6 
 
-            # Apply the slice to inputs, hard labels, AND soft targets
             teacher_cls_full = teacher_cls_full[:N_target]
             teacher_label_full = teacher_label_full[:N_target]
-            teacher_log_probs_full = teacher_log_probs_full[:N_target] # Slicing the log_probs
+            teacher_log_probs_full = teacher_log_probs_full[:N_target] 
 
             if rank == 0:
                 xm.master_print(f"Data Sliced: Using {N_target}/{N_total_local} samples ({N_target/N_total_local:.2%}) for 18.75% utilization.")
 
-            # Class Weighting for Hard Labels
+            # Class Weighting
             neg_samples = (teacher_label_full == 0).sum().item()
             pos_samples = (teacher_label_full == 1).sum().item()
             pos_weight_val = neg_samples / (pos_samples + 1e-6)
             pos_weight_tensor = torch.tensor([pos_weight_val]).float().to(device)
 
-            # Define Losses
-            # 1. Hard Label Loss (BCE)
             bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight_tensor).to(device)
             
-            # 2. Knowledge Distillation Loss (REPLACED WITH MANUAL XLA COMPATIBLE VERSION IN LOOP)
-            # We previously used nn.KLDivLoss here, but it caused Autograd warnings on XLA.
-            
-            # Create Dataset with Log Soft Targets
             dataset = TensorDataset(teacher_cls_full, teacher_label_full, teacher_log_probs_full)
-            
-            # Use RandomSampler to shuffle
             sampler = RandomSampler(dataset)
             
             data_loader = DataLoader(dataset, sampler=sampler, batch_size=flags["batch_size"], drop_last=True, num_workers=2)
@@ -297,7 +271,6 @@ def train_loop(rank, flags):
             for epoch in range(flags["epochs"]):
                 model.train()
                 
-                # Reset diagnostic holders
                 diag_sample_pos = None
                 diag_sample_neg = None
 
@@ -306,14 +279,12 @@ def train_loop(rank, flags):
                     
                     teacher_cls = teacher_cls.to(device)
                     teacher_label = teacher_label.to(device)
-                    teacher_log_probs = teacher_log_probs.to(device) # [B, 2]
+                    teacher_log_probs = teacher_log_probs.to(device)
                     
                     # Forward Pass
-                    # MODIFIED: Capture z for Contrastive Learning
-                    halting_logits, class_logits, z = model(teacher_cls) # class_logits: [B, L, 2]
+                    halting_logits, class_logits, z = model(teacher_cls) 
                     
-                    # --- Capture Diagnostics (Rank 0, First Batch Only) ---
-                    # KEEPING DEBUG OUTPUTS AS REQUESTED
+                    # --- Diagnostics ---
                     if rank == 0 and batch_idx == 0:
                         def extract_sample(label_val):
                             indices = (teacher_label == label_val).nonzero(as_tuple=True)[0]
@@ -325,102 +296,89 @@ def train_loop(rank, flags):
                                     'lbl': teacher_label[idx].detach().cpu()
                                 }
                             return None
-                        
                         diag_sample_pos = extract_sample(1)
                         diag_sample_neg = extract_sample(0)
 
                     # --- LOSS CALCULATION ---
                     
-                    # A. Hard Label Loss (Standard)
+                    # A. Hard Label Loss
                     labels = teacher_label.float().unsqueeze(1).expand(-1, L)
-                    # Use class 1 logits for BCE
                     if class_logits.size(-1) == 2:
                         class_logits_positive = class_logits[:, :, 1]
-                        # For KD, we need the full Log Softmax [B, L, 2]
                         student_log_probs = F.log_softmax(class_logits, dim=-1)
                     else:
                         class_logits_positive = class_logits.squeeze(-1)
-                        # Fallback for log_probs (should not happen with num_classes=2)
                         student_log_probs = F.log_softmax(
                              torch.stack([-class_logits_positive, class_logits_positive], dim=-1),
                              dim=-1
                           )
                     
-                    loss_hard = bce_loss_fn(class_logits_positive, labels) # [B, L]
+                    loss_hard = bce_loss_fn(class_logits_positive, labels)
 
-                    # B. Knowledge Distillation Loss [FIXED FOR XLA]
-                    # Expand teacher log_probs to match student layers: [B, 2] -> [B, L, 2]
+                    # B. Knowledge Distillation Loss
                     teacher_log_probs_expanded = teacher_log_probs.unsqueeze(1).expand(-1, L, -1)
-                    
-                    # MANUAL KL Divergence for log_target=True
-                    # Formula: exp(target) * (target - input)
-                    # This replaces nn.KLDivLoss to avoid XLA Autograd warnings.
                     kl_elementwise = teacher_log_probs_expanded.exp() * (teacher_log_probs_expanded - student_log_probs)
-                    loss_soft = kl_elementwise.sum(dim=-1) # [B, L]
+                    loss_soft = kl_elementwise.sum(dim=-1)
 
-                    # Combined Classification Loss per layer
-                    # Alpha: Balance between Hard and Soft. 0.5 is a standard starting point.
                     alpha = 0.5
                     ce_per_layer = (alpha * loss_hard) + ((1 - alpha) * loss_soft)
 
-                    # C. Contrastive Layer Learning (Fix #4: Smoothness Penalty)
-                    # Use MSE instead of Cosine Similarity for XLA Stability (prevents division by zero/hanging)
-                    # Penalize the difference between latent states z[t] and z[t+1]
+                    # C. Contrastive Layer Learning (Smoothness)
                     loss_contrast = F.mse_loss(z[:, 1:, :], z[:, :-1, :])
 
                     if stage == 1:
                         loss_cls = ce_per_layer.mean()
                         loss_halt = torch.tensor(0.0, device=device)
-                        
-                        # Add Contrastive Loss (Smoothness) to Stage 1
                         loss = (loss_cls * 2) + (0.1 * loss_contrast)
 
                     elif stage == 2:
-                        # --- GUMBEL-SOFTMAX (Fix #7) ---
-                        # Sample exit distribution
-                        # Lowered Tau to 1.0 to avoid washout
-                        q = F.gumbel_softmax(halting_logits, tau=1.0, hard=False, dim=-1)
+                        # --- ENHANCEMENT 1: Increased Temperature ---
+                        # Tau=5.0 softens the distribution, allowing more layers to get gradients
+                        q = F.gumbel_softmax(halting_logits, tau=5.0, hard=False, dim=-1)
                         
-                        # Weighted Classification Loss (Expected Loss)
                         loss_cls = (q * ce_per_layer).sum(dim=1).mean()
                         
-                        # --- LAGRANGIAN PONDER LOSS (Fix #6) ---
-                        # Ponder Cost = Expected Depth
+                        # --- ENHANCEMENT 2: Entropy Regularization ---
+                        # Penalize low entropy to discourage "spiky" single-layer choices
+                        # Maximize Entropy H(q) = - sum(q * log(q))
+                        # Loss term = - H(q) = sum(q * log(q))
+                        # We calculate entropy on the PROBABILITIES from the halting_logits
+                        h_probs = F.softmax(halting_logits, dim=-1)
+                        entropy = - (h_probs * (h_probs + 1e-9).log()).sum(dim=-1).mean()
+                        # We subtract entropy from loss (minimize negative entropy)
+                        loss_entropy = - 0.05 * entropy # Weight 0.05
+
+                        # --- LAGRANGIAN PONDER LOSS ---
                         depths = (torch.arange(1, L + 1, device=device).float()).unsqueeze(0)
                         expected_depth = (q * depths).sum(dim=1).mean()
                         
-                        # Get current lambda value
                         lambda_val = torch.exp(log_lambda)
-                        
-                        # 1. Main Loss Term: Penalize model for high depth
                         loss_ponder = lambda_val.detach() * expected_depth
-                        
-                        # 2. Lagrangian Constraint Term: Adjust lambda to match target
-                        # We want to MAXIMIZE lambda * (depth - target).
-                        # Equivalent to MINIMIZING -lambda * (depth - target)
-                        # We detach expected_depth so the model doesn't try to "trick" the constraint
                         loss_constraint = - lambda_val * (expected_depth.detach() - target_depth)
                         
-                        loss = loss_cls + loss_ponder + loss_constraint
+                        # --- ENHANCEMENT 3: Orthogonality Regularization ---
+                        # Force halting heads to learn distinct features
+                        # Stack all halting head weights: Shape [L, d_ctrl]
+                        head_weights = torch.cat([head.weight for head in model.halting_heads], dim=0)
+                        head_weights_norm = F.normalize(head_weights, p=2, dim=1)
+                        sim_matrix = torch.mm(head_weights_norm, head_weights_norm.t())
+                        identity = torch.eye(model.L, device=device)
+                        loss_ortho = ((sim_matrix - identity) ** 2).sum() * 0.1
 
-                    # Optimization
+                        loss = loss_cls + loss_ponder + loss_constraint + loss_entropy + loss_ortho
+
                     optimizer.zero_grad()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     xm.optimizer_step(optimizer)
-                    
-                    # Scheduler Step
                     scheduler.step()
-                    
                     xm.mark_step()
 
                 # --- End of Epoch Aggregation ---
                 loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
                 loss_cls_sum = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
                 
-                # For logging, we just want the model's perceived halt loss
                 if stage == 2:
-                    # Log the ponder part
                     loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_ponder)
                 else:
                     loss_halt_sum = torch.tensor(0.0)
@@ -435,12 +393,11 @@ def train_loop(rank, flags):
                     xm.master_print(f"STAGE {stage} | CHUNK {chunk_idx+1} | EPOCH {epoch+1}")
                     xm.master_print(f"  LR:         {current_lr:.2e}")
                     xm.master_print(f"  Total Loss: {loss_sum / num_cores:.4f}")
-                    xm.master_print(f"  Cls Loss:   {loss_cls_sum / num_cores:.4f} (Hybrid Hard+Soft)")
+                    xm.master_print(f"  Cls Loss:   {loss_cls_sum / num_cores:.4f}")
                     if stage == 2:
-                        # Log Lambda and Depth
                         curr_lambda = torch.exp(log_lambda).item()
-                        xm.master_print(f"  Lambda:     {curr_lambda:.6f} (Dynamic)")
-                        xm.master_print(f"  Ponder Loss:{loss_halt_sum / num_cores:.4f}")
+                        xm.master_print(f"  Lambda:     {curr_lambda:.6f}")
+                        xm.master_print(f"  Ponder:     {loss_halt_sum / num_cores:.4f}")
                     else:
                         xm.master_print(f"  Halt Loss:  {loss_halt_sum / num_cores:.4f}")
                     
@@ -460,15 +417,12 @@ def train_loop(rank, flags):
                     xm.master_print(format_sample(diag_sample_pos, "Sample POS"))
                     xm.master_print(format_sample(diag_sample_neg, "Sample NEG"))
 
-            # Checkpoint
             if (chunk_idx + 1) % 5 == 0 and rank == 0:
                 torch.save(model.state_dict(), f"/tmp/controller_stage{stage}_chunk{chunk_idx+1}.pt")
                 xm.master_print("Saved Checkpoint.")
 
             xm.rendezvous(f"chunk_end_st{stage}_ch{chunk_idx}")
 
-
-    # Final Save and Evaluation
     if rank == 0:
         torch.save(model.state_dict(), "/tmp/controller_final_stage2.pt")
         xm.master_print("✅ Training Complete.")
