@@ -1,78 +1,135 @@
-#train.py
 import os, time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts 
+
+from torch.utils.data import TensorDataset, DataLoader, SequentialSampler, RandomSampler
+from torch.utils.data.distributed import DistributedSampler
 
 from controller_model import Controller, compute_q_from_h
 from training_data_download import training_data_download
 
-#summary of existing issues:
-# .item() -> fixed
-# trying to shuffle data through some weird function even though it is already shuffled -> fixed
-#memory overusage ->fixed
-#worker 3 always failing ->fixed
-#speed ->fixed
-#deadlock with master_print, make sure synchronization through rendevous and mark step -> fixed
-#halt loss is not computing correctly, it seems like it is always 0 ->fixed
-#implement weight averaging after update: gradients are reduced (summed or averaged) across all replicas, and then all replicas update their model parameters identically. ->fixed
-#consider using 6 transformer layers instead of 4 to get more nuance
-#figure out why code seems to run on a variable amount of cores 25-30 every time you run -> fixed
-def train_loop(rank, flags):
-    device = xm.torch_xla.device()
+# =========================================================================
+# EVALUATION FUNCTION (Unchanged)
+# =========================================================================
+def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_shard):
+    """
+    Tests the model on a specific chunk using an early-exit strategy.
+    Runs ONLY on Device 0.
+    """
+    if rank != 0:
+        return
+
+    device = xm.xla_device()
     
-    # Get actual number of cores (don't hardcode!)
-    num_cores = xm.xrt_world_size()
+    xm.master_print(f"\n{'*'*80}")
+    xm.master_print(f"*** STARTING EVALUATION ON CHUNK {chunk_idx} (Device 0 Only) ***")
+    xm.master_print(f"{'*'*80}")
+
+    model.eval()
     
-    if rank == 0:
-        xm.master_print(f"Detected {num_cores} active cores")
-        xm.master_print(f"Starting training with {flags['samples_per_shard']} samples per core")
-    
-    # --- Load Data Once (Outside Training Loop) ---
-    print(f"[Core {rank}] Loading training data from GCS...")
-    
-    # Each core loads its own shard
+    current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
     data = training_data_download(
-        core_id=rank,
-        filename=flags["chunk_filename"],
-        max_entries=flags["samples_per_shard"]
+        core_id=0, 
+        filename=current_chunk_filename,
+        max_entries=samples_per_shard
     )
     
     if data is None:
-        raise RuntimeError(f"[Core {rank}] Failed to load training data")
+        xm.master_print(f"[Core {rank}] Failed to load test data for chunk {chunk_idx}")
+        return
+
+    teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
+    teacher_label_full = torch.from_numpy(data['classifications']).long()
     
-    print(f"[Core {rank}] Data loaded from GCS")
-    
-    # CRITICAL: Wait for all cores to finish loading before proceeding
-    xm.rendezvous("data_loaded")
-    
-    # Convert to torch tensors and move to XLA device
-    print(f"[Core {rank}] Converting to torch tensors...")
-    teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float().to(device)
-    teacher_label_full = torch.from_numpy(data['classifications']).long().to(device)
-    
-    # Handle layer slicing if needed (remove layer 0 if data has 25 layers)
     if teacher_cls_full.shape[1] == 25:
-        teacher_cls_full = teacher_cls_full[:, 1:25, :]  # Keep layers 1-24
-    elif teacher_cls_full.shape[1] != 24:
-        raise ValueError(f"Unexpected number of layers: {teacher_cls_full.shape[1]}")
+        teacher_cls_full = teacher_cls_full[:, 1:25, :]
     
-    num_samples = teacher_cls_full.shape[0]
+    dataset = TensorDataset(teacher_cls_full, teacher_label_full)
+    sampler = SequentialSampler(dataset)
     
-    print(f"[Core {rank}] Data ready: {num_samples} samples")
+    data_loader = DataLoader(
+        dataset,
+        sampler=sampler,
+        batch_size=batch_size,
+        drop_last=False,
+        num_workers=2
+    )
     
-    # Wait for all cores to finish data preparation
-    xm.rendezvous("data_prepared")
+    total_samples = 0
+    total_correct = 0
+    layer_exit_counts_cpu = torch.zeros(24, dtype=torch.float32)
+
+    with torch.no_grad():
+        for i, (teacher_cls, teacher_label) in enumerate(data_loader):
+            teacher_cls = teacher_cls.to(device)
+            teacher_label = teacher_label.to(device)
+            
+            halting_logits, class_logits, _ = model(teacher_cls)
+            
+            h_probs = torch.sigmoid(halting_logits)
+            threshold_mask = (h_probs > threshold)
+            
+            exit_indices = torch.argmax(threshold_mask.long(), dim=1)
+            row_has_exit = threshold_mask.any(dim=1)
+            exit_indices[~row_has_exit] = 23
+            
+            batch_indices = torch.arange(class_logits.size(0), device=device)
+            selected_logits = class_logits[batch_indices, exit_indices]
+            predictions = torch.argmax(selected_logits, dim=-1)
+            
+            correct_tensor = (predictions == teacher_label).sum()
+            total_correct += correct_tensor.item() 
+            total_samples += teacher_label.size(0)
+            
+            exit_indices_cpu = exit_indices.cpu()
+            unique_exits, counts = torch.unique(exit_indices_cpu, return_counts=True)
+            layer_exit_counts_cpu.index_add_(0, unique_exits, counts.float())
+            
+            xm.mark_step()
+            
+            if i % 100 == 0:
+                print(f"[Eval] Processed batch {i}...")
+            
+    accuracy = (total_correct / total_samples) * 100.0
     
-    if rank == 0:
-        xm.master_print(f"All {num_cores} cores have loaded data successfully")
-        xm.master_print(f"CLS tokens shape: {teacher_cls_full.shape}")
-        xm.master_print(f"Labels shape: {teacher_label_full.shape}")
+    # --- Statistics Calculation ---
+    layers = torch.arange(24, dtype=torch.float32)
+    avg_exit_layer = (layer_exit_counts_cpu * layers).sum() / total_samples
+    variance = (layer_exit_counts_cpu * (layers - avg_exit_layer).pow(2)).sum() / total_samples
+    std_exit_layer = torch.sqrt(variance)
     
-    # --- Initialize Model ---
-    print(f"[Core {rank}] Initializing model...")
+    # --- MAD Calculation ---
+    counts_int = layer_exit_counts_cpu.long()
+    all_exit_layers = torch.repeat_interleave(layers, counts_int)
+    med_exit_layer = all_exit_layers.median()
+    abs_dev = torch.abs(all_exit_layers - med_exit_layer)
+    mad_exit_layer = abs_dev.median()
+    
+    xm.master_print(f"RESULTS FOR CHUNK {chunk_idx} (Threshold: {threshold}):")
+    xm.master_print(f"  Accuracy: {accuracy:.2f}% ({total_correct}/{total_samples})")
+    xm.master_print(f"  Average Exit Layer: {avg_exit_layer:.2f} +/- {std_exit_layer:.2f} (0-23)")
+    xm.master_print(f"  Median Exit Layer:  {med_exit_layer:.2f} (MAD: {mad_exit_layer:.2f})")
+    
+    # --- Histogram Log (NEW) ---
+    xm.master_print(f"  Exit Layer Distribution (0-23): {layer_exit_counts_cpu.long().tolist()}")
+    
+    xm.master_print(f"{'*'*80}\n")
+
+    model.train() 
+
+# =========================================================================
+# TRAINING LOOP 
+# =========================================================================
+def train_loop(rank, flags):
+    device = xm.torch_xla.device()
+    num_cores = xm.xrt_world_size()
+    
+    # 1. Model Initialization
     L = 24
     model = Controller(
         L=L,
@@ -82,202 +139,299 @@ def train_loop(rank, flags):
         num_classes=2
     ).to(device)
     
-    print(f"[Core {rank}] Model initialized")
-    
-    # ========== CRITICAL: SYNCHRONIZE INITIAL WEIGHTS ==========
-    if rank == 0:
-        xm.master_print("Synchronizing initial weights across all cores...")
-    
-    # Use DYNAMIC num_cores, not hardcoded!
+    # Sync initial weights
+    if rank == 0: xm.master_print("Synchronizing initial weights...")
     for param in model.parameters():
-        if rank == 0:
-            param.data = param.data * num_cores
-        else:
-            param.data = param.data * 0
-        
-        param.data = xm.all_reduce(xm.REDUCE_SUM, param.data)
-        param.data = param.data / num_cores
-    
-    xm.mark_step()
-    xm.rendezvous("weights_synced")
-    
-    if rank == 0:
-        xm.master_print("✅ Initial weights synchronized across all cores")
-    
-    # ========== VERIFY INITIAL WEIGHT SYNC (Keep for debugging initial state) ==========
-    param_checks = []
-    for i, param in enumerate(model.parameters()):
-        if i >= 3:
-            break
-        param_element = param.flatten()[0]
-        param_sum = xm.all_reduce(xm.REDUCE_SUM, param_element)
-        param_checks.append((param_sum, param_element))
-    
+        param.data = xm.all_reduce(xm.REDUCE_SUM, param.data) / num_cores
     xm.mark_step()
     
-    if rank == 0:
-        xm.master_print("=" * 80)
-        xm.master_print("INITIAL WEIGHT SYNC VERIFICATION")
-        xm.master_print("=" * 80)
-        for i, (param_sum, param_element) in enumerate(param_checks):
-            expected_sum = param_element * num_cores
-            diff = param_sum - expected_sum
-            xm.master_print(f"Parameter {i}: Difference = {diff:.6f}")
-        xm.master_print("=" * 80)
-    
-    xm.rendezvous("verify_weights")
-    
-    # NOW continue with optimizer initialization
-    optimizer = optim.AdamW(model.parameters(), lr=flags["lr"], weight_decay=1e-2)
-    bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none")
-    
-    # --- Training Configuration ---
-    num_epochs = flags["epochs"]
-    lambda_start, lambda_target = flags["lambda_start"], flags["lambda_target"]
-    batch_size = flags["batch_size"]
-    total_steps = num_epochs * (num_samples // batch_size)
-    
-    # Calculate number of batches per epoch
-    num_batches = num_samples // batch_size
-    
-    if rank == 0:
-        xm.master_print(f"Training config: {num_epochs} epochs, {num_batches} batches/epoch, batch_size={batch_size}")
-        xm.master_print(f"Total global samples: {num_samples * num_cores}")
-        xm.master_print(f"Total steps: {total_steps}")
-    
+    # Initial Rendezvous
+    xm.rendezvous("weights_synced") 
+
+    # Calculate step counts
+    total_samples = flags["samples_per_shard"]
+    num_batches_per_chunk = total_samples // flags["batch_size"]
+    total_steps_stage_2 = flags["epochs"] * 29 * num_batches_per_chunk
     global_step = 0
     start_time = time.time()
-    
-    # --- Full Training Loop ---
-    model.train()
-    
-    for epoch in range(num_epochs): # MODIFICATION 1: Iterate over all epochs
-        if rank == 0:
-            xm.master_print(f"\n--- Epoch {epoch + 1}/{num_epochs} ---")
+
+    # Placeholders for sample diagnostics (Rank 0 only)
+    diag_sample_pos = None
+    diag_sample_neg = None
+
+    # =========================================================================
+    # STAGE LOOP: 1 -> Backbone/Classifiers, 2 -> Halting Heads
+    # =========================================================================
+    for stage in [1, 2]:
         
-        for batch_idx in range(num_batches): # MODIFICATION 2: Iterate over all batches
+        # --- PHASE SETUP ---
+        if stage == 1:
+            stage_name = "STAGE 1: Backbone & Classifiers (Halting IGNORED)"
+            for param in model.parameters(): param.requires_grad = True
+            for param in model.halting_heads.parameters(): param.requires_grad = False
             
-            # MODIFICATION 3: Implement batch slicing
-            start_idx = batch_idx * batch_size
-            end_idx = min((batch_idx + 1) * batch_size, num_samples)
+        elif stage == 2:
+            stage_name = "STAGE 2: Halting Heads Only (Backbone & Classifiers FROZEN)"
+            for param in model.parameters(): param.requires_grad = False
+            for param in model.halting_heads.parameters(): param.requires_grad = True
+
+        if rank == 0:
+            xm.master_print(f"\n{'#'*80}")
+            xm.master_print(f"STARTING {stage_name}")
+            xm.master_print(f"{'#'*80}")
+        
+        # --- LAGRANGIAN PARAMETER ---
+        log_lambda = torch.tensor(torch.log(torch.tensor(0.001)), device=device, requires_grad=True)
+        # Using a balanced target depth
+        target_depth = torch.tensor(7.0, device=device) 
+        
+        # --- HYPERPARAMETER: Classification Loss Multiplier ---
+        cls_weight = 10.0
+        
+        # --- OPTIMIZER FIX: Parameter Groups ---
+        model_params = [p for p in model.parameters() if p.requires_grad]
+        optim_groups = [
+            {'params': model_params, 'weight_decay': 1e-2},
+        ]
+        
+        if stage == 2:
+            # Low LR for lambda to ensure stability
+            optim_groups.append({'params': [log_lambda], 'weight_decay': 0.0, 'lr': 1e-4})
+
+        optimizer = optim.AdamW(optim_groups, lr=flags["lr"])
+
+        # --- SCHEDULER SETUP ---
+        total_steps_in_stage = 28 * flags["epochs"] * num_batches_per_chunk
+        T_0 = total_steps_in_stage // 4
+        scheduler = CosineAnnealingWarmRestarts(
+            optimizer, 
+            T_0=T_0, 
+            T_mult=1,   
+            eta_min=1e-6
+        )
+        if rank == 0:
+            xm.master_print(f"Scheduler Initialized: CosineAnnealingWarmRestarts with T_0={T_0} steps")
+
+        for chunk_idx in range(28): 
+            current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
             
-            teacher_cls = teacher_cls_full[start_idx:end_idx]
-            teacher_label = teacher_label_full[start_idx:end_idx]
+            if rank == 0:
+                xm.master_print(f"Stage {stage} | Chunk {chunk_idx + 1}/29 | Loading {current_chunk_filename}")
+
+            # --- Load Data ---
+            data = training_data_download(
+                core_id=rank,
+                filename=current_chunk_filename,
+                max_entries=flags["samples_per_shard"]
+            )
             
-            # --- Loss Calculation ---
+            if data is None: raise RuntimeError(f"[Core {rank}] Failed load chunk {chunk_idx}")
+
+            teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
+            teacher_label_full = torch.from_numpy(data['classifications']).long()
             
-            # Forward pass
-            halting_logits, class_logits, _ = model(teacher_cls)
-            
-            h = torch.sigmoid(halting_logits)
-            q = compute_q_from_h(h)
-            
-            # Classification loss
-            labels = teacher_label.float().unsqueeze(1).expand(-1, L)
-            
-            if class_logits.size(-1) == 2:
-                class_logits_positive = class_logits[:, :, 1]
+            # --- START ENHANCEMENT 9: Soft Targets Loading/Synthesis ---
+            if 'teacher_logits' in data:
+                t_logits = torch.from_numpy(data['teacher_logits']).float()
+                T_distill = 2.0
+                teacher_log_probs_full = F.log_softmax(t_logits / T_distill, dim=-1)
             else:
-                class_logits_positive = class_logits.squeeze(-1)
-            
-            ce_per_layer = bce_loss_fn(class_logits_positive, labels)
-            loss_cls = (q * ce_per_layer).sum(dim=1).mean()
-            
-            # Halting loss (Lambda calculation should be dynamic)
-            depths = torch.arange(1, L + 1, device=device).float().unsqueeze(0)
-            halt_penalty = (depths * (1 - h)).sum(dim=1)
-            
-            # MODIFICATION 4: Calculate dynamic lambda
-            progress = global_step / total_steps
-            lambda_now = lambda_start + (lambda_target - lambda_start) * progress
-            loss_halt = lambda_now * halt_penalty.mean()
-            
-            # Total loss
-            loss = loss_cls + loss_halt
-            
-            # --- Backward Pass and Optimization ---
-            
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            xm.optimizer_step(optimizer)
-            
-            # CRITICAL MODIFICATION 5: Add mark_step to prevent XLA deadlock
-            # This is essential for preventing the hang when iterating over multiple batches.
-            xm.mark_step()
-            
-            # --- Logging (Only on master rank and every log_interval) ---
-            if global_step % flags["log_interval"] == 0:
+                num_classes = 2
+                smoothing = 0.1
+                t_one_hot = torch.zeros(teacher_label_full.size(0), num_classes).scatter_(1, teacher_label_full.unsqueeze(1), 1)
+                teacher_probs_full = t_one_hot * (1.0 - smoothing) + (smoothing / num_classes)
+                teacher_log_probs_full = torch.log(teacher_probs_full)
                 
-                # All-reduce losses for logging
+                if rank == 0 and chunk_idx == 0:
+                    xm.master_print("  [Note] 'teacher_logits' not found. Using synthesized Soft Targets (Label Smoothing=0.1).")
+
+            if teacher_cls_full.shape[1] == 25:
+                teacher_cls_full = teacher_cls_full[:, 1:25, :]
+            
+            # --- Data Slicing (18.75%) ---
+            N_total_local = teacher_cls_full.shape[0]
+            N_target = (N_total_local // num_cores) * 6 
+
+            teacher_cls_full = teacher_cls_full[:N_target]
+            teacher_label_full = teacher_label_full[:N_target]
+            teacher_log_probs_full = teacher_log_probs_full[:N_target] 
+
+            if rank == 0:
+                xm.master_print(f"Data Sliced: Using {N_target}/{N_total_local} samples ({N_target/N_total_local:.2%}) for 18.75% utilization.")
+
+            # Class Weighting
+            neg_samples = (teacher_label_full == 0).sum().item()
+            pos_samples = (teacher_label_full == 1).sum().item()
+            pos_weight_val = neg_samples / (pos_samples + 1e-6)
+            pos_weight_tensor = torch.tensor([pos_weight_val]).float().to(device)
+
+            bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight_tensor).to(device)
+            
+            dataset = TensorDataset(teacher_cls_full, teacher_label_full, teacher_log_probs_full)
+            sampler = RandomSampler(dataset)
+            
+            data_loader = DataLoader(dataset, sampler=sampler, batch_size=flags["batch_size"], drop_last=True, num_workers=2)
+            
+            # --- Epoch Loop ---
+            for epoch in range(flags["epochs"]):
+                model.train()
+                
+                diag_sample_pos = None
+                diag_sample_neg = None
+
+                for batch_idx, (teacher_cls, teacher_label, teacher_log_probs) in enumerate(data_loader):
+                    if stage == 2: global_step += 29 
+                    
+                    teacher_cls = teacher_cls.to(device)
+                    teacher_label = teacher_label.to(device)
+                    teacher_log_probs = teacher_log_probs.to(device)
+                    
+                    # Forward Pass
+                    halting_logits, class_logits, z = model(teacher_cls) 
+                    
+                    if rank == 0 and batch_idx == 0:
+                        def extract_sample(label_val):
+                            indices = (teacher_label == label_val).nonzero(as_tuple=True)[0]
+                            if indices.numel() > 0:
+                                idx = indices[0]
+                                return {
+                                    'cls': class_logits[idx].detach().cpu(),
+                                    'halt': halting_logits[idx].detach().cpu(),
+                                    'lbl': teacher_label[idx].detach().cpu()
+                                }
+                            return None
+                        
+                        diag_sample_pos = extract_sample(1)
+                        diag_sample_neg = extract_sample(0)
+
+                    # --- LOSS CALCULATION ---
+                    
+                    labels = teacher_label.float().unsqueeze(1).expand(-1, L)
+                    if class_logits.size(-1) == 2:
+                        class_logits_positive = class_logits[:, :, 1]
+                        student_log_probs = F.log_softmax(class_logits, dim=-1)
+                    else:
+                        class_logits_positive = class_logits.squeeze(-1)
+                        student_log_probs = F.log_softmax(
+                             torch.stack([-class_logits_positive, class_logits_positive], dim=-1),
+                             dim=-1
+                          )
+                    
+                    loss_hard = bce_loss_fn(class_logits_positive, labels)
+
+                    teacher_log_probs_expanded = teacher_log_probs.unsqueeze(1).expand(-1, L, -1)
+                    kl_elementwise = teacher_log_probs_expanded.exp() * (teacher_log_probs_expanded - student_log_probs)
+                    loss_soft = kl_elementwise.sum(dim=-1)
+
+                    alpha = 0.5
+                    ce_per_layer = (alpha * loss_hard) + ((1 - alpha) * loss_soft)
+                    
+                    # Multiplies classification loss by class_weight
+                    weighted_ce_per_layer = cls_weight * ce_per_layer
+
+                    loss_contrast = F.mse_loss(z[:, 1:, :], z[:, :-1, :])
+
+                    if stage == 1:
+                        # Use weighted CE Loss
+                        loss_cls = weighted_ce_per_layer.mean()
+                        loss_halt = torch.tensor(0.0, device=device)
+                        loss = (loss_cls * 2) + (0.1 * loss_contrast)
+
+                    elif stage == 2:
+                        # --- GEOMETRIC POLICY FIX ---
+                        # Instead of Gumbel-Softmax, we use Sigmoid + Geometric Cumulative Calc
+                        # This aligns training logic with the independent "Yes/No" decisions of Sigmoid.
+                        h = torch.sigmoid(halting_logits)
+                        q = compute_q_from_h(h)
+                        
+                        # Use weighted CE Loss
+                        loss_cls = (q * weighted_ce_per_layer).sum(dim=1).mean()
+                        
+                        # --- ENTROPY REGULARIZATION ---
+                        # Hyperparameter you can adjust:
+                        entropy_weight = 0.01 
+                        
+                        # Entropy on q (the distribution over layers)
+                        entropy = - (q * (q + 1e-9).log()).sum(dim=-1).mean()
+                        loss_entropy = - entropy_weight * entropy
+
+                        # --- LAGRANGIAN PONDER LOSS ---
+                        depths = (torch.arange(1, L + 1, device=device).float()).unsqueeze(0)
+                        expected_depth = (q * depths).sum(dim=1).mean()
+                        
+                        # SAFETY CLAMP on lambda to prevent runaway penalty
+                        lambda_val = torch.clamp(torch.exp(log_lambda), max=0.2)
+                        
+                        loss_ponder = lambda_val.detach() * expected_depth
+                        loss_constraint = - lambda_val * (expected_depth.detach() - target_depth)
+                        
+                        loss = loss_cls + loss_ponder + loss_constraint + loss_entropy
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    xm.optimizer_step(optimizer)
+                    scheduler.step()
+                    xm.mark_step()
+
                 loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
                 loss_cls_sum = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
-                loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_halt)
-                h_mean = xm.all_reduce(xm.REDUCE_SUM, h.mean())
                 
-                # Log on master core after all-reduce
+                if stage == 2:
+                    loss_halt_sum = xm.all_reduce(xm.REDUCE_SUM, loss_ponder)
+                else:
+                    loss_halt_sum = torch.tensor(0.0)
+                
+                xm.rendezvous(f"ep_end_st{stage}_ch{chunk_idx}_ep{epoch}")
+                
                 if rank == 0:
-                    current_time = time.time()
-                    elapsed_time = current_time - start_time
+                    elapsed = time.time() - start_time
+                    current_lr = scheduler.get_last_lr()[0]
+                    xm.master_print("-" * 60)
+                    xm.master_print(f"STAGE {stage} | CHUNK {chunk_idx+1} | EPOCH {epoch+1}")
+                    xm.master_print(f"  LR:         {current_lr:.2e}")
+                    xm.master_print(f"  Total Loss: {loss_sum / num_cores:.4f}")
+                    xm.master_print(f"  Cls Loss:   {loss_cls_sum / num_cores:.4f}")
+                    if stage == 2:
+                        curr_lambda = torch.exp(log_lambda).item()
+                        xm.master_print(f"  Lambda:     {curr_lambda:.6f} (Dynamic)")
+                        xm.master_print(f"  Ponder:     {loss_halt_sum / num_cores:.4f}")
+                    else:
+                        xm.master_print(f"  Halt Loss:  {loss_halt_sum / num_cores:.4f}")
                     
-                    xm.master_print("-" * 50)
-                    xm.master_print(f"Epoch: {epoch + 1}/{num_epochs} | Step: {global_step}/{total_steps} ({global_step * 100 / total_steps:.1f}%)")
-                    xm.master_print(f"Avg Total Loss: {(loss_sum / num_cores).item():.6f}")
-                    xm.master_print(f"Avg Cls Loss: {(loss_cls_sum / num_cores).item():.6f}")
-                    xm.master_print(f"Avg Halt Loss: {(loss_halt_sum / num_cores).item():.6f}")
-                    xm.master_print(f"Avg Mean h: {(h_mean / num_cores).item():.6f}")
-                    xm.master_print(f"Lambda: {lambda_now:.6f}")
-                    xm.master_print(f"Time elapsed: {elapsed_time:.1f}s")
-                    xm.master_print("-" * 50)
+                    def format_sample(data, name):
+                        if data is None: return f"  {name}: No sample found in first batch."
+                        out = [f"  > {name} (Label {data['lbl'].item()}):"]
+                        if stage == 1:
+                            probs = torch.softmax(data['cls'], dim=-1) 
+                            cls1_probs = probs[:, 1]
+                            out.append(f"    CLS Probs (Class 1): {[f'{p:.2f}' for p in cls1_probs.tolist()]}")
+                        else:
+                            h_probs = torch.sigmoid(data['halt'])
+                            out.append(f"    HALT Probs: {[f'{p:.2f}' for p in h_probs.tolist()]}")
+                        return "\n".join(out)
 
-            # Update step count
-            global_step += 1
-        
-        # --- Checkpoint after each epoch ---
-        if (epoch + 1) % flags["checkpoint_interval"] == 0:
-            if rank == 0:
-                checkpoint_path = f"checkpoint_epoch_{epoch + 1}.pt"
-                # Save only the model state dict (and possibly optimizer state dict)
-                # xm.save(model.state_dict(), checkpoint_path) # Example save command
-                xm.master_print(f"Checkpoint saved for Epoch {epoch + 1} at {checkpoint_path} (placeholder)")
-        
-        # Ensure all cores finish the epoch before proceeding to the next one
-        xm.rendezvous(f"epoch_end_{epoch}")
+                    xm.master_print("  DIAGNOSTICS (Layer 0->23):")
+                    xm.master_print(format_sample(diag_sample_pos, "Sample POS"))
+                    xm.master_print(format_sample(diag_sample_neg, "Sample NEG"))
 
+            if (chunk_idx + 1) % 5 == 0 and rank == 0:
+                torch.save(model.state_dict(), f"/tmp/controller_stage{stage}_chunk{chunk_idx+1}.pt")
+                xm.master_print("Saved Checkpoint.")
 
-    # --- FINAL WEIGHT CHECK (Keep for peace of mind) ---
-    total_time = time.time() - start_time
+            xm.rendezvous(f"chunk_end_st{stage}_ch{chunk_idx}")
+
     if rank == 0:
-        xm.master_print("\n" + "=" * 80)
-        xm.master_print("TRAINING FINISHED")
-        xm.master_print(f"Total time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
-        xm.master_print(f"Total steps: {global_step}")
-        xm.master_print("=" * 80)
-    
-    param_checks_final = []
-    for i, param in enumerate(model.parameters()):
-        if i >= 3:
-            break
-        param_element = param.flatten()[0]
-        param_sum = xm.all_reduce(xm.REDUCE_SUM, param_element)
-        param_checks_final.append((param_sum, param_element))
-    
-    xm.mark_step()
-    
-    if rank == 0:
-        for i, (param_sum, param_element) in enumerate(param_checks_final):
-            expected_sum = param_element * num_cores
-            xm.master_print(f"Parameter {i}:")
-            xm.master_print(f"  Sum across cores: {param_sum}")
-            xm.master_print(f"  Expected if synced: {expected_sum}")
-            xm.master_print(f"  Difference: {param_sum - expected_sum:.6f}")
-        xm.master_print("=" * 80)
-        xm.master_print(f"✅ FINAL TRAINING COMPLETED ON ALL CORES. Active cores: {num_cores}/32")
-        xm.master_print("=" * 80)
+        torch.save(model.state_dict(), "/tmp/controller_final_stage2.pt")
+        xm.master_print("✅ Training Complete.")
+
+    test_chunk = flags.get("test_chunk", 29) 
+    evaluate_model(rank, model, test_chunk, 0.5, flags["batch_size"], flags["samples_per_shard"])
+    evaluate_model(rank, model, test_chunk, 0.6, flags["batch_size"], flags["samples_per_shard"])
+    evaluate_model(rank, model, test_chunk, 0.7, flags["batch_size"], flags["samples_per_shard"])
+    evaluate_model(rank, model, test_chunk, 0.95, flags["batch_size"], flags["samples_per_shard"])
     
     xm.rendezvous("final_check")
-
 
 def _mp_fn(rank, flags):
     try:
@@ -287,37 +441,21 @@ def _mp_fn(rank, flags):
         print(f"[Core {rank}] FATAL ERROR: {e}")
         import traceback
         traceback.print_exc()
-        # If one core raises an exception, we need to ensure the TPU job stops
-        # Calling xm.rendezvous here might hang if other cores are stuck,
-        # so simply re-raising the exception is the right move for XLA.
         raise
 
-
 if __name__ == "__main__":
-    FLAGS = {
-        # Model architecture
-        "d_ctrl": 256,
+    BASE_FLAGS = {
+        "d_ctrl": 512,
         "transformer_layers": 4,
-        
-        # Optimization
         "lr": 3e-4,
-        "batch_size": 64,  # Smaller batch size for 19500 samples
-        
-        # Halting loss schedule, halting loss should at first be very small then gradually go to a maximum where it matters about exactly as much as CLS
+        "batch_size": 64,   
         "lambda_start": 0.0001,
-        "lambda_target": 0.01,
-        
-        # Training, leave at 5 if model seems to be converging, else go to 10
+        "lambda_target": 0.003,
         "epochs": 5,
-        
-        # Data loading
-        "chunk_filename": "embeddings_chunk_0.npz",  # Change to desired chunk
-        "samples_per_shard": 19500,  # Number of samples per core
-        
-        # Logging and checkpointing
-        "log_interval": 50,  # Log every N steps
-        "checkpoint_interval": 1,  # Save checkpoint every N epochs
-    }
+        "samples_per_shard": 39000, 
+        "test_chunk": 29, 
+        "test_threshold": 0.8
+    }  
     
-    # Automatically detect number of TPU cores
-    xmp.spawn(_mp_fn, args=(FLAGS,), start_method='fork')
+    print("Starting Two-Stage XLA Job.")
+    xmp.spawn(_mp_fn, args=(BASE_FLAGS,), start_method='fork')
