@@ -1,6 +1,3 @@
-#fully independent halting loss experiment
-#problem with adaptive computation cost is that if earlier exit is already confident later exits don't get gradients because probability of stopping there is near zero
-
 import os, time
 import torch
 import torch.nn as nn
@@ -235,9 +232,9 @@ def train_loop(rank, flags):
             if teacher_cls_full.shape[1] == 25:
                 teacher_cls_full = teacher_cls_full[:, 1:25, :]
             
-            # --- Data Slicing (25%) ---
+            # --- Data Slicing (18.75%) ---
             N_total_local = teacher_cls_full.shape[0]
-            N_target = (N_total_local // num_cores) * 8 
+            N_target = (N_total_local // num_cores) * 6 
 
             teacher_cls_full = teacher_cls_full[:N_target]
             teacher_label_full = teacher_label_full[:N_target]
@@ -337,9 +334,18 @@ def train_loop(rank, flags):
                         # We want h -> 1 when is_correct -> 1
                         loss_halt = F.binary_cross_entropy(h, is_correct)
                         
+                        # 4. ENTROPY REGULARIZATION (ADDED)
+                        # Prevents overconfidence (h -> 0 or 1 too fast).
+                        # Calculate Binary Entropy for each head independently.
+                        # H(p) = -p*log(p) - (1-p)*log(1-p)
+                        entropy_weight = 0.001 # Hyperparameter
+                        
+                        h_entropy = - (h * (h + 1e-9).log() + (1 - h) * (1 - h + 1e-9).log())
+                        loss_entropy = - entropy_weight * h_entropy.mean()
+                        
                         # We do NOT add loss_cls because Stage 2 freezes classifiers.
                         # The only learnable parameters are the halting heads.
-                        loss = loss_halt
+                        loss = loss_halt + loss_entropy
 
                     optimizer.zero_grad()
                     loss.backward()
@@ -367,7 +373,7 @@ def train_loop(rank, flags):
                     if stage == 1:
                         xm.master_print(f"  Cls Loss:   {loss_log / num_cores:.4f}")
                     else:
-                        xm.master_print(f"  Halt Loss:  {loss_log / num_cores:.4f} (Independent Correctness BCE)")
+                        xm.master_print(f"  Halt Loss:  {loss_log / num_cores:.4f} (Independent Correctness BCE + Entropy)")
                     
                     def format_sample(data, name):
                         if data is None: return f"  {name}: No sample found in first batch."
