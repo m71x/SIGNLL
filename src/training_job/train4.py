@@ -235,9 +235,9 @@ def train_loop(rank, flags):
             if teacher_cls_full.shape[1] == 25:
                 teacher_cls_full = teacher_cls_full[:, 1:25, :]
             
-            # --- Data Slicing (21.875%) ---
+            # --- Data Slicing (25%) ---
             N_total_local = teacher_cls_full.shape[0]
-            N_target = (N_total_local // num_cores) * 7 
+            N_target = (N_total_local // num_cores) * 8 
 
             teacher_cls_full = teacher_cls_full[:N_target]
             teacher_label_full = teacher_label_full[:N_target]
@@ -399,6 +399,7 @@ def train_loop(rank, flags):
     evaluate_model(rank, model, test_chunk, 0.5, flags["batch_size"], flags["samples_per_shard"])
     evaluate_model(rank, model, test_chunk, 0.6, flags["batch_size"], flags["samples_per_shard"])
     evaluate_model(rank, model, test_chunk, 0.7, flags["batch_size"], flags["samples_per_shard"])
+    evaluate_model(rank, model, test_chunk, 0.8, flags["batch_size"], flags["samples_per_shard"])
     evaluate_model(rank, model, test_chunk, 0.95, flags["batch_size"], flags["samples_per_shard"])
     
     xm.rendezvous("final_check")
