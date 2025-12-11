@@ -184,7 +184,7 @@ def train_loop(rank, flags):
         # Initialize log_lambda to correspond to a small start value (e.g. 0.001)
         # We perform a learnable update to find the optimal penalty.
         log_lambda = torch.tensor(torch.log(torch.tensor(0.001)), device=device, requires_grad=True)
-        target_depth = torch.tensor(12.0, device=device) # Target average depth of 15
+        target_depth = torch.tensor(7.0, device=device) # Target average depth of 15
         
         # --- OPTIMIZER FIX: Parameter Groups ---
         # Apply weight decay to model weights, but NOT to log_lambda
