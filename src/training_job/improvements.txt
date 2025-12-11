@@ -27,3 +27,5 @@ Once those layers are pruned, train again on the remaining layers
 2. orthagonality reg seems to be messing up stage 2
 3. some class probabilities are a little bit concerning in stage 1
 4. still need to fix negative halting, it is not very diverse and seems to mainly exit at one layer toward the end
+5. consider putting a weighting mechanism for the halting heads to make it more important for later heads to get it right than earlier heads (they should all be independent)
+6. cosider modifying loss so that the penalty for getting it wrong is always greater than the penalty for not halting 
