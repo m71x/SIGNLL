@@ -1,4 +1,5 @@
 #fully independent halting loss experiment
+#problem with adaptive computation cost is that if earlier exit is already confident later exits don't get gradients because probability of stopping there is near zero
 
 import os, time
 import torch
@@ -234,9 +235,9 @@ def train_loop(rank, flags):
             if teacher_cls_full.shape[1] == 25:
                 teacher_cls_full = teacher_cls_full[:, 1:25, :]
             
-            # --- Data Slicing (18.75%) ---
+            # --- Data Slicing (21.875%) ---
             N_total_local = teacher_cls_full.shape[0]
-            N_target = (N_total_local // num_cores) * 6 
+            N_target = (N_total_local // num_cores) * 7 
 
             teacher_cls_full = teacher_cls_full[:N_target]
             teacher_label_full = teacher_label_full[:N_target]
