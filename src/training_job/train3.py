@@ -184,7 +184,7 @@ def train_loop(rank, flags):
         # Initialize log_lambda to correspond to a small start value (e.g. 0.001)
         # We perform a learnable update to find the optimal penalty.
         log_lambda = torch.tensor(torch.log(torch.tensor(0.001)), device=device, requires_grad=True)
-        target_depth = torch.tensor(13.15, device=device) # Target average depth of 15
+        target_depth = torch.tensor(15.0, device=device) # Target average depth of 15
         
         # --- OPTIMIZER FIX: Parameter Groups ---
         # Apply weight decay to model weights, but NOT to log_lambda
@@ -379,7 +379,7 @@ def train_loop(rank, flags):
                         # --- GUMBEL-SOFTMAX (Fix #7) ---
                         # Sample exit distribution
                         # Lowered Tau to 1.0 to avoid washout
-                        q = F.gumbel_softmax(halting_logits, tau=5.0, hard=False, dim=-1)
+                        q = F.gumbel_softmax(halting_logits, tau=1.0, hard=False, dim=-1)
                         
                         # Weighted Classification Loss (Expected Loss)
                         loss_cls = (q * ce_per_layer).sum(dim=1).mean()
@@ -401,7 +401,20 @@ def train_loop(rank, flags):
                         # We detach expected_depth so the model doesn't try to "trick" the constraint
                         loss_constraint = - lambda_val * (expected_depth.detach() - target_depth)
                         
-                        loss = loss_cls + loss_ponder + loss_constraint
+                        # --- ADDED: ENTROPY REGULARIZATION ---
+                        # Penalize low entropy to discourage spiky distributions (collapse)
+                        # Hyperparameter you can adjust:
+                        entropy_weight = 0.05 
+                        
+                        # Calculate entropy of the halting distribution
+                        # q is [B, L]. We want H(q) = - sum(q * log q)
+                        # Add epsilon for numerical stability
+                        entropy = - (q * (q + 1e-9).log()).sum(dim=-1).mean()
+                        
+                        # We subtract entropy (maximize entropy) => minimize -entropy
+                        loss_entropy = - entropy_weight * entropy
+                        
+                        loss = loss_cls + loss_ponder + loss_constraint + loss_entropy
 
                     # Optimization
                     optimizer.zero_grad()
@@ -440,7 +453,7 @@ def train_loop(rank, flags):
                         # Log Lambda and Depth
                         curr_lambda = torch.exp(log_lambda).item()
                         xm.master_print(f"  Lambda:     {curr_lambda:.6f} (Dynamic)")
-                        xm.master_print(f"  Ponder Loss:{loss_halt_sum / num_cores:.4f}")
+                        xm.master_print(f"  Ponder:     {loss_halt_sum / num_cores:.4f}")
                     else:
                         xm.master_print(f"  Halt Loss:  {loss_halt_sum / num_cores:.4f}")
                     
