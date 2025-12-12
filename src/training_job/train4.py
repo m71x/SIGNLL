@@ -232,9 +232,9 @@ def train_loop(rank, flags):
             if teacher_cls_full.shape[1] == 25:
                 teacher_cls_full = teacher_cls_full[:, 1:25, :]
             
-            # --- Data Slicing (18.75%) ---
+            # --- Data Slicing (10/32%) ---
             N_total_local = teacher_cls_full.shape[0]
-            N_target = (N_total_local // num_cores) * 8 
+            N_target = (N_total_local // num_cores) * 10 
 
             teacher_cls_full = teacher_cls_full[:N_target]
             teacher_label_full = teacher_label_full[:N_target]
@@ -433,6 +433,6 @@ if __name__ == "__main__":
         "test_chunk": 29, 
         "test_threshold": 0.8
     }  
-    
+
     print("Starting Two-Stage XLA Job.")
     xmp.spawn(_mp_fn, args=(BASE_FLAGS,), start_method='fork')
