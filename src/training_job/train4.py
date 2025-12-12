@@ -232,7 +232,7 @@ def train_loop(rank, flags):
             if teacher_cls_full.shape[1] == 25:
                 teacher_cls_full = teacher_cls_full[:, 1:25, :]
             
-            # --- Data Slicing (10/32%) ---
+            # --- Data Slicing (10/32) ---
             N_total_local = teacher_cls_full.shape[0]
             N_target = (N_total_local // num_cores) * 10 
 
@@ -319,32 +319,37 @@ def train_loop(rank, flags):
 
                     elif stage == 2:
                         # --- INDEPENDENT HALTING LOSS FIX ---
-                        # Instead of global Ponder Loss, we train each layer's halting head
-                        # to act as an independent "Am I Correct?" predictor.
                         
                         # 1. Determine Correctness for each layer [B, L]
-                        # We use Hard Labels for the "Correctness" ground truth.
                         predictions = torch.argmax(class_logits, dim=-1)
                         is_correct = (predictions == teacher_label.unsqueeze(1)).float()
                         
                         # 2. Halting Probability (Sigmoid)
                         h = torch.sigmoid(halting_logits)
                         
-                        # 3. Independent Binary Cross Entropy
-                        # We want h -> 1 when is_correct -> 1
-                        loss_halt = F.binary_cross_entropy(h, is_correct)
+                        # --- FIX: CLASS-AWARE REBALANCING ---
+                        # Dynamically calculate weights based on batch stats
+                        n_pos = (teacher_label == 1).sum().float()
+                        n_neg = (teacher_label == 0).sum().float()
                         
-                        # 4. ENTROPY REGULARIZATION (ADDED)
-                        # Prevents overconfidence (h -> 0 or 1 too fast).
-                        # Calculate Binary Entropy for each head independently.
-                        # H(p) = -p*log(p) - (1-p)*log(1-p)
-                        entropy_weight = 0.025 # Hyperparameter
+                        # Boost penalty for the minority class (Negatives)
+                        # We clamp min=1.0 to ensure we never down-weight.
+                        neg_weight_val = (n_pos / (n_neg + 1e-6)).clamp(min=1.0)
+                        
+                        # Create a weight matrix of shape [Batch, Layers]
+                        sample_weights = torch.ones_like(h)
+                        # Apply the multiplier to all layers for samples where label == 0
+                        sample_weights[teacher_label == 0] = neg_weight_val.item()
+                        
+                        # 3. Weighted Independent Binary Cross Entropy
+                        loss_halt = F.binary_cross_entropy(h, is_correct, weight=sample_weights)
+                        
+                        # 4. ENTROPY REGULARIZATION (Retained)
+                        entropy_weight = 0.0025 
                         
                         h_entropy = - (h * (h + 1e-9).log() + (1 - h) * (1 - h + 1e-9).log())
                         loss_entropy = - entropy_weight * h_entropy.mean()
                         
-                        # We do NOT add loss_cls because Stage 2 freezes classifiers.
-                        # The only learnable parameters are the halting heads.
                         loss = loss_halt + loss_entropy
 
                     optimizer.zero_grad()
@@ -359,7 +364,7 @@ def train_loop(rank, flags):
                 if stage == 1:
                     loss_log = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
                 else:
-                    loss_log = loss_sum # In stage 2, total loss IS the halting loss
+                    loss_log = loss_sum 
                 
                 xm.rendezvous(f"ep_end_st{stage}_ch{chunk_idx}_ep{epoch}")
                 
@@ -373,7 +378,7 @@ def train_loop(rank, flags):
                     if stage == 1:
                         xm.master_print(f"  Cls Loss:   {loss_log / num_cores:.4f}")
                     else:
-                        xm.master_print(f"  Halt Loss:  {loss_log / num_cores:.4f} (Independent Correctness BCE + Entropy)")
+                        xm.master_print(f"  Halt Loss:  {loss_log / num_cores:.4f} (Weighted Independent BCE)")
                     
                     def format_sample(data, name):
                         if data is None: return f"  {name}: No sample found in first batch."
@@ -433,6 +438,6 @@ if __name__ == "__main__":
         "test_chunk": 29, 
         "test_threshold": 0.8
     }  
-
+    
     print("Starting Two-Stage XLA Job.")
     xmp.spawn(_mp_fn, args=(BASE_FLAGS,), start_method='fork')
