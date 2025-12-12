@@ -234,7 +234,7 @@ def train_loop(rank, flags):
             
             # --- Data Slicing (18.75%) ---
             N_total_local = teacher_cls_full.shape[0]
-            N_target = (N_total_local // num_cores) * 6 
+            N_target = (N_total_local // num_cores) * 8 
 
             teacher_cls_full = teacher_cls_full[:N_target]
             teacher_label_full = teacher_label_full[:N_target]
@@ -338,7 +338,7 @@ def train_loop(rank, flags):
                         # Prevents overconfidence (h -> 0 or 1 too fast).
                         # Calculate Binary Entropy for each head independently.
                         # H(p) = -p*log(p) - (1-p)*log(1-p)
-                        entropy_weight = 0.025 # Hyperparameter
+                        entropy_weight = 0.01 # Hyperparameter
                         
                         h_entropy = - (h * (h + 1e-9).log() + (1 - h) * (1 - h + 1e-9).log())
                         loss_entropy = - entropy_weight * h_entropy.mean()
