@@ -333,7 +333,6 @@ def train_loop(rank, flags):
                         n_neg = (teacher_label == 0).sum().float()
                         
                         # Boost penalty for the minority class (Negatives)
-                        # We clamp min=1.0 to ensure we never down-weight.
                         neg_weight_val = (n_pos / (n_neg + 1e-6)).clamp(min=1.0)
                         
                         # Create a weight matrix of shape [Batch, Layers]
@@ -344,13 +343,34 @@ def train_loop(rank, flags):
                         # 3. Weighted Independent Binary Cross Entropy
                         loss_halt = F.binary_cross_entropy(h, is_correct, weight=sample_weights)
                         
-                        # 4. ENTROPY REGULARIZATION (Retained)
+                        # 4. ENTROPY REGULARIZATION
                         entropy_weight = 0.0025 
-                        
                         h_entropy = - (h * (h + 1e-9).log() + (1 - h) * (1 - h + 1e-9).log())
                         loss_entropy = - entropy_weight * h_entropy.mean()
                         
-                        loss = loss_halt + loss_entropy
+                        # 5. ORTHOGONALITY REGULARIZATION (ADDED)
+                        # Forces halting heads to be distinct from one another.
+                        # Helps ensure efficient usage of layers.
+                        ortho_weight = 0.01 # Start small
+                        
+                        # Stack all halting head weights: Shape [L, d_ctrl]
+                        # self.halting_heads is a ModuleList of Linear layers. 
+                        # We take the .weight of each, which is [1, d_ctrl], and cat them.
+                        head_weights = torch.cat([head.weight for head in model.halting_heads], dim=0)
+                        
+                        # Normalize weights to focus on direction, not magnitude
+                        head_weights_norm = F.normalize(head_weights, p=2, dim=1)
+                        
+                        # Compute Cosine Similarity Matrix: [L, L]
+                        # (A . B^T) gives dot products between all pairs
+                        sim_matrix = torch.mm(head_weights_norm, head_weights_norm.t())
+                        
+                        # We want the off-diagonal elements to be zero (orthogonal)
+                        # The diagonal is 1s (self-similarity), so we subtract Identity
+                        identity = torch.eye(model.L, device=device)
+                        loss_ortho = ((sim_matrix - identity) ** 2).sum() * ortho_weight
+                        
+                        loss = loss_halt + loss_entropy + loss_ortho
 
                     optimizer.zero_grad()
                     loss.backward()
@@ -378,7 +398,7 @@ def train_loop(rank, flags):
                     if stage == 1:
                         xm.master_print(f"  Cls Loss:   {loss_log / num_cores:.4f}")
                     else:
-                        xm.master_print(f"  Halt Loss:  {loss_log / num_cores:.4f} (Weighted Independent BCE)")
+                        xm.master_print(f"  Halt Loss:  {loss_log / num_cores:.4f} (W-BCE + Ent + Ortho)")
                     
                     def format_sample(data, name):
                         if data is None: return f"  {name}: No sample found in first batch."
