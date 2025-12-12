@@ -404,7 +404,7 @@ def train_loop(rank, flags):
                         # --- ADDED: ENTROPY REGULARIZATION ---
                         # Penalize low entropy to discourage spiky distributions (collapse)
                         # Hyperparameter you can adjust:
-                        entropy_weight = 0.01 
+                        entropy_weight = 0.025 
                         
                         # Calculate entropy of the halting distribution
                         # q is [B, L]. We want H(q) = - sum(q * log q)
