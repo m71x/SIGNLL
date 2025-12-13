@@ -29,3 +29,8 @@ Once those layers are pruned, train again on the remaining layers
 4. still need to fix negative halting, it is not very diverse and seems to mainly exit at one layer toward the end
 5. consider putting a weighting mechanism for the halting heads to make it more important for later heads to get it right than earlier heads (they should all be independent)
 6. cosider modifying loss so that the penalty for getting it wrong is always greater than the penalty for not halting 
+
+
+1. add dual information thing
+2. add residual learning thing
+3. figure out how to fix plateauing halting losses, possibly start by increasing learning rate at the end
