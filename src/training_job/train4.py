@@ -186,7 +186,7 @@ def train_loop(rank, flags):
 
         # --- SCHEDULER SETUP ---
         total_steps_in_stage = 28 * flags["epochs"] * num_batches_per_chunk
-        T_0 = total_steps_in_stage // 4
+        T_0 = total_steps_in_stage // 8
         scheduler = CosineAnnealingWarmRestarts(
             optimizer, 
             T_0=T_0, 
