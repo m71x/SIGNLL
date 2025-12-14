@@ -186,7 +186,7 @@ def train_loop(rank, flags):
 
         # --- SCHEDULER SETUP ---
         total_steps_in_stage = 28 * flags["epochs"] * num_batches_per_chunk
-        T_0 = total_steps_in_stage // 6
+        T_0 = total_steps_in_stage // 8
         scheduler = CosineAnnealingWarmRestarts(
             optimizer, 
             T_0=T_0, 
@@ -411,6 +411,7 @@ def train_loop(rank, flags):
     evaluate_model(rank, model, test_chunk, 0.6, flags["batch_size"], flags["samples_per_shard"])
     evaluate_model(rank, model, test_chunk, 0.7, flags["batch_size"], flags["samples_per_shard"])
     evaluate_model(rank, model, test_chunk, 0.8, flags["batch_size"], flags["samples_per_shard"])
+    evaluate_model(rank, model, test_chunk, 0.9, flags["batch_size"], flags["samples_per_shard"])
     evaluate_model(rank, model, test_chunk, 0.95, flags["batch_size"], flags["samples_per_shard"])
     
     xm.rendezvous("final_check")
