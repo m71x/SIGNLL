@@ -190,7 +190,7 @@ def train_loop(rank, flags):
         scheduler = CosineAnnealingWarmRestarts(
             optimizer, 
             T_0=T_0, 
-            T_mult=1,   
+            T_mult=2,   
             eta_min=1e-6
         )
         if rank == 0:
