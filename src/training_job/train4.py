@@ -234,7 +234,7 @@ def train_loop(rank, flags):
             
             # --- Data Slicing (10/32) ---
             N_total_local = teacher_cls_full.shape[0]
-            N_target = (N_total_local // num_cores) * 28 
+            N_target = (N_total_local // num_cores) * 30
 
             teacher_cls_full = teacher_cls_full[:N_target]
             teacher_label_full = teacher_label_full[:N_target]
