@@ -227,14 +227,19 @@ def train_loop(rank, flags):
         # --- OPTIMIZER FIX: Parameter Groups ---
         model_params = [p for p in model.parameters() if p.requires_grad]
         
-        # Initialize SAM with AdamW as the base optimizer
-        optimizer = SAM(model_params, optim.AdamW, rho=0.05, lr=flags["lr"], weight_decay=1e-2)
+        # Use Standard AdamW for Stage 1, SAM(AdamW) for Stage 2
+        if stage == 1:
+            optimizer = optim.AdamW(model_params, lr=flags["lr"], weight_decay=1e-2)
+        else:
+            # Stage 2: Sharpness-Aware Maximization
+            # rho=0.05 is a standard starting point for SAM
+            optimizer = SAM(model_params, optim.AdamW, rho=0.05, lr=flags["lr"], weight_decay=1e-2)
 
         # --- SCHEDULER SETUP ---
         total_steps_in_stage = 28 * flags["epochs"] * num_batches_per_chunk
-        T_0 = total_steps_in_stage // 6
+        T_0 = total_steps_in_stage // 4
         scheduler = CosineAnnealingWarmRestarts(
-            optimizer, # SAM optimizer wraps the base, scheduler steps on SAM
+            optimizer, 
             T_0=T_0, 
             T_mult=2,   
             eta_min=1e-6
@@ -280,7 +285,7 @@ def train_loop(rank, flags):
             
             # --- Data Slicing (10/32) ---
             N_total_local = teacher_cls_full.shape[0]
-            N_target = (N_total_local // num_cores) * 32 
+            N_target = (N_total_local // num_cores) * 12 
 
             teacher_cls_full = teacher_cls_full[:N_target]
             teacher_label_full = teacher_label_full[:N_target]
@@ -316,8 +321,8 @@ def train_loop(rank, flags):
                     teacher_label = teacher_label.to(device)
                     teacher_log_probs = teacher_log_probs.to(device)
                     
-                    # --- COMPUTE LOSS CLOSURE ---
-                    # We define this inner function so we can run it twice (once for initial grad, once for SAM)
+                    # --- LOSS COMPUTATION CLOSURE (For SAM) ---
+                    # We define this locally to run it multiple times if needed (SAM requires 2 passes)
                     def compute_loss_step():
                         # Forward Pass
                         halting_logits, class_logits, z = model(teacher_cls) 
@@ -348,8 +353,7 @@ def train_loop(rank, flags):
                         if stage == 1:
                             loss_cls = ce_per_layer.mean()
                             loss = (loss_cls * 2) + (0.1 * loss_contrast)
-                            
-                            # For logging (return tuple)
+                            # Return relevant stats
                             return loss, loss_cls, torch.tensor(0.0), halting_logits, class_logits
 
                         elif stage == 2:
@@ -385,32 +389,44 @@ def train_loop(rank, flags):
                             
                             return loss, torch.tensor(0.0), loss_halt, halting_logits, class_logits
 
-                    # --- SAM OPTIMIZATION STEP (Manual for XLA) ---
-                    # 1. First Forward & Backward
-                    loss, loss_cls_val, loss_halt_val, halting_logits, class_logits = compute_loss_step()
-                    
-                    optimizer.zero_grad()
-                    loss.backward()
-                    
-                    # Sync gradients across TPU cores before perturbation
-                    xm.reduce_gradients(optimizer) 
-                    
-                    # 2. Perturb Weights (Ascent)
-                    optimizer.first_step(zero_grad=True)
-                    
-                    # 3. Second Forward & Backward (at perturbed state)
-                    loss_2, _, _, _, _ = compute_loss_step()
-                    loss_2.backward()
-                    
-                    # Sync gradients again
-                    xm.reduce_gradients(optimizer)
-                    
-                    # 4. Update Weights (Descent)
-                    optimizer.second_step(zero_grad=True)
-                    
+                    # --- OPTIMIZATION STEP ---
+                    if stage == 1:
+                        # Standard AdamW Step
+                        loss, loss_cls_val, _, halting_logits, class_logits = compute_loss_step()
+                        optimizer.zero_grad()
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        xm.optimizer_step(optimizer)
+                        loss_halt_val = torch.tensor(0.0)
+                        
+                    elif stage == 2:
+                        # SAM Step (Manual XLA Procedure)
+                        # 1. First Forward & Backward
+                        loss, _, loss_halt_val, halting_logits, class_logits = compute_loss_step()
+                        optimizer.zero_grad()
+                        loss.backward()
+                        
+                        # Sync gradients across cores (Manual reduce because we are managing step)
+                        xm.reduce_gradients(optimizer)
+                        
+                        # 2. Perturb Weights (Ascent to worst neighbor)
+                        optimizer.first_step(zero_grad=True)
+                        
+                        # 3. Second Forward & Backward (at perturbed state)
+                        loss_2, _, _, _, _ = compute_loss_step()
+                        loss_2.backward()
+                        
+                        # Sync gradients again
+                        xm.reduce_gradients(optimizer)
+                        
+                        # 4. Update Weights (Descent)
+                        optimizer.second_step(zero_grad=True)
+                        
+                        loss_cls_val = torch.tensor(0.0)
+                        xm.mark_step()
+
                     # Scheduler Step
                     scheduler.step()
-                    xm.mark_step()
                     
                     # --- CAPTURE DIAGNOSTICS (Rank 0) ---
                     if rank == 0 and batch_idx == 0:
