@@ -227,17 +227,15 @@ def train_loop(rank, flags):
         # --- OPTIMIZER FIX: Parameter Groups ---
         model_params = [p for p in model.parameters() if p.requires_grad]
         
-        # Use Standard AdamW for Stage 1, SAM(AdamW) for Stage 2
         if stage == 1:
             optimizer = optim.AdamW(model_params, lr=flags["lr"], weight_decay=1e-2)
         else:
-            # Stage 2: Sharpness-Aware Maximization
-            # rho=0.05 is a standard starting point for SAM
+            # Stage 2: SAM with AdamW as base
             optimizer = SAM(model_params, optim.AdamW, rho=0.05, lr=flags["lr"], weight_decay=1e-2)
 
         # --- SCHEDULER SETUP ---
         total_steps_in_stage = 28 * flags["epochs"] * num_batches_per_chunk
-        T_0 = total_steps_in_stage // 4
+        T_0 = total_steps_in_stage // 6
         scheduler = CosineAnnealingWarmRestarts(
             optimizer, 
             T_0=T_0, 
@@ -283,9 +281,9 @@ def train_loop(rank, flags):
             if teacher_cls_full.shape[1] == 25:
                 teacher_cls_full = teacher_cls_full[:, 1:25, :]
             
-            # --- Data Slicing (10/32) ---
+            # --- Data Slicing (10/32%) ---
             N_total_local = teacher_cls_full.shape[0]
-            N_target = (N_total_local // num_cores) * 12 
+            N_target = (N_total_local // num_cores) * 32 
 
             teacher_cls_full = teacher_cls_full[:N_target]
             teacher_label_full = teacher_label_full[:N_target]
@@ -321,13 +319,10 @@ def train_loop(rank, flags):
                     teacher_label = teacher_label.to(device)
                     teacher_log_probs = teacher_log_probs.to(device)
                     
-                    # --- LOSS COMPUTATION CLOSURE (For SAM) ---
-                    # We define this locally to run it multiple times if needed (SAM requires 2 passes)
+                    # --- COMPUTE LOSS CLOSURE ---
                     def compute_loss_step():
-                        # Forward Pass
                         halting_logits, class_logits, z = model(teacher_cls) 
                         
-                        # --- LOSS CALCULATION ---
                         labels = teacher_label.float().unsqueeze(1).expand(-1, L)
                         if class_logits.size(-1) == 2:
                             class_logits_positive = class_logits[:, :, 1]
@@ -353,31 +348,32 @@ def train_loop(rank, flags):
                         if stage == 1:
                             loss_cls = ce_per_layer.mean()
                             loss = (loss_cls * 2) + (0.1 * loss_contrast)
-                            # Return relevant stats
                             return loss, loss_cls, torch.tensor(0.0), halting_logits, class_logits
 
                         elif stage == 2:
-                            # --- INDEPENDENT HALTING LOSS ---
+                            # 1. Correctness
                             predictions = torch.argmax(class_logits, dim=-1)
                             is_correct = (predictions == teacher_label.unsqueeze(1)).float()
                             
+                            # 2. Halting
                             h = torch.sigmoid(halting_logits)
                             
-                            # Class-Aware Rebalancing
+                            # Class-Aware Weights
                             n_pos = (teacher_label == 1).sum().float()
                             n_neg = (teacher_label == 0).sum().float()
                             neg_weight_val = (n_pos / (n_neg + 1e-6)).clamp(min=1.0)
                             sample_weights = torch.ones_like(h)
                             sample_weights[teacher_label == 0] = neg_weight_val.item()
                             
+                            # 3. Loss
                             loss_halt = F.binary_cross_entropy(h, is_correct, weight=sample_weights)
                             
-                            # Entropy Regularization
+                            # 4. Entropy
                             entropy_weight = 0.0025 
                             h_entropy = - (h * (h + 1e-9).log() + (1 - h) * (1 - h + 1e-9).log())
                             loss_entropy = - entropy_weight * h_entropy.mean()
                             
-                            # Orthogonality Regularization
+                            # 5. Orthogonality
                             ortho_weight = 0.01 
                             head_weights = torch.cat([head.weight for head in model.halting_heads], dim=0)
                             head_weights_norm = F.normalize(head_weights, p=2, dim=1)
@@ -386,12 +382,10 @@ def train_loop(rank, flags):
                             loss_ortho = ((sim_matrix - identity) ** 2).sum() * ortho_weight
                             
                             loss = loss_halt + loss_entropy + loss_ortho
-                            
                             return loss, torch.tensor(0.0), loss_halt, halting_logits, class_logits
 
                     # --- OPTIMIZATION STEP ---
                     if stage == 1:
-                        # Standard AdamW Step
                         loss, loss_cls_val, _, halting_logits, class_logits = compute_loss_step()
                         optimizer.zero_grad()
                         loss.backward()
@@ -400,26 +394,29 @@ def train_loop(rank, flags):
                         loss_halt_val = torch.tensor(0.0)
                         
                     elif stage == 2:
-                        # SAM Step (Manual XLA Procedure)
-                        # 1. First Forward & Backward
+                        # SAM Step (Manual)
+                        # 1. First Pass
                         loss, _, loss_halt_val, halting_logits, class_logits = compute_loss_step()
                         optimizer.zero_grad()
                         loss.backward()
                         
-                        # Sync gradients across cores (Manual reduce because we are managing step)
+                        # Sync grads
                         xm.reduce_gradients(optimizer)
                         
-                        # 2. Perturb Weights (Ascent to worst neighbor)
+                        # Perturb (Ascent)
                         optimizer.first_step(zero_grad=True)
                         
-                        # 3. Second Forward & Backward (at perturbed state)
+                        # ⚠️ IMPORTANT: Flush graph to keep memory usage low
+                        xm.mark_step() 
+                        
+                        # 2. Second Pass
                         loss_2, _, _, _, _ = compute_loss_step()
                         loss_2.backward()
                         
-                        # Sync gradients again
+                        # Sync grads again
                         xm.reduce_gradients(optimizer)
                         
-                        # 4. Update Weights (Descent)
+                        # Update (Descent)
                         optimizer.second_step(zero_grad=True)
                         
                         loss_cls_val = torch.tensor(0.0)
@@ -428,7 +425,6 @@ def train_loop(rank, flags):
                     # Scheduler Step
                     scheduler.step()
                     
-                    # --- CAPTURE DIAGNOSTICS (Rank 0) ---
                     if rank == 0 and batch_idx == 0:
                         def extract_sample(label_val):
                             indices = (teacher_label == label_val).nonzero(as_tuple=True)[0]
@@ -443,7 +439,6 @@ def train_loop(rank, flags):
                         diag_sample_pos = extract_sample(1)
                         diag_sample_neg = extract_sample(0)
 
-                # --- End of Epoch Logging ---
                 loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
                 
                 if stage == 1:
