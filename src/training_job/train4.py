@@ -431,7 +431,7 @@ if __name__ == "__main__":
         "d_ctrl": 512,
         "transformer_layers": 4,
         "lr": 5e-4,
-        "batch_size": 32,   
+        "batch_size": 64,   
         "lambda_start": 0.0001,
         "lambda_target": 0.003,
         "epochs": 5,
