@@ -1,6 +1,6 @@
 import os
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 from torch.utils.data import TensorDataset, DataLoader, SequentialSampler
@@ -14,15 +14,17 @@ from training_data_download import training_data_download
 def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_shard):
     """
     Tests the model on a specific chunk using an early-exit strategy.
-    Runs ONLY on Device 0.
+    Runs ONLY on Device 0 logic, but workers must be handled.
     """
+    # Note: In XLA, even if only Rank 0 does the math, we must ensure 
+    # no global syncs are triggered inside here that workers aren't part of.
     if rank != 0:
         return
 
     device = xm.xla_device()
     
     xm.master_print(f"\n{'*'*80}")
-    xm.master_print(f"*** STARTING EVALUATION ON CHUNK {chunk_idx} (Device 0 Only) ***")
+    xm.master_print(f"*** STARTING EVALUATION ON CHUNK {chunk_idx} (Threshold: {threshold}) ***")
     xm.master_print(f"{'*'*80}")
 
     model.eval()
@@ -35,7 +37,7 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
     )
     
     if data is None:
-        xm.master_print(f"[Core {rank}] Failed to load test data for chunk {chunk_idx}")
+        xm.master_print(f"❌ [Core {rank}] Failed to load test data for chunk {chunk_idx}")
         return
 
     teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
@@ -69,9 +71,10 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
             h_probs = torch.sigmoid(halting_logits)
             threshold_mask = (h_probs > threshold)
             
+            # Determine exit layer
             exit_indices = torch.argmax(threshold_mask.long(), dim=1)
             row_has_exit = threshold_mask.any(dim=1)
-            exit_indices[~row_has_exit] = 23
+            exit_indices[~row_has_exit] = 23 # Default to last layer
             
             batch_indices = torch.arange(class_logits.size(0), device=device)
             selected_logits = class_logits[batch_indices, exit_indices]
@@ -81,10 +84,12 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
             total_correct += correct_tensor.item() 
             total_samples += teacher_label.size(0)
             
+            # Track statistics on CPU
             exit_indices_cpu = exit_indices.cpu()
             unique_exits, counts = torch.unique(exit_indices_cpu, return_counts=True)
             layer_exit_counts_cpu.index_add_(0, unique_exits, counts.float())
             
+            # Local sync for Rank 0 to keep memory clean
             xm.mark_step()
             
             if i % 100 == 0:
@@ -92,119 +97,92 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
             
     accuracy = (total_correct / total_samples) * 100.0
     
-    # --- Statistics Calculation ---
+    # --- Stats ---
     layers = torch.arange(24, dtype=torch.float32)
     avg_exit_layer = (layer_exit_counts_cpu * layers).sum() / total_samples
-    variance = (layer_exit_counts_cpu * (layers - avg_exit_layer).pow(2)).sum() / total_samples
-    std_exit_layer = torch.sqrt(variance)
+    std_exit_layer = torch.sqrt((layer_exit_counts_cpu * (layers - avg_exit_layer).pow(2)).sum() / total_samples)
     
-    # --- MAD Calculation ---
-    counts_int = layer_exit_counts_cpu.long()
-    all_exit_layers = torch.repeat_interleave(layers, counts_int)
-    med_exit_layer = all_exit_layers.median()
-    abs_dev = torch.abs(all_exit_layers - med_exit_layer)
-    mad_exit_layer = abs_dev.median()
-    
-    xm.master_print(f"RESULTS FOR CHUNK {chunk_idx} (Threshold: {threshold}):")
-    xm.master_print(f"  Accuracy: {accuracy:.2f}% ({total_correct}/{total_samples})")
-    xm.master_print(f"  Average Exit Layer: {avg_exit_layer:.2f} +/- {std_exit_layer:.2f} (0-23)")
-    xm.master_print(f"  Median Exit Layer:  {med_exit_layer:.2f} (MAD: {mad_exit_layer:.2f})")
-    
-    # --- Histogram Log ---
-    xm.master_print(f"  Exit Layer Distribution (0-23): {layer_exit_counts_cpu.long().tolist()}")
-    
+    xm.master_print(f"RESULTS:")
+    xm.master_print(f"  Accuracy: {accuracy:.2f}%")
+    xm.master_print(f"  Avg Exit: {avg_exit_layer:.2f} +/- {std_exit_layer:.2f}")
+    xm.master_print(f"  Distribution: {layer_exit_counts_cpu.long().tolist()}")
     xm.master_print(f"{'*'*80}\n")
 
-    model.train() 
 
-# =========================================================================
-# EVALUATION LOOP
-# =========================================================================
-def eval_loop(rank, flags):
-    device = xm.torch_xla.device()
-    num_cores = xm.xrt_world_size()
+def eval_main(rank, flags):
+    device = xm.xla_device()
     
-    # 1. Model Initialization
-    L = 24
+    # 1. Initialize Model
     model = Controller(
-        L=L,
+        L=24,
         d_teacher=1024,
         d_ctrl=flags["d_ctrl"],
         n_layers=flags["transformer_layers"],
         num_classes=2
     ).to(device)
+
+    # 2. Loading Weights (All Ranks participate to avoid rendezvous mismatch)
+    load_path = os.path.expanduser("~/SIGNLL/final_model_stage2.pt")
     
-    # 2. Load trained model weights
-    model_path = flags.get("model_path", os.path.expanduser("~/SIGNLL/final_model_stage2.pt"))
-    
-    if rank == 0:
-        xm.master_print(f"Loading model from: {model_path}")
-    
-    if not os.path.exists(model_path):
+    # Critical: Check path existence on all ranks before trying to load
+    if not os.path.exists(load_path):
         if rank == 0:
-            xm.master_print(f"ERROR: Model file not found at {model_path}")
+            print(f"❌ ERROR: Model not found at {load_path}")
+        # All ranks must hit this rendezvous before exiting
+        xm.rendezvous("model_not_found_abort")
         return
-    
-    # Load state dict
-    state_dict = torch.load(model_path, map_location='cpu')
+
+    # All ranks load the state dict to CPU
+    state_dict = torch.load(load_path, map_location='cpu')
     model.load_state_dict(state_dict)
     
-    if rank == 0:
-        xm.master_print("Model loaded successfully!")
-    
-    # Sync model weights across all cores
-    for param in model.parameters():
-        param.data = xm.all_reduce(xm.REDUCE_SUM, param.data) / num_cores
+    # Sync weights to TPU device and clear graph
     xm.mark_step()
     
-    xm.rendezvous("weights_synced")
-    
-    # 3. Run evaluations at different thresholds
+    if rank == 0:
+        xm.master_print(f"✅ Successfully loaded and synced model from {load_path}")
+
+    # Everyone must reach this point
+    xm.rendezvous("model_loaded_and_synced")
+
+    # 3. Evaluation
     test_chunk = flags.get("test_chunk", 29)
-    thresholds = flags.get("thresholds", [0.5, 0.6, 0.7, 0.8, 0.9, 0.95])
+    thresholds = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
     
     if rank == 0:
-        xm.master_print(f"\n{'='*80}")
-        xm.master_print(f"STARTING EVALUATION ON CHUNK {test_chunk}")
-        xm.master_print(f"Testing thresholds: {thresholds}")
-        xm.master_print(f"{'='*80}\n")
-    
-    for threshold in thresholds:
-        evaluate_model(
-            rank, 
-            model, 
-            test_chunk, 
-            threshold, 
-            flags["batch_size"], 
-            flags["samples_per_shard"]
-        )
-        xm.rendezvous(f"eval_threshold_{threshold}")
-    
+        # Rank 0 performs the actual evaluation
+        for thresh in thresholds:
+            evaluate_model(rank, model, test_chunk, thresh, flags["batch_size"], flags["samples_per_shard"])
+            xm.rendezvous(f"eval_threshold_{thresh}")
+        # After finishing all loops, Rank 0 signals workers to release
+        xm.rendezvous("evaluation_complete")
+    else:
+        # Workers (1-7) wait at this barrier while Rank 0 is in the loop above
+        xm.rendezvous("evaluation_complete")
+
     if rank == 0:
-        xm.master_print("✅ Evaluation Complete.")
-    
-    xm.rendezvous("final_check")
+        xm.master_print("✅ Evaluation script finished successfully.")
 
 def _mp_fn(rank, flags):
     try:
+        # Ensure default tensors are on CPU for the initial load
         torch.set_default_tensor_type('torch.FloatTensor')
-        eval_loop(rank, flags)
+        eval_main(rank, flags)
     except Exception as e:
-        print(f"[Core {rank}] FATAL ERROR: {e}")
+        print(f" 🔥 [Core {rank}] FATAL ERROR: {e}")
         import traceback
         traceback.print_exc()
-        raise
+        # If one core fails, we try to force an exit to prevent hanging others
+        os._exit(1) 
 
 if __name__ == "__main__":
-    EVAL_FLAGS = {
+    BASE_FLAGS = {
         "d_ctrl": 512,
         "transformer_layers": 4,
         "batch_size": 32,
-        "samples_per_shard": 39000,
-        "test_chunk": 29,
-        "model_path": os.path.expanduser("~/SIGNLL/final_model_stage2.pt"),
-        "thresholds": [0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
-    }
+        "samples_per_shard": 39000, 
+        "test_chunk": 29
+    }  
     
-    print("Starting Evaluation XLA Job.")
-    xmp.spawn(_mp_fn, args=(EVAL_FLAGS,), start_method='fork')
+    print("Starting Synchronized Evaluation Job.")
+    xmp.spawn(_mp_fn, args=(BASE_FLAGS,), start_method='fork')
