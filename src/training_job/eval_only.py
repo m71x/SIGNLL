@@ -153,7 +153,7 @@ def eval_main(rank, flags):
 
     # 3. Evaluation
     test_chunk = flags.get("test_chunk", 29)
-    thresholds = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+    thresholds = [0.95]
     
     # ALL ranks iterate together
     for threshold in thresholds:
