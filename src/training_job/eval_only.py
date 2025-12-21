@@ -35,20 +35,22 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
         filename=current_chunk_filename,
         max_entries=samples_per_shard
     )
-    
+    xm.master_print("data downloaded")
     if data is None:
         xm.master_print(f"❌ [Core {rank}] Failed to load test data for chunk {chunk_idx}")
         return
 
     teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
     teacher_label_full = torch.from_numpy(data['classifications']).long()
-    
+    xm.master_print("teacher labels loaded")
+
     if teacher_cls_full.shape[1] == 25:
         teacher_cls_full = teacher_cls_full[:, 1:25, :]
     
     dataset = TensorDataset(teacher_cls_full, teacher_label_full)
     sampler = SequentialSampler(dataset)
-    
+    xm.master_print("sampler loaded")
+
     data_loader = DataLoader(
         dataset,
         sampler=sampler,
@@ -57,10 +59,11 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
         num_workers=2
     )
     
+    xm.master_print("dataLoader done")
     total_samples = 0
     total_correct = 0
     layer_exit_counts_cpu = torch.zeros(24, dtype=torch.float32)
-
+    xm.master_print("entering loop")
     with torch.no_grad():
         for i, (teacher_cls, teacher_label) in enumerate(data_loader):
             teacher_cls = teacher_cls.to(device)
@@ -153,7 +156,7 @@ def eval_main(rank, flags):
         # Rank 0 performs the actual evaluation
         for thresh in thresholds:
             evaluate_model(rank, model, test_chunk, thresh, flags["batch_size"], flags["samples_per_shard"])
-            xm.rendezvous(f"eval_threshold_{thresh}")
+        
         # After finishing all loops, Rank 0 signals workers to release
         xm.rendezvous("evaluation_complete")
     else:
