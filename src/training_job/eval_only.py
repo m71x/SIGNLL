@@ -96,7 +96,7 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
             xm.mark_step()
             
             if i % 100 == 0:
-                print(f"[Eval] Processed batch {i}...")
+                xm.master_print(f"[Eval] Processed batch {i}...")
             
     accuracy = (total_correct / total_samples) * 100.0
     
