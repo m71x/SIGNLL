@@ -54,7 +54,7 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
         sampler=sampler,
         batch_size=batch_size,
         drop_last=False,
-        num_workers=0
+        num_workers=2
     )
     
     total_samples = 0
@@ -155,10 +155,7 @@ def eval_main(rank, flags):
             evaluate_model(rank, model, test_chunk, thresh, flags["batch_size"], flags["samples_per_shard"])
         
         # After finishing all loops, Rank 0 signals workers to release
-        xm.rendezvous("evaluation_complete")
-    else:
-        # Workers (1-7) wait at this barrier while Rank 0 is in the loop above
-        xm.rendezvous("evaluation_complete")
+    xm.rendezvous("final")
 
     if rank == 0:
         xm.master_print("✅ Evaluation script finished successfully.")
