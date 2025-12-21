@@ -27,7 +27,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
-    --worker=6
+    --worker=3
 #run inference
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
@@ -74,14 +74,14 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="tmux new -d -s signll_train 'cd ~/SIGNLL && PJRT_DEVICE=TPU python3 train_only.py'"
+  --command="tmux new -d -s signll_train 'cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/training_job/train_only.py'"
 
 #run eval (no tmux)
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="cd ~/SIGNLL && PJRT_DEVICE=TPU python3 eval_only.py"  
+  --command="cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/training_job/eval_only.py"  
 
 #clone xla onto all workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
