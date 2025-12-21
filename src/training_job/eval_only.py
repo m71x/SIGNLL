@@ -35,22 +35,20 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
         filename=current_chunk_filename,
         max_entries=samples_per_shard
     )
-    xm.master_print("data downloaded")
+    
     if data is None:
         xm.master_print(f"❌ [Core {rank}] Failed to load test data for chunk {chunk_idx}")
         return
 
     teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
     teacher_label_full = torch.from_numpy(data['classifications']).long()
-    xm.master_print("teacher labels loaded")
-
+    
     if teacher_cls_full.shape[1] == 25:
         teacher_cls_full = teacher_cls_full[:, 1:25, :]
     
     dataset = TensorDataset(teacher_cls_full, teacher_label_full)
     sampler = SequentialSampler(dataset)
-    xm.master_print("sampler loaded")
-
+    
     data_loader = DataLoader(
         dataset,
         sampler=sampler,
@@ -59,11 +57,10 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
         num_workers=0
     )
     
-    xm.master_print("dataLoader done")
     total_samples = 0
     total_correct = 0
     layer_exit_counts_cpu = torch.zeros(24, dtype=torch.float32)
-    xm.master_print("entering loop")
+
     with torch.no_grad():
         for i, (teacher_cls, teacher_label) in enumerate(data_loader):
             teacher_cls = teacher_cls.to(device)
@@ -96,18 +93,15 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
             xm.mark_step()
             
             if i % 100 == 0:
-                xm.master_print(f"[Eval] Processed batch {i}...")
+                print(f"[Eval] Processed batch {i}...")
             
     accuracy = (total_correct / total_samples) * 100.0
-    xm.master_print("calculated accuracy")
+    
     # --- Stats ---
     layers = torch.arange(24, dtype=torch.float32)
-    xm.master_print("layers")
     avg_exit_layer = (layer_exit_counts_cpu * layers).sum() / total_samples
-    xm.master_print("avg exit layers")
     std_exit_layer = torch.sqrt((layer_exit_counts_cpu * (layers - avg_exit_layer).pow(2)).sum() / total_samples)
-    xm.master_print("calculated std exit layers")
-
+    
     xm.master_print(f"RESULTS:")
     xm.master_print(f"  Accuracy: {accuracy:.2f}%")
     xm.master_print(f"  Avg Exit: {avg_exit_layer:.2f} +/- {std_exit_layer:.2f}")
@@ -153,13 +147,18 @@ def eval_main(rank, flags):
 
     # 3. Evaluation
     test_chunk = flags.get("test_chunk", 29)
-    thresholds = [0.95]
+    thresholds = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
     
-    # ALL ranks iterate together
-    for threshold in thresholds:
-        evaluate_model(rank, model, test_chunk, threshold, flags["batch_size"], flags["samples_per_shard"])  # All ranks call it, only rank 0 does work inside
-
-    xm.rendezvous("evaluation_complete")  # All ranks hit this together
+    if rank == 0:
+        # Rank 0 performs the actual evaluation
+        for thresh in thresholds:
+            evaluate_model(rank, model, test_chunk, thresh, flags["batch_size"], flags["samples_per_shard"])
+        
+        # After finishing all loops, Rank 0 signals workers to release
+        xm.rendezvous("evaluation_complete")
+    else:
+        # Workers (1-7) wait at this barrier while Rank 0 is in the loop above
+        xm.rendezvous("evaluation_complete")
 
     if rank == 0:
         xm.master_print("✅ Evaluation script finished successfully.")
