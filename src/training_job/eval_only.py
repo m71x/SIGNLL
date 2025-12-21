@@ -99,12 +99,15 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
                 xm.master_print(f"[Eval] Processed batch {i}...")
             
     accuracy = (total_correct / total_samples) * 100.0
-    
+    xm.master_print("calculated accuracy")
     # --- Stats ---
     layers = torch.arange(24, dtype=torch.float32)
+    xm.master_print("layers")
     avg_exit_layer = (layer_exit_counts_cpu * layers).sum() / total_samples
+    xm.master_print("avg exit layers")
     std_exit_layer = torch.sqrt((layer_exit_counts_cpu * (layers - avg_exit_layer).pow(2)).sum() / total_samples)
-    
+    xm.master_print("calculated std exit layers")
+
     xm.master_print(f"RESULTS:")
     xm.master_print(f"  Accuracy: {accuracy:.2f}%")
     xm.master_print(f"  Avg Exit: {avg_exit_layer:.2f} +/- {std_exit_layer:.2f}")
