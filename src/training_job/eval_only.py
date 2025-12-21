@@ -157,7 +157,7 @@ def eval_main(rank, flags):
     
     # ALL ranks iterate together
     for threshold in thresholds:
-        evaluate_model(...)  # All ranks call it, only rank 0 does work inside
+        evaluate_model(rank, model, test_chunk, threshold, flags["batch_size"], flags["samples_per_shard"])  # All ranks call it, only rank 0 does work inside
 
     xm.rendezvous("evaluation_complete")  # All ranks hit this together
 
