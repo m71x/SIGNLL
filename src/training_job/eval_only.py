@@ -14,10 +14,8 @@ from training_data_download import training_data_download
 def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_shard):
     """
     Tests the model on a specific chunk using an early-exit strategy.
-    Runs ONLY on Device 0 logic, but workers must be handled.
+    Fixed version that doesn't hang on high thresholds.
     """
-    # Note: In XLA, even if only Rank 0 does the math, we must ensure 
-    # no global syncs are triggered inside here that workers aren't part of.
     if rank != 0:
         return
 
@@ -61,6 +59,11 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
     total_correct = 0
     layer_exit_counts_cpu = torch.zeros(24, dtype=torch.float32)
 
+    # CRITICAL FIX: Accumulate results on CPU to avoid XLA graph issues
+    all_exit_indices = []
+    all_predictions = []
+    all_labels = []
+
     with torch.no_grad():
         for i, (teacher_cls, teacher_label) in enumerate(data_loader):
             teacher_cls = teacher_cls.to(device)
@@ -74,30 +77,37 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
             # Determine exit layer
             exit_indices = torch.argmax(threshold_mask.long(), dim=1)
             row_has_exit = threshold_mask.any(dim=1)
-            exit_indices[~row_has_exit] = 23 # Default to last layer
+            exit_indices[~row_has_exit] = 23  # Default to last layer
             
             batch_indices = torch.arange(class_logits.size(0), device=device)
             selected_logits = class_logits[batch_indices, exit_indices]
             predictions = torch.argmax(selected_logits, dim=-1)
             
-            correct_tensor = (predictions == teacher_label).sum()
-            total_correct += correct_tensor.item() 
-            total_samples += teacher_label.size(0)
+            # CRITICAL FIX: Move to CPU immediately and accumulate
+            all_exit_indices.append(exit_indices.cpu())
+            all_predictions.append(predictions.cpu())
+            all_labels.append(teacher_label.cpu())
             
-            # Track statistics on CPU
-            exit_indices_cpu = exit_indices.cpu()
-            unique_exits, counts = torch.unique(exit_indices_cpu, return_counts=True)
-            layer_exit_counts_cpu.index_add_(0, unique_exits, counts.float())
-            
-            # Local sync for Rank 0 to keep memory clean
+            # CRITICAL FIX: Mark step AFTER moving to CPU
             xm.mark_step()
             
             if i % 100 == 0:
-                print(f"[Eval] Processed batch {i}...")
-            
+                print(f"[Eval] Processed batch {i}/{len(data_loader)}...")
+    
+    # Process all accumulated results on CPU (no XLA involvement)
+    all_exit_indices = torch.cat(all_exit_indices)
+    all_predictions = torch.cat(all_predictions)
+    all_labels = torch.cat(all_labels)
+    
+    total_samples = len(all_labels)
+    total_correct = (all_predictions == all_labels).sum().item()
     accuracy = (total_correct / total_samples) * 100.0
     
-    # --- Stats ---
+    # Calculate exit statistics
+    unique_exits, counts = torch.unique(all_exit_indices, return_counts=True)
+    layer_exit_counts_cpu.index_add_(0, unique_exits, counts.float())
+    
+    # Calculate mean and std
     layers = torch.arange(24, dtype=torch.float32)
     avg_exit_layer = (layer_exit_counts_cpu * layers).sum() / total_samples
     std_exit_layer = torch.sqrt((layer_exit_counts_cpu * (layers - avg_exit_layer).pow(2)).sum() / total_samples)
