@@ -132,8 +132,9 @@ class Controller(nn.Module):
         self.post_ln = nn.LayerNorm(d_ctrl) 
 
         # 3. Output Heads
+        # MODIFIED: Input dim is now d_ctrl + 1 to account for entropy scalar
         self.halting_heads = nn.ModuleList([
-            nn.Linear(d_ctrl, 1) for _ in range(L)
+            nn.Linear(d_ctrl + 1, 1) for _ in range(L)
         ])
         
         self.classifier_heads = nn.ModuleList([
@@ -189,11 +190,27 @@ class Controller(nn.Module):
         class_logits_list = []
         
         for l in range(L):
-            h_l = self.halting_heads[l](z[:, l, :]) 
-            halting_logits_list.append(h_l)
-            
+            # A. Compute Classifier Logits FIRST
             c_l = self.classifier_heads[l](z[:, l, :]) 
             class_logits_list.append(c_l)
+            
+            # B. Calculate Entropy of predictions (Uncertainty)
+            # Use safe soft/log_softmax to avoid NaNs
+            probs = F.softmax(c_l, dim=-1)
+            log_probs = F.log_softmax(c_l, dim=-1)
+            
+            # entropy = -sum(p * log(p))
+            # Use where() to handle 0 * -inf cases safely
+            p_log_p = torch.where(probs > 0, probs * log_probs, torch.zeros_like(probs))
+            entropy = -p_log_p.sum(dim=-1, keepdim=True) # [B, 1]
+            
+            # C. Concatenate [Hidden_State, Entropy] for Halting Head
+            # z[l]: [B, d_ctrl], entropy: [B, 1] -> combined: [B, d_ctrl + 1]
+            combined_input = torch.cat([z[:, l, :], entropy], dim=-1)
+            
+            # D. Compute Halting Logits using combined input
+            h_l = self.halting_heads[l](combined_input) 
+            halting_logits_list.append(h_l)
         
         halting_logits = torch.cat(halting_logits_list, dim=-1).squeeze(-1) 
         class_logits = torch.stack(class_logits_list, dim=1)
