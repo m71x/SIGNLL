@@ -155,16 +155,11 @@ def eval_main(rank, flags):
     test_chunk = flags.get("test_chunk", 29)
     thresholds = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
     
-    if rank == 0:
-        # Rank 0 performs the actual evaluation
-        for thresh in thresholds:
-            evaluate_model(rank, model, test_chunk, thresh, flags["batch_size"], flags["samples_per_shard"])
-        
-        # After finishing all loops, Rank 0 signals workers to release
-        xm.rendezvous("evaluation_complete")
-    else:
-        # Workers (1-7) wait at this barrier while Rank 0 is in the loop above
-        xm.rendezvous("evaluation_complete")
+    # ALL ranks iterate together
+    for threshold in thresholds:
+        evaluate_model(...)  # All ranks call it, only rank 0 does work inside
+
+    xm.rendezvous("evaluation_complete")  # All ranks hit this together
 
     if rank == 0:
         xm.master_print("✅ Evaluation script finished successfully.")
