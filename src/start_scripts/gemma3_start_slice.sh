@@ -69,6 +69,19 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all \
   --command="pkill -f -u mikexi python3"
   
+#run tmux training only
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="tmux new -d -s signll_train 'cd ~/SIGNLL && PJRT_DEVICE=TPU python3 train_only.py'"
+
+#run eval (no tmux)
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="cd ~/SIGNLL && PJRT_DEVICE=TPU python3 eval_only.py"  
 
 #clone xla onto all workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
