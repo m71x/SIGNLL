@@ -267,6 +267,8 @@ def train_loop(rank, flags):
                         loss_hard = bce_loss_fn(class_logits_positive, labels)
 
                         teacher_log_probs_expanded = teacher_log_probs.unsqueeze(1).expand(-1, L, -1)
+                        # Fix: Clamp student_log_probs to prevent Inf/NaN in KL calculation
+                        student_log_probs = student_log_probs.clamp(min=-100.0) 
                         kl_elementwise = teacher_log_probs_expanded.exp() * (teacher_log_probs_expanded - student_log_probs)
                         loss_soft = kl_elementwise.sum(dim=-1)
 
