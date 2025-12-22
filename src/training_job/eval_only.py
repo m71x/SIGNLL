@@ -171,7 +171,7 @@ def eval_main(rank, flags):
         evaluate_model(rank, model, test_chunk, thresh, flags["batch_size"], flags["samples_per_shard"])
         
         # After finishing all loops, Rank 0 signals workers to release
-    xm.rendezvous("final")
+    #xm.rendezvous("final")
 
     if rank == 0:
         xm.master_print("✅ Evaluation script finished successfully.")
