@@ -60,17 +60,23 @@ class CustomTransformerLayer(nn.Module):
 # =========================================================================
 # NEW: Simple Gating Module for Entropy
 # =========================================================================
-class EntropyGate(nn.Module):
-    """Small network that learns to gate/weight the entropy signal."""
-    def __init__(self, d_ctrl: int):
+class VectorizedEntropyGate(nn.Module):
+    def __init__(self, d_ctrl: int, L: int):
         super().__init__()
-        # Tiny 2-layer network: hidden state -> gate weight [0,1]
-        self.gate = nn.Sequential(
+        # Use simple Linears; they natively support [Batch, Seq, Dim] inputs
+        self.net = nn.Sequential(
             nn.Linear(d_ctrl, 8),
             nn.Tanh(),
             nn.Linear(8, 1),
             nn.Sigmoid()
         )
+
+    def forward(self, z: torch.Tensor, entropy: torch.Tensor) -> torch.Tensor:
+        # z: [B, L, D]
+        # entropy: [B, L, 1]
+        
+        gate_weight = self.net(z) # Output: [B, L, 1]
+        return entropy * gate_weight
     
     def forward(self, z: torch.Tensor, entropy: torch.Tensor) -> torch.Tensor:
         """
