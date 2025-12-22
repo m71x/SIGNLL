@@ -63,6 +63,7 @@ class GatedHaltingHead(nn.Module):
         super().__init__()
         self.trust_gate = nn.Sequential(
             nn.Linear(d_ctrl, 32),
+            nn.LayerNorm(32), # Added to prevent activation drift
             nn.ReLU(),
             nn.Linear(32, 1),
             nn.Sigmoid() 
@@ -70,8 +71,16 @@ class GatedHaltingHead(nn.Module):
         self.head = nn.Linear(d_ctrl + 1, 1)
 
     def forward(self, z, entropy):
+        # 1. Sanitize entropy: replace NaNs/Infs with 0 before gating
+        clean_entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # 2. Compute gate with its own internal normalization
         gate = self.trust_gate(z) 
-        gated_entropy = entropy * gate
+        
+        # 3. Gated signal
+        gated_entropy = clean_entropy * gate
+        
+        # 4. Concatenate and pass to head
         combined = torch.cat([z, gated_entropy], dim=-1)
         return self.head(combined)
 
