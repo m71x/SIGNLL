@@ -1,23 +1,20 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch_xla.core.xla_model as xm
 import math 
 
 # =========================================================================
 # RoPE Utility Functions
 # =========================================================================
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Rotates half the hidden dimension for RoPE."""
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 
 def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Applies RoPE to the input tensor x. Shapes: [B, L, D]"""
     return (x * cos) + (rotate_half(x) * sin)
 
 # =========================================================================
-# SwiGLU Feed-Forward Network
+# SwiGLU & Transformer Layers
 # =========================================================================
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, hidden_dim: int, dropout: float = 0.1):
@@ -32,9 +29,6 @@ class SwiGLU(nn.Module):
         hidden = F.silu(x1) * x2
         return self.dropout(self.w3(hidden))
 
-# =========================================================================
-# Custom Transformer Layer (Pre-Norm + SwiGLU)
-# =========================================================================
 class CustomTransformerLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward, dropout):
         super().__init__()
@@ -50,47 +44,66 @@ class CustomTransformerLayer(nn.Module):
         x_norm = self.norm1(x)
         attn_out, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=mask, need_weights=False)
         x = x + self.dropout1(attn_out)
-        
         x_norm = self.norm2(x)
         ffn_out = self.ffn(x_norm)
         x = x + self.dropout2(ffn_out)
-        
         return x
 
 # =========================================================================
-# NEW: Simple Gating Module for Entropy
+# OPTIMIZED: Vectorized Gating Module
 # =========================================================================
 class VectorizedEntropyGate(nn.Module):
     def __init__(self, d_ctrl: int, L: int):
         super().__init__()
-        # Use simple Linears; they natively support [Batch, Seq, Dim] inputs
-        self.net = nn.Sequential(
-            nn.Linear(d_ctrl, 8),
-            nn.Tanh(),
-            nn.Linear(8, 1),
-            nn.Sigmoid()
+        # We use Conv1d with groups=L to simulate L independent Linear layers
+        # Input: [B, D*L, 1] (reshaped) -> Output: [B, 8*L, 1]
+        self.L = L
+        self.d_ctrl = d_ctrl
+        
+        # Layer 1: d_ctrl -> 8 (Unique weights per layer L)
+        self.net1 = nn.Conv1d(
+            in_channels=d_ctrl * L, 
+            out_channels=8 * L, 
+            kernel_size=1, 
+            groups=L
         )
+        self.act = nn.Tanh()
+        
+        # Layer 2: 8 -> 1 (Unique weights per layer L)
+        self.net2 = nn.Conv1d(
+            in_channels=8 * L, 
+            out_channels=1 * L, 
+            kernel_size=1, 
+            groups=L
+        )
+        self.sigmoid = nn.Sigmoid()
 
-    def forward(self, z: torch.Tensor, entropy: torch.Tensor) -> torch.Tensor:
+        # Initialize to output 0.5 (bias=0)
+        nn.init.constant_(self.net2.bias, 0.0)
+
+    def forward(self, z, entropy):
         # z: [B, L, D]
         # entropy: [B, L, 1]
+        B, L, D = z.shape
         
-        gate_weight = self.net(z) # Output: [B, L, 1]
-        return entropy * gate_weight
-    
-    def forward(self, z: torch.Tensor, entropy: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z: [B, d_ctrl] - hidden state
-            entropy: [B, 1] - raw entropy value
-        Returns:
-            gated_entropy: [B, 1] - entropy scaled by learned gate
-        """
-        gate_weight = self.gate(z)  # [B, 1]
-        return entropy * gate_weight
+        # 1. Reshape for Conv1d: [B, D*L, 1]
+        # We permute to put features in channel dim, then flatten L*D
+        z_reshaped = z.transpose(1, 2).reshape(B, D * L, 1)
+        
+        # 2. Forward Pass (Vectorized)
+        out = self.net1(z_reshaped)      # [B, 8*L, 1]
+        out = self.act(out)
+        out = self.net2(out)             # [B, L, 1]
+        gate = self.sigmoid(out)
+        
+        # 3. Reshape back to [B, L, 1]
+        gate = gate.reshape(B, L, 1)
+        
+        return entropy * gate
 
 # =========================================================================
-
+# CONTROLLER
+# =========================================================================
 class Controller(nn.Module):
     def __init__(
         self,
@@ -130,12 +143,7 @@ class Controller(nn.Module):
         
         # 2. Controller Architecture
         self.layers = nn.ModuleList([
-            CustomTransformerLayer(
-                d_model=d_ctrl,
-                nhead=n_heads,
-                dim_feedforward=ffn_dim,
-                dropout=dropout
-            )
+            CustomTransformerLayer(d_ctrl, n_heads, ffn_dim, dropout)
             for _ in range(n_layers)
         ])
         
@@ -143,12 +151,9 @@ class Controller(nn.Module):
         self.post_ln = nn.LayerNorm(d_ctrl) 
 
         # 3. Output Heads
-        # NEW: Add entropy gates (one per layer)
-        self.entropy_gates = nn.ModuleList([
-            EntropyGate(d_ctrl) for _ in range(L)
-        ])
+        # OPTIMIZED: Single Vectorized Gate Module (Replaces List of 24)
+        self.entropy_gate_module = VectorizedEntropyGate(d_ctrl, L)
         
-        # Halting heads now take [d_ctrl + 1] (hidden + gated_entropy)
         self.halting_heads = nn.ModuleList([
             nn.Linear(d_ctrl + 1, 1) for _ in range(L)
         ])
@@ -164,86 +169,73 @@ class Controller(nn.Module):
         with torch.no_grad():
             for head in self.halting_heads:
                 head.bias.fill_(halting_bias_init)
-            
-            # Initialize gates to output ~0.5 initially (middle of sigmoid range)
-            for gate_module in self.entropy_gates:
-                gate_module.gate[-2].bias.fill_(0.0)  # Sigmoid(0) = 0.5
 
     def _init_weights(self, module):
-        """Applies stable weight initialization."""
         if isinstance(module, nn.Linear):
             nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
-            if module.bias is not None:
-                nn.init.constant_(module.bias, 0)
+            if module.bias is not None: nn.init.constant_(module.bias, 0)
         elif isinstance(module, nn.LayerNorm):
             nn.init.constant_(module.weight, 1.0)
             nn.init.constant_(module.bias, 0.0)
+        # Conv1d is initialized by default, but we can add explicit init if needed
 
     def forward(self, teacher_cls: torch.Tensor):
         B, L, D = teacher_cls.shape
+        assert L == self.L
 
-        assert L == self.L and D == self.d_teacher, \
-            f"Shape mismatch! got (L={L}, D={D}) but model expects (L={self.L}, D={self.d_teacher})"
-        
-        # 1. Controller Body Computation
+        # 1. Controller Body
         x = self.input_ln(teacher_cls)
         x = self.proj(x)
         x = apply_rotary_pos_emb(x, self.cos_cached, self.sin_cached)
         x = self.pre_ln(x)
-        
-        # Mask
         attn_mask = torch.triu(torch.ones(L, L, device=teacher_cls.device), diagonal=1).bool()
         
-        # Iterate through Custom Layers
         z = x
         for layer in self.layers:
             z = layer(z, mask=attn_mask)
-            
         z = self.post_ln(z) 
         
-        # 2. Apply Unique Heads
-        halting_logits_list = []
+        # 2. Gather All Class Logits & Entropy FIRST
+        # (We still loop here because classifier_heads is a ModuleList, but this was baseline speed)
         class_logits_list = []
+        entropy_list = []
+        
+        max_entropy = math.log(self.num_classes)
         
         for l in range(L):
-            # A. Compute Classifier Logits
             c_l = self.classifier_heads[l](z[:, l, :]) 
             class_logits_list.append(c_l)
             
-            # B. Calculate Entropy (numerically stable)
+            # Stable Entropy Calc
             log_probs = F.log_softmax(c_l, dim=-1)
             probs = torch.exp(log_probs)
-            
-            # Clamp to avoid log(0)
             probs_safe = probs.clamp(min=1e-10, max=1.0)
             log_probs_safe = torch.log(probs_safe)
             
             # Entropy: -sum(p * log(p))
-            entropy = -(probs_safe * log_probs_safe).sum(dim=-1, keepdim=True)  # [B, 1]
+            ent = -(probs_safe * log_probs_safe).sum(dim=-1, keepdim=True)
+            ent_norm = (ent / max_entropy).clamp(0.0, 1.0)
+            entropy_list.append(ent_norm)
             
-            # Normalize entropy to [0, 1] range
-            max_entropy = math.log(self.num_classes)
-            entropy_normalized = (entropy / max_entropy).clamp(0.0, 1.0)
+        # Stack: [B, L, 1]
+        all_entropies = torch.stack(entropy_list, dim=1)
+        
+        # 3. OPTIMIZED: Run Vectorized Gate on ALL layers at once
+        # Input: z [B, L, D], all_entropies [B, L, 1]
+        # Output: [B, L, 1]
+        all_gated_entropies = self.entropy_gate_module(z, all_entropies)
+
+        # 4. Compute Halting
+        halting_logits_list = []
+        for l in range(L):
+            # Extract the pre-computed gate for this layer
+            gated_ent_l = all_gated_entropies[:, l, :] # [B, 1]
             
-            # C. NEW: Apply learned gate to entropy
-            gated_entropy = self.entropy_gates[l](z[:, l, :], entropy_normalized)
-            
-            # D. Concatenate [Hidden_State, Gated_Entropy] for Halting Head
-            combined_input = torch.cat([z[:, l, :], gated_entropy], dim=-1)
-            
-            # E. Compute Halting Logits
+            combined_input = torch.cat([z[:, l, :], gated_ent_l], dim=-1)
             h_l = self.halting_heads[l](combined_input) 
             halting_logits_list.append(h_l)
         
-        halting_logits = torch.cat(halting_logits_list, dim=-1)  # [B, L]
-        class_logits = torch.stack(class_logits_list, dim=1)  # [B, L, num_classes]
+        halting_logits = torch.cat(halting_logits_list, dim=-1) 
+        class_logits = torch.stack(class_logits_list, dim=1)
         
         return halting_logits, class_logits, z
-
-def compute_q_from_h(h: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    h = h.clamp(min=eps, max=1.0 - eps)
-    one_minus_h = 1.0 - h
-    S = torch.cumprod(one_minus_h, dim=1)
-    ones = torch.ones(h.size(0), 1, device=h.device, dtype=h.dtype)
-    S_prev = torch.cat([ones, S[:, :-1]], dim=1)
-    return S_prev * h
