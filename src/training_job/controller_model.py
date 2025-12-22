@@ -8,26 +8,31 @@ import math
 # RoPE Utility Functions
 # =========================================================================
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotates half the hidden dimension for RoPE."""
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 
 def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Applies RoPE to the input tensor x. Shapes: [B, L, D]"""
     return (x * cos) + (rotate_half(x) * sin)
 
 # =========================================================================
-# SwiGLU Feed-Forward Network
+# SwiGLU Feed-Forward Network (STABILIZED)
 # =========================================================================
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, hidden_dim: int, dropout: float = 0.1):
         super().__init__()
         self.w12 = nn.Linear(d_model, 2 * hidden_dim)
         self.w3 = nn.Linear(hidden_dim, d_model)
+        # Internal norm prevents the SiLU product from exploding during forward pass
+        self.inner_norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         w12_out = self.w12(x)
         x1, x2 = w12_out.chunk(2, dim=-1)
-        hidden = F.silu(x1) * x2
+        # Apply normalization to the gated linear unit output before final projection
+        hidden = self.inner_norm(F.silu(x1) * x2)
         return self.dropout(self.w3(hidden))
 
 # =========================================================================
@@ -56,14 +61,15 @@ class CustomTransformerLayer(nn.Module):
         return x
 
 # =========================================================================
-# Gated Halting Head
+# Gated Halting Head (DEFENSIVE MATH)
 # =========================================================================
 class GatedHaltingHead(nn.Module):
     def __init__(self, d_ctrl):
         super().__init__()
+        # Added LayerNorm to the gate to stabilize initial random activations
         self.trust_gate = nn.Sequential(
             nn.Linear(d_ctrl, 32),
-            nn.LayerNorm(32), # Added to prevent activation drift
+            nn.LayerNorm(32), 
             nn.ReLU(),
             nn.Linear(32, 1),
             nn.Sigmoid() 
@@ -72,7 +78,8 @@ class GatedHaltingHead(nn.Module):
 
     def forward(self, z, entropy):
         # 1. Sanitize entropy: replace NaNs/Infs with 0 before gating
-        clean_entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
+        # Clamping posinf to a reasonable range helps prevent logit explosion
+        clean_entropy = torch.nan_to_num(entropy, nan=0.0, posinf=5.0, neginf=0.0)
         
         # 2. Compute gate with its own internal normalization
         gate = self.trust_gate(z) 
@@ -109,7 +116,7 @@ class Controller(nn.Module):
         self.input_ln = nn.LayerNorm(d_teacher)
         self.proj = nn.Linear(d_teacher, d_ctrl)
         
-        # RoPE
+        # RoPE Setup
         inv_freq = 1.0 / (10000 ** (torch.arange(0, d_ctrl, 2).float() / d_ctrl))
         self.register_buffer("inv_freq", inv_freq)
         t = torch.arange(L, dtype=torch.float32)
@@ -142,7 +149,8 @@ class Controller(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+            # Xavier Uniform is more stable for deep networks than Kaiming Normal
+            nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
         elif isinstance(module, nn.LayerNorm):
@@ -150,6 +158,9 @@ class Controller(nn.Module):
             nn.init.constant_(module.bias, 0.0)
 
     def forward(self, teacher_cls: torch.Tensor):
+        # Defensive input cleaning to prevent NaN propagation from teacher embeddings
+        teacher_cls = torch.nan_to_num(teacher_cls, nan=0.0)
+        
         B, L, D = teacher_cls.shape
         x = self.input_ln(teacher_cls)
         x = self.proj(x)
@@ -168,11 +179,13 @@ class Controller(nn.Module):
         
         for l in range(L):
             c_l = self.classifier_heads[l](z[:, l, :]) 
+            
+            # --- SAFETY RAIL: LOGIT CLAMPING ---
+            # Sanitizes logits before they hit the Categorical distribution
+            c_l = torch.nan_to_num(c_l, nan=0.0, posinf=1e4, neginf=-1e4)
             class_logits_list.append(c_l)
             
-            # --- FIX: STABLE ENTROPY CALCULATION ---
-            # Using torch.distributions.Categorical prevents 0 * -inf NaNs
-            # We use logits=c_l directly for numerical stability
+            # Use Distributions for Log-Sum-Exp stable entropy
             entropy = torch.distributions.Categorical(logits=c_l).entropy().unsqueeze(-1)
             
             h_l = self.halting_heads[l](z[:, l, :], entropy)
