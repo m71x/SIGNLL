@@ -78,6 +78,40 @@ class CustomTransformerLayer(nn.Module):
         return x
 
 # =========================================================================
+# NEW: Gated Halting Head
+# =========================================================================
+class GatedHaltingHead(nn.Module):
+    def __init__(self, d_ctrl):
+        super().__init__()
+        # 1. The Gate: Decides "How much should I trust the classifier's uncertainty?"
+        # Input: Controller hidden state (z)
+        # Output: Scalar [0, 1]
+        self.trust_gate = nn.Sequential(
+            nn.Linear(d_ctrl, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid() 
+        )
+        
+        # 2. The Decision Head
+        # Input: Hidden state + (Gated Entropy)
+        self.head = nn.Linear(d_ctrl + 1, 1)
+
+    def forward(self, z, entropy):
+        # z: [B, d_ctrl]
+        # entropy: [B, 1]
+        
+        # Calculate how trustworthy the entropy signal is based on the context z
+        gate = self.trust_gate(z) 
+        
+        # Scale entropy by the gate (if gate is 0, entropy is ignored)
+        gated_entropy = entropy * gate
+        
+        # Concatenate and predict
+        combined = torch.cat([z, gated_entropy], dim=-1)
+        return self.head(combined)
+
+# =========================================================================
 
 class Controller(nn.Module):
     def __init__(
@@ -132,9 +166,9 @@ class Controller(nn.Module):
         self.post_ln = nn.LayerNorm(d_ctrl) 
 
         # 3. Output Heads
-        # MODIFIED: Input dim is now d_ctrl + 1 to account for entropy scalar
+        # MODIFIED: Replaced standard Linear layer with GatedHaltingHead
         self.halting_heads = nn.ModuleList([
-            nn.Linear(d_ctrl + 1, 1) for _ in range(L)
+            GatedHaltingHead(d_ctrl) for _ in range(L)
         ])
         
         self.classifier_heads = nn.ModuleList([
@@ -145,9 +179,10 @@ class Controller(nn.Module):
         self.apply(self._init_weights)
 
         # 5. Override Halting Bias
+        # NOTE: Updated to access the inner 'head' layer of GatedHaltingHead
         with torch.no_grad():
-            for head in self.halting_heads:
-                head.bias.fill_(halting_bias_init)
+            for module in self.halting_heads:
+                module.head.bias.fill_(halting_bias_init)
 
     def _init_weights(self, module):
         """Applies stable weight initialization."""
@@ -204,12 +239,8 @@ class Controller(nn.Module):
             p_log_p = torch.where(probs > 0, probs * log_probs, torch.zeros_like(probs))
             entropy = -p_log_p.sum(dim=-1, keepdim=True) # [B, 1]
             
-            # C. Concatenate [Hidden_State, Entropy] for Halting Head
-            # z[l]: [B, d_ctrl], entropy: [B, 1] -> combined: [B, d_ctrl + 1]
-            combined_input = torch.cat([z[:, l, :], entropy], dim=-1)
-            
-            # D. Compute Halting Logits using combined input
-            h_l = self.halting_heads[l](combined_input) 
+            # C. Pass hidden state and entropy SEPARATELY to the Gated Head
+            h_l = self.halting_heads[l](z[:, l, :], entropy)
             halting_logits_list.append(h_l)
         
         halting_logits = torch.cat(halting_logits_list, dim=-1).squeeze(-1) 
