@@ -78,41 +78,6 @@ class SAM(torch.optim.Optimizer):
         self.base_optimizer.param_groups = self.param_groups
 
 # =========================================================================
-# STABLE KL DIVERGENCE CALCULATION
-# =========================================================================
-def stable_kl_divergence(teacher_log_probs, student_logits, eps=1e-10):
-    """
-    Compute KL divergence in a numerically stable way.
-    
-    KL(teacher || student) = sum(teacher_probs * (log(teacher_probs) - log(student_probs)))
-    
-    Args:
-        teacher_log_probs: [B, L, num_classes] - log probabilities from teacher
-        student_logits: [B, L, num_classes] - raw logits from student
-        eps: Small constant for numerical stability
-    
-    Returns:
-        kl_loss: [B, L] - KL divergence per sample per layer
-    """
-    # Get student log probs (numerically stable)
-    student_log_probs = F.log_softmax(student_logits, dim=-1)
-    
-    # Teacher probabilities
-    teacher_probs = torch.exp(teacher_log_probs)
-    
-    # KL divergence: sum over classes
-    # We clamp student_log_probs to avoid -inf issues
-    student_log_probs_safe = student_log_probs.clamp(min=-100)  # Prevent extreme values
-    
-    kl = teacher_probs * (teacher_log_probs - student_log_probs_safe)
-    kl = kl.sum(dim=-1)  # [B, L]
-    
-    # Clamp final KL to reasonable range (KL should be >= 0)
-    kl = kl.clamp(min=0.0, max=100.0)
-    
-    return kl
-
-# =========================================================================
 # TRAINING LOOP 
 # =========================================================================
 def train_loop(rank, flags):
@@ -135,7 +100,6 @@ def train_loop(rank, flags):
         param.data = xm.all_reduce(xm.REDUCE_SUM, param.data) / num_cores
     xm.mark_step()
     
-    # Initial Rendezvous
     xm.rendezvous("weights_synced") 
 
     # Calculate step counts
@@ -148,20 +112,30 @@ def train_loop(rank, flags):
     diag_sample_neg = None
 
     # =========================================================================
-    # STAGE LOOP: 1 -> Backbone/Classifiers, 2 -> Halting Heads
+    # STAGE LOOP: 1 -> Backbone/Classifiers, 2 -> Halting Heads + Gates
     # =========================================================================
     for stage in [1, 2]:
         
         # --- PHASE SETUP ---
         if stage == 1:
-            stage_name = "STAGE 1: Backbone & Classifiers (Halting IGNORED)"
-            for param in model.parameters(): param.requires_grad = True
-            for param in model.halting_heads.parameters(): param.requires_grad = False
+            stage_name = "STAGE 1: Backbone & Classifiers (Halting & Gates FROZEN)"
+            for param in model.parameters(): 
+                param.requires_grad = True
+            # Freeze halting heads AND entropy gates
+            for param in model.halting_heads.parameters(): 
+                param.requires_grad = False
+            for param in model.entropy_gates.parameters(): 
+                param.requires_grad = False
             
         elif stage == 2:
-            stage_name = "STAGE 2: Halting Heads Only (Backbone & Classifiers FROZEN) with SAM"
-            for param in model.parameters(): param.requires_grad = False
-            for param in model.halting_heads.parameters(): param.requires_grad = True
+            stage_name = "STAGE 2: Halting Heads + Entropy Gates with SAM (Backbone FROZEN)"
+            for param in model.parameters(): 
+                param.requires_grad = False
+            # Unfreeze halting heads AND entropy gates
+            for param in model.halting_heads.parameters(): 
+                param.requires_grad = True
+            for param in model.entropy_gates.parameters(): 
+                param.requires_grad = True
 
         if rank == 0:
             xm.master_print(f"\n{'#'*80}")
@@ -170,6 +144,10 @@ def train_loop(rank, flags):
         
         # --- OPTIMIZER SETUP ---
         model_params = [p for p in model.parameters() if p.requires_grad]
+        
+        if rank == 0:
+            num_params = sum(p.numel() for p in model_params)
+            xm.master_print(f"Trainable parameters: {num_params:,}")
         
         if stage == 1:
             optimizer = optim.AdamW(model_params, lr=flags["lr"], weight_decay=1e-2)
@@ -186,7 +164,7 @@ def train_loop(rank, flags):
             eta_min=1e-6
         )
         if rank == 0:
-            xm.master_print(f"Scheduler Initialized: CosineAnnealingWarmRestarts with T_0={T_0} steps")
+            xm.master_print(f"Scheduler: CosineAnnealingWarmRestarts, T_0={T_0} steps")
 
         for chunk_idx in range(28): 
             current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
@@ -201,7 +179,8 @@ def train_loop(rank, flags):
                 max_entries=flags["samples_per_shard"]
             )
             
-            if data is None: raise RuntimeError(f"[Core {rank}] Failed load chunk {chunk_idx}")
+            if data is None: 
+                raise RuntimeError(f"[Core {rank}] Failed load chunk {chunk_idx}")
 
             teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
             teacher_label_full = torch.from_numpy(data['classifications']).long()
@@ -214,7 +193,9 @@ def train_loop(rank, flags):
             else:
                 num_classes = 2
                 smoothing = 0.1
-                t_one_hot = torch.zeros(teacher_label_full.size(0), num_classes).scatter_(1, teacher_label_full.unsqueeze(1), 1)
+                t_one_hot = torch.zeros(teacher_label_full.size(0), num_classes).scatter_(
+                    1, teacher_label_full.unsqueeze(1), 1
+                )
                 teacher_probs_full = t_one_hot * (1.0 - smoothing) + (smoothing / num_classes)
                 teacher_log_probs_full = torch.log(teacher_probs_full.clamp(min=1e-10))
 
@@ -224,6 +205,7 @@ def train_loop(rank, flags):
             # --- Data Slicing ---
             N_total_local = teacher_cls_full.shape[0]
             N_target = (N_total_local // num_cores) * 32
+
             teacher_cls_full = teacher_cls_full[:N_target]
             teacher_label_full = teacher_label_full[:N_target]
             teacher_log_probs_full = teacher_log_probs_full[:N_target] 
@@ -239,7 +221,10 @@ def train_loop(rank, flags):
             dataset = TensorDataset(teacher_cls_full, teacher_label_full, teacher_log_probs_full)
             sampler = RandomSampler(dataset)
             
-            data_loader = DataLoader(dataset, sampler=sampler, batch_size=flags["batch_size"], drop_last=True, num_workers=2)
+            data_loader = DataLoader(
+                dataset, sampler=sampler, batch_size=flags["batch_size"], 
+                drop_last=True, num_workers=2
+            )
             
             # --- Epoch Loop ---
             for epoch in range(flags["epochs"]):
@@ -248,13 +233,14 @@ def train_loop(rank, flags):
                 diag_sample_neg = None
 
                 for batch_idx, (teacher_cls, teacher_label, teacher_log_probs) in enumerate(data_loader):
-                    if stage == 2: global_step += 1
+                    if stage == 2: 
+                        global_step += 1
                     
                     teacher_cls = teacher_cls.to(device)
                     teacher_label = teacher_label.to(device)
                     teacher_log_probs = teacher_log_probs.to(device)
                     
-                    # --- STAGE 1: FIXED LOSS CALCULATION ---
+                    # --- STAGE 1: Standard Training ---
                     if stage == 1:
                         halting_logits, class_logits, z = model(teacher_cls) 
                         
@@ -269,44 +255,39 @@ def train_loop(rank, flags):
                                         'lbl': teacher_label[idx].detach().cpu()
                                     }
                                 return None
+                            
                             diag_sample_pos = extract_sample(1)
                             diag_sample_neg = extract_sample(0)
 
-                        # Prepare labels
+                        # --- LOSS CALCULATION ---
                         labels = teacher_label.float().unsqueeze(1).expand(-1, L)
                         
-                        # Hard loss (BCE)
                         if class_logits.size(-1) == 2:
                             class_logits_positive = class_logits[:, :, 1]
+                            student_log_probs = F.log_softmax(class_logits, dim=-1)
                         else:
                             class_logits_positive = class_logits.squeeze(-1)
+                            student_log_probs = F.log_softmax(
+                                torch.stack([-class_logits_positive, class_logits_positive], dim=-1),
+                                dim=-1
+                            )
                         
                         loss_hard = bce_loss_fn(class_logits_positive, labels)
-                        
-                        # FIXED: Soft loss (KL divergence) using stable calculation
+
                         teacher_log_probs_expanded = teacher_log_probs.unsqueeze(1).expand(-1, L, -1)
-                        loss_soft = stable_kl_divergence(teacher_log_probs_expanded, class_logits)
-                        
-                        # Combined classification loss
+                        kl_elementwise = teacher_log_probs_expanded.exp() * (
+                            teacher_log_probs_expanded - student_log_probs
+                        )
+                        loss_soft = kl_elementwise.sum(dim=-1)
+
                         alpha = 0.5
                         ce_per_layer = (alpha * loss_hard) + ((1 - alpha) * loss_soft)
-                        
-                        # Contrast loss (smoothness regularization)
+
                         loss_contrast = F.mse_loss(z[:, 1:, :], z[:, :-1, :])
-                        
-                        # Total loss
+
                         loss_cls = ce_per_layer.mean()
                         loss_halt = torch.tensor(0.0, device=device)
                         loss = (loss_cls * 2) + (0.1 * loss_contrast)
-                        
-                        # Check for NaN before backward
-                        if torch.isnan(loss) or torch.isinf(loss):
-                            if rank == 0:
-                                xm.master_print(f"WARNING: NaN/Inf detected in loss at batch {batch_idx}")
-                                xm.master_print(f"  loss_hard: {loss_hard.mean().item()}")
-                                xm.master_print(f"  loss_soft: {loss_soft.mean().item()}")
-                                xm.master_print(f"  loss_contrast: {loss_contrast.item()}")
-                            continue
 
                         optimizer.zero_grad()
                         loss.backward()
@@ -315,7 +296,7 @@ def train_loop(rank, flags):
                         scheduler.step()
                         xm.mark_step()
 
-                    # --- STAGE 2: SAM Training ---
+                    # --- STAGE 2: SAM Training (Halting + Gates) ---
                     elif stage == 2:
                         def closure():
                             halting_logits, class_logits, z = model(teacher_cls)
@@ -331,20 +312,20 @@ def train_loop(rank, flags):
                             sample_weights = torch.ones_like(halting_logits)
                             sample_weights[teacher_label == 0] = neg_weight_val.item()
                             
-                            # BCE with logits for stability
+                            # Use BCEWithLogitsLoss for stability
                             loss_halt = F.binary_cross_entropy_with_logits(
                                 halting_logits, 
                                 is_correct, 
                                 weight=sample_weights
                             )
                             
-                            # Stable Entropy Regularization
+                            # Entropy regularization
                             h = torch.sigmoid(halting_logits)
-                            h_safe = h.clamp(min=1e-6, max=1.0-1e-6)
+                            h_safe = h.clamp(min=1e-6, max=1.0 - 1e-6)
                             
                             entropy_weight = 0.0025 
-                            h_entropy = - (h_safe * h_safe.log() + (1 - h_safe) * (1 - h_safe).log())
-                            loss_entropy = - entropy_weight * h_entropy.mean()
+                            h_entropy = -(h_safe * h_safe.log() + (1 - h_safe) * (1 - h_safe).log())
+                            loss_entropy = -entropy_weight * h_entropy.mean()
                             
                             loss = loss_halt + loss_entropy
                             loss.backward()
@@ -363,6 +344,7 @@ def train_loop(rank, flags):
                                             'lbl': teacher_label[idx].detach().cpu()
                                         }
                                     return None
+                                
                                 diag_sample_pos = extract_sample(1)
                                 diag_sample_neg = extract_sample(0)
                         
@@ -373,6 +355,7 @@ def train_loop(rank, flags):
                         xm.mark_step()
 
                 loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
+                
                 if stage == 1:
                     loss_log = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
                 else:
@@ -392,7 +375,8 @@ def train_loop(rank, flags):
                         xm.master_print(f"  Halt Loss:  {loss_log / num_cores:.4f}")
                     
                     def format_sample(data, name):
-                        if data is None: return f"  {name}: No sample found."
+                        if data is None: 
+                            return f"  {name}: No sample found."
                         out = [f"  > {name} (Label {data['lbl'].item()}):"]
                         if stage == 1:
                             probs = torch.softmax(data['cls'], dim=-1) 
@@ -407,17 +391,16 @@ def train_loop(rank, flags):
                     xm.master_print(format_sample(diag_sample_pos, "Sample POS"))
                     xm.master_print(format_sample(diag_sample_neg, "Sample NEG"))
 
-            if (chunk_idx + 1) % 5 == 0 and rank == 0:
-                pass
-            
             xm.rendezvous(f"chunk_end_st{stage}_ch{chunk_idx}")
 
     xm.rendezvous("ready_to_save_final")
-    save_path = os.path.expanduser("~/SIGNLL/final_model_stage2.pt")
+    save_path = os.path.expanduser("~/SIGNLL/final_model_stage2_gated.pt")
+    
     if rank == 0:
         xm.master_print(f"Saving final model: {save_path}")
         torch.save(model.state_dict(), save_path)
-        xm.master_print("✅ Training Complete.")
+        xm.master_print("✅ Training Complete with Gated Entropy.")
+
     xm.rendezvous("save_complete_safe_exit")
 
 def _mp_fn(rank, flags):
@@ -439,5 +422,6 @@ if __name__ == "__main__":
         "epochs": 5,
         "samples_per_shard": 39000
     }  
-    print("Starting Train Only Job.")
+    
+    print("Starting Two-Stage Training with Gated Entropy.")
     xmp.spawn(_mp_fn, args=(BASE_FLAGS,), start_method='fork')

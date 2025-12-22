@@ -50,77 +50,38 @@ class CustomTransformerLayer(nn.Module):
         x_norm = self.norm1(x)
         attn_out, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=mask, need_weights=False)
         x = x + self.dropout1(attn_out)
+        
         x_norm = self.norm2(x)
         ffn_out = self.ffn(x_norm)
         x = x + self.dropout2(ffn_out)
+        
         return x
 
 # =========================================================================
-# FIXED: Gated Halting Head with Numerical Stability
+# NEW: Simple Gating Module for Entropy
 # =========================================================================
-class GatedHaltingHead(nn.Module):
-    def __init__(self, d_ctrl):
+class EntropyGate(nn.Module):
+    """Small network that learns to gate/weight the entropy signal."""
+    def __init__(self, d_ctrl: int):
         super().__init__()
-        # Trust gate with LayerNorm for stability
-        self.trust_gate = nn.Sequential(
-            nn.LayerNorm(d_ctrl),  # Added LayerNorm
-            nn.Linear(d_ctrl, 32),
-            nn.ReLU(),
-            nn.Dropout(0.1),  # Added dropout for regularization
-            nn.Linear(32, 1),
-            nn.Sigmoid() 
+        # Tiny 2-layer network: hidden state -> gate weight [0,1]
+        self.gate = nn.Sequential(
+            nn.Linear(d_ctrl, 8),
+            nn.Tanh(),
+            nn.Linear(8, 1),
+            nn.Sigmoid()
         )
-        
-        # Decision head with proper input scaling
-        self.input_norm = nn.LayerNorm(d_ctrl + 1)  # Normalize concatenated input
-        self.head = nn.Linear(d_ctrl + 1, 1)
-
-    def forward(self, z, entropy):
-        # z: [B, d_ctrl]
-        # entropy: [B, 1]
-        
-        # Clamp entropy to prevent extreme values
-        entropy = entropy.clamp(min=0.0, max=10.0)  # Cap at ~log(num_classes)*5
-        
-        # Calculate trust gate
-        gate = self.trust_gate(z)  # [B, 1]
-        
-        # Scale entropy by gate
-        gated_entropy = entropy * gate
-        
-        # Concatenate and normalize before final projection
-        combined = torch.cat([z, gated_entropy], dim=-1)
-        combined_norm = self.input_norm(combined)
-        
-        return self.head(combined_norm)
-
-# =========================================================================
-# FIXED: Stable Entropy Calculation Function
-# =========================================================================
-def compute_stable_entropy(logits: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
-    """
-    Compute entropy in a numerically stable way.
     
-    Args:
-        logits: [B, num_classes] classifier logits
-        eps: Small constant for numerical stability
-    
-    Returns:
-        entropy: [B, 1] entropy values
-    """
-    # Use log_softmax for numerical stability (computed in log space)
-    log_probs = F.log_softmax(logits, dim=-1)
-    probs = torch.exp(log_probs)
-    
-    # Entropy: -sum(p * log(p))
-    # Since log_probs = log(p), we have: -sum(p * log_probs)
-    entropy = -(probs * log_probs).sum(dim=-1, keepdim=True)
-    
-    # Clamp to valid range [0, log(num_classes)]
-    max_entropy = math.log(logits.size(-1))
-    entropy = entropy.clamp(min=0.0, max=max_entropy)
-    
-    return entropy
+    def forward(self, z: torch.Tensor, entropy: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            z: [B, d_ctrl] - hidden state
+            entropy: [B, 1] - raw entropy value
+        Returns:
+            gated_entropy: [B, 1] - entropy scaled by learned gate
+        """
+        gate_weight = self.gate(z)  # [B, 1]
+        return entropy * gate_weight
 
 # =========================================================================
 
@@ -176,8 +137,14 @@ class Controller(nn.Module):
         self.post_ln = nn.LayerNorm(d_ctrl) 
 
         # 3. Output Heads
+        # NEW: Add entropy gates (one per layer)
+        self.entropy_gates = nn.ModuleList([
+            EntropyGate(d_ctrl) for _ in range(L)
+        ])
+        
+        # Halting heads now take [d_ctrl + 1] (hidden + gated_entropy)
         self.halting_heads = nn.ModuleList([
-            GatedHaltingHead(d_ctrl) for _ in range(L)
+            nn.Linear(d_ctrl + 1, 1) for _ in range(L)
         ])
         
         self.classifier_heads = nn.ModuleList([
@@ -189,10 +156,12 @@ class Controller(nn.Module):
 
         # 5. Override Halting Bias
         with torch.no_grad():
-            for module in self.halting_heads:
-                module.head.bias.fill_(halting_bias_init)
-                # Initialize trust gate to output ~0.5 initially
-                module.trust_gate[-2].bias.fill_(0.0)
+            for head in self.halting_heads:
+                head.bias.fill_(halting_bias_init)
+            
+            # Initialize gates to output ~0.5 initially (middle of sigmoid range)
+            for gate_module in self.entropy_gates:
+                gate_module.gate[-2].bias.fill_(0.0)  # Sigmoid(0) = 0.5
 
     def _init_weights(self, module):
         """Applies stable weight initialization."""
@@ -226,7 +195,7 @@ class Controller(nn.Module):
             
         z = self.post_ln(z) 
         
-        # 2. Apply Unique Heads with STABLE entropy calculation
+        # 2. Apply Unique Heads
         halting_logits_list = []
         class_logits_list = []
         
@@ -235,11 +204,29 @@ class Controller(nn.Module):
             c_l = self.classifier_heads[l](z[:, l, :]) 
             class_logits_list.append(c_l)
             
-            # B. Calculate Entropy using stable function
-            entropy = compute_stable_entropy(c_l)  # [B, 1]
+            # B. Calculate Entropy (numerically stable)
+            log_probs = F.log_softmax(c_l, dim=-1)
+            probs = torch.exp(log_probs)
             
-            # C. Pass to Gated Head
-            h_l = self.halting_heads[l](z[:, l, :], entropy)
+            # Clamp to avoid log(0)
+            probs_safe = probs.clamp(min=1e-10, max=1.0)
+            log_probs_safe = torch.log(probs_safe)
+            
+            # Entropy: -sum(p * log(p))
+            entropy = -(probs_safe * log_probs_safe).sum(dim=-1, keepdim=True)  # [B, 1]
+            
+            # Normalize entropy to [0, 1] range
+            max_entropy = math.log(self.num_classes)
+            entropy_normalized = (entropy / max_entropy).clamp(0.0, 1.0)
+            
+            # C. NEW: Apply learned gate to entropy
+            gated_entropy = self.entropy_gates[l](z[:, l, :], entropy_normalized)
+            
+            # D. Concatenate [Hidden_State, Gated_Entropy] for Halting Head
+            combined_input = torch.cat([z[:, l, :], gated_entropy], dim=-1)
+            
+            # E. Compute Halting Logits
+            h_l = self.halting_heads[l](combined_input) 
             halting_logits_list.append(h_l)
         
         halting_logits = torch.cat(halting_logits_list, dim=-1)  # [B, L]
