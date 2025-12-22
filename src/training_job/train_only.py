@@ -78,10 +78,45 @@ class SAM(torch.optim.Optimizer):
         self.base_optimizer.param_groups = self.param_groups
 
 # =========================================================================
+# STABLE KL DIVERGENCE CALCULATION
+# =========================================================================
+def stable_kl_divergence(teacher_log_probs, student_logits, eps=1e-10):
+    """
+    Compute KL divergence in a numerically stable way.
+    
+    KL(teacher || student) = sum(teacher_probs * (log(teacher_probs) - log(student_probs)))
+    
+    Args:
+        teacher_log_probs: [B, L, num_classes] - log probabilities from teacher
+        student_logits: [B, L, num_classes] - raw logits from student
+        eps: Small constant for numerical stability
+    
+    Returns:
+        kl_loss: [B, L] - KL divergence per sample per layer
+    """
+    # Get student log probs (numerically stable)
+    student_log_probs = F.log_softmax(student_logits, dim=-1)
+    
+    # Teacher probabilities
+    teacher_probs = torch.exp(teacher_log_probs)
+    
+    # KL divergence: sum over classes
+    # We clamp student_log_probs to avoid -inf issues
+    student_log_probs_safe = student_log_probs.clamp(min=-100)  # Prevent extreme values
+    
+    kl = teacher_probs * (teacher_log_probs - student_log_probs_safe)
+    kl = kl.sum(dim=-1)  # [B, L]
+    
+    # Clamp final KL to reasonable range (KL should be >= 0)
+    kl = kl.clamp(min=0.0, max=100.0)
+    
+    return kl
+
+# =========================================================================
 # TRAINING LOOP 
 # =========================================================================
 def train_loop(rank, flags):
-    device = xm.torch_xla.device()
+    device = xm.xla_device()
     num_cores = xm.xrt_world_size()
     
     # 1. Model Initialization
@@ -157,7 +192,7 @@ def train_loop(rank, flags):
             current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
             
             if rank == 0:
-                xm.master_print(f"Stage {stage} | Chunk {chunk_idx + 1}/29 | Loading {current_chunk_filename}")
+                xm.master_print(f"Stage {stage} | Chunk {chunk_idx + 1}/28 | Loading {current_chunk_filename}")
 
             # --- Load Data ---
             data = training_data_download(
@@ -181,7 +216,7 @@ def train_loop(rank, flags):
                 smoothing = 0.1
                 t_one_hot = torch.zeros(teacher_label_full.size(0), num_classes).scatter_(1, teacher_label_full.unsqueeze(1), 1)
                 teacher_probs_full = t_one_hot * (1.0 - smoothing) + (smoothing / num_classes)
-                teacher_log_probs_full = torch.log(teacher_probs_full)
+                teacher_log_probs_full = torch.log(teacher_probs_full.clamp(min=1e-10))
 
             if teacher_cls_full.shape[1] == 25:
                 teacher_cls_full = teacher_cls_full[:, 1:25, :]
@@ -213,13 +248,13 @@ def train_loop(rank, flags):
                 diag_sample_neg = None
 
                 for batch_idx, (teacher_cls, teacher_label, teacher_log_probs) in enumerate(data_loader):
-                    if stage == 2: global_step += 29 
+                    if stage == 2: global_step += 1
                     
                     teacher_cls = teacher_cls.to(device)
                     teacher_label = teacher_label.to(device)
                     teacher_log_probs = teacher_log_probs.to(device)
                     
-                    # --- STAGE 1 ---
+                    # --- STAGE 1: FIXED LOSS CALCULATION ---
                     if stage == 1:
                         halting_logits, class_logits, z = model(teacher_cls) 
                         
@@ -237,28 +272,41 @@ def train_loop(rank, flags):
                             diag_sample_pos = extract_sample(1)
                             diag_sample_neg = extract_sample(0)
 
+                        # Prepare labels
                         labels = teacher_label.float().unsqueeze(1).expand(-1, L)
+                        
+                        # Hard loss (BCE)
                         if class_logits.size(-1) == 2:
                             class_logits_positive = class_logits[:, :, 1]
-                            student_log_probs = F.log_softmax(class_logits, dim=-1)
                         else:
                             class_logits_positive = class_logits.squeeze(-1)
-                            student_log_probs = F.log_softmax(
-                                 torch.stack([-class_logits_positive, class_logits_positive], dim=-1),
-                                 dim=-1
-                              )
                         
                         loss_hard = bce_loss_fn(class_logits_positive, labels)
+                        
+                        # FIXED: Soft loss (KL divergence) using stable calculation
                         teacher_log_probs_expanded = teacher_log_probs.unsqueeze(1).expand(-1, L, -1)
-                        kl_elementwise = teacher_log_probs_expanded.exp() * (teacher_log_probs_expanded - student_log_probs)
-                        loss_soft = kl_elementwise.sum(dim=-1)
-
+                        loss_soft = stable_kl_divergence(teacher_log_probs_expanded, class_logits)
+                        
+                        # Combined classification loss
                         alpha = 0.5
                         ce_per_layer = (alpha * loss_hard) + ((1 - alpha) * loss_soft)
+                        
+                        # Contrast loss (smoothness regularization)
                         loss_contrast = F.mse_loss(z[:, 1:, :], z[:, :-1, :])
+                        
+                        # Total loss
                         loss_cls = ce_per_layer.mean()
                         loss_halt = torch.tensor(0.0, device=device)
                         loss = (loss_cls * 2) + (0.1 * loss_contrast)
+                        
+                        # Check for NaN before backward
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            if rank == 0:
+                                xm.master_print(f"WARNING: NaN/Inf detected in loss at batch {batch_idx}")
+                                xm.master_print(f"  loss_hard: {loss_hard.mean().item()}")
+                                xm.master_print(f"  loss_soft: {loss_soft.mean().item()}")
+                                xm.master_print(f"  loss_contrast: {loss_contrast.item()}")
+                            continue
 
                         optimizer.zero_grad()
                         loss.backward()
@@ -267,7 +315,7 @@ def train_loop(rank, flags):
                         scheduler.step()
                         xm.mark_step()
 
-                    # --- STAGE 2: SAM Training (FIXED) ---
+                    # --- STAGE 2: SAM Training ---
                     elif stage == 2:
                         def closure():
                             halting_logits, class_logits, z = model(teacher_cls)
@@ -283,21 +331,18 @@ def train_loop(rank, flags):
                             sample_weights = torch.ones_like(halting_logits)
                             sample_weights[teacher_label == 0] = neg_weight_val.item()
                             
-                            # --- FIX 1: Use BCEWithLogitsLoss for stability ---
-                            # Instead of Sigmoid -> BCE, use raw logits
+                            # BCE with logits for stability
                             loss_halt = F.binary_cross_entropy_with_logits(
                                 halting_logits, 
                                 is_correct, 
                                 weight=sample_weights
                             )
                             
-                            # --- FIX 2: Stable Entropy Regularization ---
-                            # Clamp h so it never hits exact 0 or 1 for the entropy calc
+                            # Stable Entropy Regularization
                             h = torch.sigmoid(halting_logits)
                             h_safe = h.clamp(min=1e-6, max=1.0-1e-6)
                             
                             entropy_weight = 0.0025 
-                            # - (p*log(p) + (1-p)*log(1-p))
                             h_entropy = - (h_safe * h_safe.log() + (1 - h_safe) * (1 - h_safe).log())
                             loss_entropy = - entropy_weight * h_entropy.mean()
                             
