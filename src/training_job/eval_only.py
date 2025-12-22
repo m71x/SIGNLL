@@ -90,25 +90,39 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
             unique_exits, counts = torch.unique(exit_indices_cpu, return_counts=True)
             layer_exit_counts_cpu.index_add_(0, unique_exits, counts.float())
             xm.master_print("statistics calculated")
-            
+
             # Local sync for Rank 0 to keep memory clean
             xm.mark_step()
             
             if i % 100 == 0:
                 print(f"[Eval] Processed batch {i}...")
             
+    xm.master_print("loop exited")
+    xm.mark_step()
     accuracy = (total_correct / total_samples) * 100.0
-    
+    xm.mark_step()
+    xm.master_print("accuracy calculated")
     # --- Stats ---
     layers = torch.arange(24, dtype=torch.float32)
+    xm.master_print("layers arranged")
+    xm.mark_step()
+
     avg_exit_layer = (layer_exit_counts_cpu * layers).sum() / total_samples
+    xm.master_print("avg exit layer determined")
+    xm.mark_step()
+
     std_exit_layer = torch.sqrt((layer_exit_counts_cpu * (layers - avg_exit_layer).pow(2)).sum() / total_samples)
-    
+    xm.master_print("done")
+    xm.mark_step()
+
+
+
     xm.master_print(f"RESULTS:")
     xm.master_print(f"  Accuracy: {accuracy:.2f}%")
     xm.master_print(f"  Avg Exit: {avg_exit_layer:.2f} +/- {std_exit_layer:.2f}")
     xm.master_print(f"  Distribution: {layer_exit_counts_cpu.long().tolist()}")
     xm.master_print(f"{'*'*80}\n")
+    xm.mark_step()
 
 
 def eval_main(rank, flags):
