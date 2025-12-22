@@ -56,18 +56,18 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
         drop_last=False,
         num_workers=2
     )
-    
+    xm.master_print("data loader set up")
     total_samples = 0
     total_correct = 0
     layer_exit_counts_cpu = torch.zeros(24, dtype=torch.float32)
-
+    xm.master_print("going into loop")
     with torch.no_grad():
         for i, (teacher_cls, teacher_label) in enumerate(data_loader):
             teacher_cls = teacher_cls.to(device)
             teacher_label = teacher_label.to(device)
-            
+            xm.master_print("teacher sample set up")
             halting_logits, class_logits, _ = model(teacher_cls)
-            
+            xm.master_print("inference performedp")
             h_probs = torch.sigmoid(halting_logits)
             threshold_mask = (h_probs > threshold)
             
@@ -75,19 +75,21 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
             exit_indices = torch.argmax(threshold_mask.long(), dim=1)
             row_has_exit = threshold_mask.any(dim=1)
             exit_indices[~row_has_exit] = 23 # Default to last layer
-            
+            xm.master_print("exit layer determined")
             batch_indices = torch.arange(class_logits.size(0), device=device)
             selected_logits = class_logits[batch_indices, exit_indices]
             predictions = torch.argmax(selected_logits, dim=-1)
-            
+            xm.master_print("p2")
+
             correct_tensor = (predictions == teacher_label).sum()
             total_correct += correct_tensor.item() 
             total_samples += teacher_label.size(0)
-            
+            xm.master_print("correctness calculated")
             # Track statistics on CPU
             exit_indices_cpu = exit_indices.cpu()
             unique_exits, counts = torch.unique(exit_indices_cpu, return_counts=True)
             layer_exit_counts_cpu.index_add_(0, unique_exits, counts.float())
+            xm.master_print("statistics calculated")
             
             # Local sync for Rank 0 to keep memory clean
             xm.mark_step()
