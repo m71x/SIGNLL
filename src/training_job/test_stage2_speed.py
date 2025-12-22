@@ -7,122 +7,20 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts 
 
-# =========================================================================
-# 1. OPTIMIZED MODEL (Vectorized Gates)
-# =========================================================================
-
-class OptimizedEntropyGate(nn.Module):
-    """
-    Replaces the list of 24 separate EntropyGates with a single Grouped Convolution.
-    This maintains UNIQUE weights per layer but runs as 1 fast operation.
-    """
-    def __init__(self, d_ctrl: int, L: int):
-        super().__init__()
-        self.L = L
-        # We use Conv1d with groups=L to simulate L independent Linear layers
-        # Input: [B, D*L, 1] (reshaped) -> Output: [B, 8*L, 1]
-        self.net1 = nn.Conv1d(
-            in_channels=d_ctrl * L, 
-            out_channels=8 * L, 
-            kernel_size=1, 
-            groups=L
-        )
-        self.act = nn.Tanh()
-        self.net2 = nn.Conv1d(
-            in_channels=8 * L, 
-            out_channels=1 * L, 
-            kernel_size=1, 
-            groups=L
-        )
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, z, entropy):
-        # z: [B, L, D]
-        # entropy: [B, L, 1]
-        B, L, D = z.shape
-        
-        # 1. Permute for Conv1d: [B, D*L, 1]
-        # We group by L so Conv1d sees (Layer1_Feats, Layer2_Feats, ...)
-        z_reshaped = z.permute(0, 2, 1).reshape(B, D * L, 1)
-        
-        # 2. Forward Pass (Vectorized)
-        out = self.net1(z_reshaped)      # [B, 8*L, 1]
-        out = self.act(out)
-        out = self.net2(out)             # [B, L, 1]
-        gate = self.sigmoid(out)
-        
-        # 3. Reshape back to [B, L, 1]
-        gate = gate.reshape(B, L, 1)
-        
-        return entropy * gate
-
-class OptimizedController(nn.Module):
-    def __init__(self, L=24, d_teacher=1024, d_ctrl=512, n_layers=4, num_classes=2):
-        super().__init__()
-        self.L = L
-        self.d_ctrl = d_ctrl
-        self.num_classes = num_classes
-        
-        # Mocking the Backbone for speed test (just projections)
-        self.proj = nn.Linear(d_teacher, d_ctrl)
-        self.layers = nn.ModuleList([
-            nn.Linear(d_ctrl, d_ctrl) for _ in range(n_layers) # Simplified transformer
-        ])
-        
-        # --- THE FIX: Single Vectorized Module instead of List ---
-        self.vectorized_gate = OptimizedEntropyGate(d_ctrl, L)
-        
-        # Halting Heads (We can leave these as List for now, or vectorize similarly)
-        self.halting_heads = nn.ModuleList([
-            nn.Linear(d_ctrl + 1, 1) for _ in range(L)
-        ])
-        self.classifier_heads = nn.ModuleList([
-            nn.Linear(d_ctrl, num_classes) for _ in range(L)
-        ])
-
-    def forward(self, teacher_cls):
-        # Simplified Forward for Speed Test
-        B, L, D = teacher_cls.shape
-        x = self.proj(teacher_cls) # [B, L, d_ctrl]
-        
-        # Fake Transformer blocks
-        for layer in self.layers:
-            x = x + layer(x)
-        z = x
-        
-        # 1. Compute Class Logits & Entropy for ALL layers at once
-        class_logits_list = []
-        for l in range(L):
-            class_logits_list.append(self.classifier_heads[l](z[:, l, :]))
-        class_logits = torch.stack(class_logits_list, dim=1) # [B, L, 2]
-        
-        # Calculate Entropy
-        log_probs = F.log_softmax(class_logits, dim=-1)
-        probs = torch.exp(log_probs)
-        entropy = -(probs * log_probs).sum(dim=-1, keepdim=True) # [B, L, 1]
-        
-        # 2. VECTORIZED GATE (The Speed Fix)
-        # Instead of looping 24 times, we run once
-        gated_entropy = self.vectorized_gate(z, entropy) # [B, L, 1]
-        
-        # 3. Halting Heads
-        halting_logits_list = []
-        for l in range(L):
-            # Input is hidden state + the gated entropy for this layer
-            combined = torch.cat([z[:, l, :], gated_entropy[:, l, :]], dim=-1)
-            halting_logits_list.append(self.halting_heads[l](combined))
-            
-        halting_logits = torch.cat(halting_logits_list, dim=-1)
-        
-        return halting_logits, class_logits, z
+from torch.utils.data import TensorDataset, DataLoader, RandomSampler
+from controller_model import Controller
+from training_data_download import training_data_download
 
 # =========================================================================
-# 2. SAM OPTIMIZER (Same as yours)
+# SAM OPTIMIZER WRAPPER
 # =========================================================================
 class SAM(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer, rho=0.05, adaptive=False, **kwargs):
+        assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
+
         defaults = dict(rho=rho, adaptive=adaptive, **kwargs)
         super(SAM, self).__init__(params, defaults)
+
         self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
         self.param_groups = self.base_optimizer.param_groups
         self.defaults.update(self.base_optimizer.defaults)
@@ -132,11 +30,13 @@ class SAM(torch.optim.Optimizer):
         grad_norm = self._grad_norm()
         for group in self.param_groups:
             scale = group["rho"] / (grad_norm + 1e-12)
+
             for p in group["params"]:
                 if p.grad is None: continue
                 self.state[p]["old_p"] = p.data.clone()
                 e_w = (torch.pow(p, 2) if group["adaptive"] else 1.0) * p.grad * scale.to(p)
-                p.add_(e_w)
+                p.add_(e_w)  # climb to the local maximum "w + e(w)"
+
         if zero_grad: self.zero_grad()
 
     @torch.no_grad()
@@ -144,93 +44,238 @@ class SAM(torch.optim.Optimizer):
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None: continue
-                p.data = self.state[p]["old_p"]
-        self.base_optimizer.step()
+                p.data = self.state[p]["old_p"]  # get back to "w" from "w + e(w)"
+
+        self.base_optimizer.step()  # do the actual "sharpness-aware" update
+
         if zero_grad: self.zero_grad()
 
     @torch.no_grad()
     def step(self, closure=None):
-        closure = torch.enable_grad()(closure)
+        assert closure is not None, "Sharpness Aware Minimization requires closure, but it was not provided"
+        closure = torch.enable_grad()(closure)  # the closure should do a full forward-backward pass
+
         self.first_step(zero_grad=True)
         closure()
         self.second_step()
 
     def _grad_norm(self):
-        # Optimization: Move norm calculation to XLA more efficiently if possible
-        # but sticking to your implementation for consistency
         shared_device = self.param_groups[0]["params"][0].device
         norm = torch.norm(
-            torch.stack([
-                ((torch.abs(p) if group["adaptive"] else 1.0) * p.grad).norm(p=2).to(shared_device)
-                for group in self.param_groups for p in group["params"]
-                if p.grad is not None
-            ]), p=2
-        )
+                    torch.stack([
+                        ((torch.abs(p) if group["adaptive"] else 1.0) * p.grad).norm(p=2).to(shared_device)
+                        for group in self.param_groups for p in group["params"]
+                        if p.grad is not None
+                    ]),
+                    p=2
+               )
         return norm
 
 # =========================================================================
-# 3. DUMMY TRAINING LOOP (Stage 2 Only)
+# STAGE 2 ONLY TRAINING LOOP
 # =========================================================================
 def train_loop(rank, flags):
     device = xm.xla_device()
+    num_cores = xm.xrt_world_size()
     
-    # Init Optimized Model
-    model = OptimizedController(d_ctrl=flags['d_ctrl']).to(device)
-    
-    # Mock syncing weights
-    xm.mark_step()
-    
-    # FREEZE BACKBONE (Stage 2 setup)
-    for p in model.parameters(): p.requires_grad = False
-    for p in model.halting_heads.parameters(): p.requires_grad = True
-    for p in model.vectorized_gate.parameters(): p.requires_grad = True
-    
-    model_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = SAM(model_params, optim.AdamW, lr=0.001)
-    
-    # Synthetic Data Generator
-    batch_size = flags['batch_size']
+    # 1. Model Initialization
     L = 24
-    d_teacher = 1024
+    model = Controller(
+        L=L,
+        d_teacher=1024,
+        d_ctrl=flags["d_ctrl"],
+        n_layers=flags["transformer_layers"],
+        num_classes=2
+    ).to(device)
     
-    xm.master_print(">>> Starting Dummy Stage 2 Training (Speed Test)")
-    xm.master_print(f">>> Batch Size: {batch_size}, Optimization: SAM")
+    # Sync initial weights across TPU cores
+    for param in model.parameters():
+        param.data = xm.all_reduce(xm.REDUCE_SUM, param.data) / num_cores
+    xm.mark_step()
+    xm.rendezvous("weights_synced") 
+
+    # --- PHASE SETUP: STAGE 2 ONLY ---
+    stage_name = "STAGE 2 TEST: Halting Heads + Vectorized Entropy Gates (SAM) | Backbone FROZEN"
     
-    start_time = time.time()
-    
-    # Run 50 steps
-    for step in range(50):
-        # Generate random dummy data on device
-        # We use fixed class probabilities effectively by having random inputs 
-        # that don't change much, but the model will process them fully.
-        teacher_cls = torch.randn(batch_size, L, d_teacher, device=device)
-        teacher_label = torch.randint(0, 2, (batch_size,), device=device)
+    # A. Freeze entire model first
+    for param in model.parameters(): 
+        param.requires_grad = False
         
-        def closure():
-            halting_logits, class_logits, z = model(teacher_cls)
-            
-            # Simple Loss
-            loss = halting_logits.mean() + class_logits.mean() # Dummy loss
-            loss.backward()
-            return loss
-        
-        loss = closure()
-        optimizer.step(closure)
-        xm.mark_step()
-        
-        if step % 10 == 0 and rank == 0:
-            elapsed = time.time() - start_time
-            print(f"Step {step}: {elapsed:.2f}s elapsed ({(elapsed/(step+1)):.3f} s/step)")
+    # B. Unfreeze Halting Heads (Standard List)
+    for param in model.halting_heads.parameters(): 
+        param.requires_grad = True
+
+    # C. Unfreeze Entropy Gate (CRITICAL FIX: Access the single vectorized module)
+    # The previous code failed here because it looked for a list 'entropy_gates'
+    for param in model.entropy_gate_module.parameters(): 
+        param.requires_grad = True
 
     if rank == 0:
-        total_time = time.time() - start_time
-        print(f"✅ Finished 50 steps in {total_time:.2f}s")
-        print(f"✅ Avg time per step: {total_time/50:.4f}s")
+        xm.master_print(f"\n{'#'*80}")
+        xm.master_print(f"STARTING {stage_name}")
+        xm.master_print(f"{'#'*80}")
+        
+        # Verify parameter counts
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        frozen_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        xm.master_print(f"  Trainable Params: {trainable_params:,}")
+        xm.master_print(f"  Frozen Params:    {frozen_params:,}")
+
+    # --- OPTIMIZER SETUP ---
+    model_params = [p for p in model.parameters() if p.requires_grad]
+    
+    # Use SAM as requested for Stage 2
+    optimizer = SAM(model_params, optim.AdamW, rho=0.05, adaptive=False, lr=flags["lr"], weight_decay=1e-2)
+    
+    # --- SCHEDULER SETUP ---
+    total_samples = flags["samples_per_shard"]
+    num_batches_per_chunk = total_samples // flags["batch_size"]
+    total_steps = 28 * flags["epochs"] * num_batches_per_chunk
+    
+    scheduler = CosineAnnealingWarmRestarts(
+        optimizer.base_optimizer, 
+        T_0=total_steps // 4, 
+        T_mult=2,   
+        eta_min=1e-6
+    )
+    
+    start_time = time.time()
+
+    # Iterate over data chunks
+    for chunk_idx in range(28): 
+        current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
+        
+        if rank == 0:
+            xm.master_print(f"Chunk {chunk_idx + 1}/28 | Loading {current_chunk_filename}")
+
+        # Load Data (Real Data Download)
+        data = training_data_download(
+            core_id=rank,
+            filename=current_chunk_filename,
+            max_entries=total_samples
+        )
+        
+        if data is None: 
+            raise RuntimeError(f"[Core {rank}] Failed load chunk {chunk_idx}")
+
+        teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
+        teacher_label_full = torch.from_numpy(data['classifications']).long()
+        
+        if teacher_cls_full.shape[1] == 25:
+            teacher_cls_full = teacher_cls_full[:, 1:25, :]
+        
+        # Slicing for distributed training
+        # Ensure divisible by num_cores for safety
+        N_total_local = teacher_cls_full.shape[0]
+        N_target = (N_total_local // num_cores) * num_cores
+
+        teacher_cls_full = teacher_cls_full[:N_target]
+        teacher_label_full = teacher_label_full[:N_target]
+
+        dataset = TensorDataset(teacher_cls_full, teacher_label_full)
+        sampler = RandomSampler(dataset)
+        
+        data_loader = DataLoader(
+            dataset, 
+            sampler=sampler, 
+            batch_size=flags["batch_size"], 
+            drop_last=True, 
+            num_workers=2
+        )
+        
+        # --- Epoch Loop ---
+        for epoch in range(flags["epochs"]):
+            model.train()
+            
+            for batch_idx, (teacher_cls, teacher_label) in enumerate(data_loader):
+                teacher_cls = teacher_cls.to(device)
+                teacher_label = teacher_label.to(device)
+                
+                # Define Closure for SAM
+                def closure():
+                    # Forward Pass (Backbone is frozen, but we need the output 'z')
+                    halting_logits, class_logits, z = model(teacher_cls)
+                    
+                    # 1. Calculate Correctness for Reweighting
+                    predictions = torch.argmax(class_logits, dim=-1)
+                    is_correct = (predictions == teacher_label.unsqueeze(1)).float()
+                    
+                    # 2. Class-Aware Rebalancing Weights
+                    n_pos = (teacher_label == 1).sum().float()
+                    n_neg = (teacher_label == 0).sum().float()
+                    # Prevent division by zero
+                    neg_weight_val = (n_pos / (n_neg + 1e-6)).clamp(min=1.0)
+                    
+                    sample_weights = torch.ones_like(halting_logits)
+                    sample_weights[teacher_label == 0] = neg_weight_val.item()
+                    
+                    # 3. Halting Loss (Binary Cross Entropy)
+                    loss_halt = F.binary_cross_entropy_with_logits(
+                        halting_logits, 
+                        is_correct, 
+                        weight=sample_weights
+                    )
+                    
+                    # 4. Entropy Regularization
+                    # Sigmoid and clamp for numerical stability
+                    h = torch.sigmoid(halting_logits).clamp(min=1e-6, max=1.0 - 1e-6)
+                    
+                    entropy_weight = 0.0025 
+                    # Binary entropy: -[p*log(p) + (1-p)*log(1-p)]
+                    h_entropy = -(h * h.log() + (1 - h) * (1 - h).log())
+                    # Minimize negative entropy (maximize uncertainty slightly to prevent collapse)
+                    loss_entropy = -entropy_weight * h_entropy.mean()
+                    
+                    loss = loss_halt + loss_entropy
+                    loss.backward()
+                    return loss
+                
+                # SAM Step
+                loss = closure()
+                optimizer.step(closure)
+                
+                # Clip Grads & Scheduler
+                torch.nn.utils.clip_grad_norm_(model_params, 1.0)
+                scheduler.step()
+                xm.mark_step()
+
+            # End of Epoch / Chunk Logging
+            loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
+            xm.rendezvous(f"chunk_{chunk_idx}_ep_{epoch}_complete")
+            
+            if rank == 0:
+                elapsed = time.time() - start_time
+                current_lr = scheduler.get_last_lr()[0]
+                xm.master_print("-" * 60)
+                xm.master_print(f"CHUNK {chunk_idx+1} | EPOCH {epoch+1}")
+                xm.master_print(f"  LR:            {current_lr:.2e}")
+                xm.master_print(f"  Stage 2 Loss:  {loss_sum / num_cores:.4f}")
+                xm.master_print(f"  Elapsed Time:  {elapsed:.1f}s")
+
+    if rank == 0:
+        save_path = "controller_stage2_final.pt"
+        torch.save(model.state_dict(), save_path)
+        xm.master_print(f"✅ Training Complete. Saved to {save_path}")
 
 def _mp_fn(rank, flags):
-    torch.set_default_tensor_type('torch.FloatTensor')
-    train_loop(rank, flags)
+    try:
+        torch.set_default_tensor_type('torch.FloatTensor')
+        train_loop(rank, flags)
+    except Exception as e:
+        print(f"[Core {rank}] FATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 if __name__ == "__main__":
-    FLAGS = {"d_ctrl": 512, "batch_size": 32}
-    xmp.spawn(_mp_fn, args=(FLAGS,), start_method='fork')
+    BASE_FLAGS = {
+        "d_ctrl": 512,
+        "transformer_layers": 4,
+        "lr": 5e-4,
+        "batch_size": 32,   
+        "epochs": 1, 
+        "samples_per_shard": 39000
+    }  
+    
+    print("Starting Optimized Stage 2 Training.")
+    xmp.spawn(_mp_fn, args=(BASE_FLAGS,), start_method='fork')

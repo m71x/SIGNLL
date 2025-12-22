@@ -56,7 +56,7 @@ class VectorizedEntropyGate(nn.Module):
     def __init__(self, d_ctrl: int, L: int):
         super().__init__()
         # We use Conv1d with groups=L to simulate L independent Linear layers
-        # Input: [B, D*L, 1] (reshaped) -> Output: [B, 8*L, 1]
+        # This runs in 1 TPU kernel instead of 24 separate ones.
         self.L = L
         self.d_ctrl = d_ctrl
         
@@ -151,7 +151,7 @@ class Controller(nn.Module):
         self.post_ln = nn.LayerNorm(d_ctrl) 
 
         # 3. Output Heads
-        # OPTIMIZED: Single Vectorized Gate Module (Replaces List of 24)
+        # OPTIMIZED: Single Vectorized Gate Module (Replaces slow ModuleList)
         self.entropy_gate_module = VectorizedEntropyGate(d_ctrl, L)
         
         self.halting_heads = nn.ModuleList([
@@ -177,7 +177,6 @@ class Controller(nn.Module):
         elif isinstance(module, nn.LayerNorm):
             nn.init.constant_(module.weight, 1.0)
             nn.init.constant_(module.bias, 0.0)
-        # Conv1d is initialized by default, but we can add explicit init if needed
 
     def forward(self, teacher_cls: torch.Tensor):
         B, L, D = teacher_cls.shape
@@ -196,7 +195,6 @@ class Controller(nn.Module):
         z = self.post_ln(z) 
         
         # 2. Gather All Class Logits & Entropy FIRST
-        # (We still loop here because classifier_heads is a ModuleList, but this was baseline speed)
         class_logits_list = []
         entropy_list = []
         
@@ -221,8 +219,7 @@ class Controller(nn.Module):
         all_entropies = torch.stack(entropy_list, dim=1)
         
         # 3. OPTIMIZED: Run Vectorized Gate on ALL layers at once
-        # Input: z [B, L, D], all_entropies [B, L, 1]
-        # Output: [B, L, 1]
+        # Input: z [B, L, D], all_entropies [B, L, 1] -> Output: [B, L, 1]
         all_gated_entropies = self.entropy_gate_module(z, all_entropies)
 
         # 4. Compute Halting
