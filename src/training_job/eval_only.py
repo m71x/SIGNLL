@@ -90,7 +90,7 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
             unique_exits, counts = torch.unique(exit_indices_cpu, return_counts=True)
             layer_exit_counts_cpu.index_add_(0, unique_exits, counts.float())
             xm.master_print("statistics calculated")
-
+            xm.master_print(i)
             # Local sync for Rank 0 to keep memory clean
             xm.mark_step()
             
