@@ -136,7 +136,7 @@ def eval_main(rank, flags):
     ).to(device)
 
     # 2. Loading Weights (All Ranks participate to avoid rendezvous mismatch)
-    load_path = os.path.expanduser("~/SIGNLL/final_model_stage2.pt")
+    load_path = os.path.expanduser("~/SIGNLL/final_model_stage2_gated.pt")
     
     # Critical: Check path existence on all ranks before trying to load
     if not os.path.exists(load_path):
