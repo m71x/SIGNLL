@@ -132,7 +132,7 @@ class SAM(torch.optim.Optimizer):
 # =========================================================================
 def train_loop(rank, flags):
     device = xm.xla_device()
-    model = DummyEntropyController(d_ctrl=flags["d_ctrl"], transformer_layers=flags["transformer_layers"]).to(device)
+    model = DummyEntropyController(d_ctrl=flags["d_ctrl"], n_layers=flags["transformer_layers"]).to(device)
     
     # Freeze logic
     for p in model.parameters(): p.requires_grad = False
