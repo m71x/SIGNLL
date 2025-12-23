@@ -98,7 +98,7 @@ def evaluate_model(rank, model, threshold, batch_size, samples_per_shard):
         xm.master_print(f"DONE | Accuracy: {acc:.2f}% | Samples: {int(total_samples.item())}")
         xm.master_print(f"Exit Distribution: {dist}\n")
 
-    xm.rendezvous("threshold_step")
+    #xm.rendezvous("threshold_step")
 
 def eval_main(rank, flags):
     device = xm.xla_device()
