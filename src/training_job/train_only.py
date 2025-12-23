@@ -14,32 +14,29 @@ from controller_model import Controller
 from training_data_download import training_data_download
 
 # =========================================================================
-# SAM OPTIMIZER WRAPPER (Updated to prevent NaN at larger batches)
+# SAM OPTIMIZER WRAPPER (Robust Version for XLA)
 # =========================================================================
 class SAM(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer, rho=0.05, adaptive=False, max_norm=1.0, **kwargs):
-        assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
-
-        # FIX: Include max_norm in defaults
         defaults = dict(rho=rho, adaptive=adaptive, max_norm=max_norm, **kwargs)
         super(SAM, self).__init__(params, defaults)
-
         self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
-        self.param_groups = self.base_optimizer.param_groups
-        self.defaults.update(self.base_optimizer.defaults)
-
+    
     @torch.no_grad()
     def first_step(self, zero_grad=False):
+        # FIX: Clip gradients BEFORE norm calculation to prevent bf16 overflow
+        for group in self.param_groups:
+             if group.get("max_norm") is not None:
+                torch.nn.utils.clip_grad_norm_(group["params"], group["max_norm"])
+
         grad_norm = self._grad_norm()
         for group in self.param_groups:
             scale = group["rho"] / (grad_norm + 1e-12)
-
             for p in group["params"]:
                 if p.grad is None: continue
                 self.state[p]["old_p"] = p.data.clone()
                 e_w = (torch.pow(p, 2) if group["adaptive"] else 1.0) * p.grad * scale.to(p)
                 p.add_(e_w)
-
         if zero_grad: self.zero_grad()
 
     @torch.no_grad()
@@ -47,38 +44,46 @@ class SAM(torch.optim.Optimizer):
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None: continue
-                p.data = self.state[p]["old_p"]  # Restore original weights
-
-        # FIX: Clip gradients HERE, before the base optimizer updates the weights.
-        # This prevents NaN updates when batch size increases.
+                p.data = self.state[p]["old_p"]
+        
+        # FIX: Clip AGAIN before the base optimizer updates the weights
         for group in self.param_groups:
             if group.get("max_norm") is not None:
                 torch.nn.utils.clip_grad_norm_(group["params"], group["max_norm"])
-
+        
         self.base_optimizer.step()
-
         if zero_grad: self.zero_grad()
 
     @torch.no_grad()
     def step(self, closure=None):
         assert closure is not None, "SAM requires closure"
         closure = torch.enable_grad()(closure)
-
+        
+        # NOTE: This step method assumes the first closure (gradient calc) 
+        # has already been called externally by the training loop.
+        
+        # 1. First pass gradients already exist (from loop).
+        
+        # 2. Perturb weights based on gradient norm
         self.first_step(zero_grad=True)
+        
+        # 3. Second pass at the perturbed location
         closure()
+        
+        # 4. Restore weights and update using the base optimizer
         self.second_step()
 
     def _grad_norm(self):
         shared_device = self.param_groups[0]["params"][0].device
-        norm = torch.norm(
-                    torch.stack([
-                        ((torch.abs(p) if group["adaptive"] else 1.0) * p.grad).norm(p=2).to(shared_device)
-                        for group in self.param_groups for p in group["params"]
-                        if p.grad is not None
-                    ]),
-                    p=2
-               )
-        return norm
+        # FIX: Force float32 for the norm calculation to prevent bfloat16 overflow
+        grads = [
+            ((torch.abs(p) if group["adaptive"] else 1.0) * p.grad).norm(p=2).to(dtype=torch.float32, device=shared_device)
+            for group in self.param_groups for p in group["params"]
+            if p.grad is not None
+        ]
+        if not grads:
+            return torch.tensor(1.0, dtype=torch.float32, device=shared_device)
+        return torch.norm(torch.stack(grads), p=2)
 
     def load_state_dict(self, state_dict):
         super().load_state_dict(state_dict)

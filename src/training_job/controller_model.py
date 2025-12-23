@@ -82,24 +82,18 @@ class VectorizedEntropyGate(nn.Module):
         nn.init.constant_(self.net2.bias, 0.0)
 
     def forward(self, z, entropy):
-        # z: [B, L, D]
-        # entropy: [B, L, 1]
         B, L, D = z.shape
+        # FIXED: Reshape correctly for grouped convolution (Layer-wise grouping)
+        # Old (Incorrect for groups=L): z.transpose(1, 2).reshape(B, D * L, 1)
+        # New (Correct): Flattens L blocks of D features. Group g takes block g.
+        z_reshaped = z.reshape(B, L * D, 1)
         
-        # 1. Reshape for Conv1d: [B, D*L, 1]
-        # Permute to put features in channel dim, then flatten L*D
-        z_reshaped = z.transpose(1, 2).reshape(B, D * L, 1)
-        
-        # 2. Forward Pass (Vectorized)
-        out = self.net1(z_reshaped)      # [B, 8*L, 1]
+        out = self.net1(z_reshaped)
         out = self.act(out)
-        out = self.net2(out)             # [B, L, 1]
+        out = self.net2(out)
         gate = self.sigmoid(out)
         
-        # 3. Reshape back to [B, L, 1]
-        gate = gate.reshape(B, L, 1)
-        
-        return entropy * gate
+        return entropy * gate.reshape(B, L, 1)
 
 # =========================================================================
 # CONTROLLER
