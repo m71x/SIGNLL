@@ -108,15 +108,16 @@ def eval_main(rank, flags):
         n_layers=flags["transformer_layers"], num_classes=2
     ).to(device)
 
+    if rank == 0:
     # Load Stage 2 Weights
-    load_path = os.path.expanduser("~/SIGNLL/final_model_stage2_gated.pt")
-    state_dict = torch.load(load_path, map_location='cpu')
-    model.load_state_dict(state_dict)
-    xm.mark_step()
+        load_path = os.path.expanduser("~/SIGNLL/final_model_stage2_gated.pt")
+        state_dict = torch.load(load_path, map_location='cpu')
+        model.load_state_dict(state_dict)
+        xm.mark_step()
 
-    thresholds = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
-    for thresh in thresholds:
-        evaluate_model(rank, model, thresh, flags["batch_size"], flags["samples_per_shard"])
+        thresholds = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+        for thresh in thresholds:
+            evaluate_model(rank, model, thresh, flags["batch_size"], flags["samples_per_shard"])
 
 if __name__ == "__main__":
     BASE_FLAGS = {
