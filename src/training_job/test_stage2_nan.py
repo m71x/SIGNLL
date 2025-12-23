@@ -30,7 +30,7 @@ class VectorizedEntropyGate(nn.Module):
 
     def forward(self, z, entropy):
         B, L, D = z.shape
-        # Ensure Layer features stay contiguous for Grouped Conv1d
+        # Flatten L and D correctly for grouped convolution
         z_reshaped = z.reshape(B, L * D, 1)
         out = self.net1(z_reshaped)
         out = self.act(out)
@@ -71,7 +71,7 @@ class DummyEntropyController(Controller):
         return halting_logits, class_logits, z
 
 # =========================================================================
-# 3. ROBUST SAM OPTIMIZER (Float32 Norms)
+# 3. ROBUST SAM OPTIMIZER (Fixed Logic for XLA)
 # =========================================================================
 class SAM(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer, rho=0.05, adaptive=False, max_norm=1.0, **kwargs):
@@ -102,38 +102,63 @@ class SAM(torch.optim.Optimizer):
             for p in group["params"]:
                 if p.grad is None: continue
                 p.data = self.state[p]["old_p"]
-        # Clip BEFORE update
+        
+        # Clip AGAIN before the base optimizer updates the weights
         for group in self.param_groups:
             if group.get("max_norm") is not None:
                 torch.nn.utils.clip_grad_norm_(group["params"], group["max_norm"])
+        
         self.base_optimizer.step()
         if zero_grad: self.zero_grad()
 
     @torch.no_grad()
     def step(self, closure=None):
+        assert closure is not None, "SAM requires closure"
         closure = torch.enable_grad()(closure)
+        
+        # 1. First pass to generate gradients
+        closure() 
+        # 2. Perturb weights based on gradient norm
         self.first_step(zero_grad=True)
+        # 3. Second pass at the perturbed location
         closure()
+        # 4. Restore weights and update using the base optimizer
         self.second_step()
 
     def _grad_norm(self):
         shared_device = self.param_groups[0]["params"][0].device
-        # Force float32 for the norm reduction to prevent bfloat16 SumOfSquares overflow
-        norm = torch.norm(
-                    torch.stack([
-                        ((torch.abs(p) if group["adaptive"] else 1.0) * p.grad).norm(p=2).to(dtype=torch.float32, device=shared_device)
-                        for group in self.param_groups for p in group["params"]
-                        if p.grad is not None
-                    ]), p=2)
-        return norm
+        # Force float32 for the norm calculation to prevent bfloat16 overflow
+        grads = [
+            ((torch.abs(p) if group["adaptive"] else 1.0) * p.grad).norm(p=2).to(dtype=torch.float32, device=shared_device)
+            for group in self.param_groups for p in group["params"]
+            if p.grad is not None
+        ]
+        if not grads:
+            return torch.tensor(1.0, dtype=torch.float32, device=shared_device)
+        return torch.norm(torch.stack(grads), p=2)
 
 # =========================================================================
-# 4. TRAINING LOOP (Single Forward Pass Optimization)
+# 4. TRAINING LOOP
 # =========================================================================
 def train_loop(rank, flags):
     device = xm.xla_device()
-    model = DummyEntropyController(d_ctrl=flags["d_ctrl"], n_layers=flags["transformer_layers"]).to(device)
+    num_cores = xm.xrt_world_size()
     
+    L = 24
+    model = DummyEntropyController(
+        L=L,
+        d_teacher=1024,
+        d_ctrl=flags["d_ctrl"],
+        n_layers=flags["transformer_layers"],
+        num_classes=2
+    ).to(device)
+    
+    # Sync initial weights
+    for param in model.parameters():
+        param.data = xm.all_reduce(xm.REDUCE_SUM, param.data) / num_cores
+    xm.mark_step()
+    xm.rendezvous("weights_synced") 
+
     # Freeze logic
     for p in model.parameters(): p.requires_grad = False
     for p in model.halting_heads.parameters(): p.requires_grad = True
@@ -154,7 +179,7 @@ def train_loop(rank, flags):
     
     for epoch in range(flags["epochs"]):
         model.train()
-        diag_probs = None # To store diagnostic info from inside the closure
+        diag_probs = None 
 
         for batch_idx, (teacher_cls, teacher_label) in enumerate(data_loader):
             teacher_cls, teacher_label = teacher_cls.to(device), teacher_label.to(device)
@@ -171,14 +196,13 @@ def train_loop(rank, flags):
                 
                 loss.backward()
                 
-                # Capture diagnostics ONLY on first batch of first core to avoid graph overhead
                 if rank == 0 and batch_idx == 0:
                     diag_probs = h.detach().cpu()[0] 
                 return loss
 
             # SAM Step
             optimizer.step(closure)
-            xm.mark_step() # Force graph execution here
+            xm.mark_step() 
 
             if batch_idx % 20 == 0 and rank == 0:
                 print(f"Epoch {epoch} | Batch {batch_idx} processed.")
@@ -191,5 +215,12 @@ def _mp_fn(rank, flags):
     train_loop(rank, flags)
 
 if __name__ == "__main__":
-    BASE_FLAGS = {"d_ctrl": 512, "transformer_layers": 4, "lr": 5e-4, "batch_size": 64, "epochs": 2, "samples_per_shard": 5000}
+    BASE_FLAGS = {
+        "d_ctrl": 512, 
+        "transformer_layers": 4, 
+        "lr": 5e-4, 
+        "batch_size": 64, 
+        "epochs": 2, 
+        "samples_per_shard": 5000
+    }
     xmp.spawn(_mp_fn, args=(BASE_FLAGS,), start_method='fork')
