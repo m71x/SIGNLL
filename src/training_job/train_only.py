@@ -14,13 +14,14 @@ from controller_model import Controller
 from training_data_download import training_data_download
 
 # =========================================================================
-# SAM OPTIMIZER WRAPPER
+# SAM OPTIMIZER WRAPPER (Updated to prevent NaN at larger batches)
 # =========================================================================
 class SAM(torch.optim.Optimizer):
-    def __init__(self, params, base_optimizer, rho=0.05, adaptive=False, **kwargs):
+    def __init__(self, params, base_optimizer, rho=0.05, adaptive=False, max_norm=1.0, **kwargs):
         assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
 
-        defaults = dict(rho=rho, adaptive=adaptive, **kwargs)
+        # FIX: Include max_norm in defaults
+        defaults = dict(rho=rho, adaptive=adaptive, max_norm=max_norm, **kwargs)
         super(SAM, self).__init__(params, defaults)
 
         self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
@@ -46,7 +47,13 @@ class SAM(torch.optim.Optimizer):
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None: continue
-                p.data = self.state[p]["old_p"]
+                p.data = self.state[p]["old_p"]  # Restore original weights
+
+        # FIX: Clip gradients HERE, before the base optimizer updates the weights.
+        # This prevents NaN updates when batch size increases.
+        for group in self.param_groups:
+            if group.get("max_norm") is not None:
+                torch.nn.utils.clip_grad_norm_(group["params"], group["max_norm"])
 
         self.base_optimizer.step()
 
@@ -160,7 +167,8 @@ def train_loop(rank, flags):
         if stage == 1:
             optimizer = optim.AdamW(model_params, lr=flags["lr"], weight_decay=1e-2)
         elif stage == 2:
-            optimizer = SAM(model_params, optim.AdamW, rho=0.05, adaptive=False, lr=flags["lr"], weight_decay=1e-2)
+            # FIX: Initialize SAM with max_norm=1.0 for internal clipping
+            optimizer = SAM(model_params, optim.AdamW, rho=0.05, adaptive=False, lr=flags["lr"], weight_decay=1e-2, max_norm=1.0)
 
         # --- SCHEDULER SETUP ---
         total_steps_in_stage = 28 * flags["epochs"] * num_batches_per_chunk
@@ -358,7 +366,7 @@ def train_loop(rank, flags):
                         
                         loss = closure()
                         optimizer.step(closure)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        # NOTE: External clipping removed here because SAM now does it internally.
                         scheduler.step()
                         xm.mark_step()
 

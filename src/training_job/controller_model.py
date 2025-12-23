@@ -50,13 +50,13 @@ class CustomTransformerLayer(nn.Module):
         return x
 
 # =========================================================================
-# OPTIMIZED: Vectorized Gating Module
+# OPTIMIZED: Vectorized Gating Module (Fixes 8x Slowdown)
 # =========================================================================
 class VectorizedEntropyGate(nn.Module):
     def __init__(self, d_ctrl: int, L: int):
         super().__init__()
-        # We use Conv1d with groups=L to simulate L independent Linear layers
-        # This runs in 1 TPU kernel instead of 24 separate ones.
+        # We use Conv1d with groups=L to simulate L independent Linear layers.
+        # This allows the TPU to process all gates in a single kernel launch.
         self.L = L
         self.d_ctrl = d_ctrl
         
@@ -87,7 +87,7 @@ class VectorizedEntropyGate(nn.Module):
         B, L, D = z.shape
         
         # 1. Reshape for Conv1d: [B, D*L, 1]
-        # We permute to put features in channel dim, then flatten L*D
+        # Permute to put features in channel dim, then flatten L*D
         z_reshaped = z.transpose(1, 2).reshape(B, D * L, 1)
         
         # 2. Forward Pass (Vectorized)
@@ -204,7 +204,7 @@ class Controller(nn.Module):
             c_l = self.classifier_heads[l](z[:, l, :]) 
             class_logits_list.append(c_l)
             
-            # Stable Entropy Calc
+            # Stable Entropy Calculation
             log_probs = F.log_softmax(c_l, dim=-1)
             probs = torch.exp(log_probs)
             probs_safe = probs.clamp(min=1e-10, max=1.0)
