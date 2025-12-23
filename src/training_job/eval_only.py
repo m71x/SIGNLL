@@ -109,7 +109,7 @@ def eval_main(rank, flags):
     ).to(device)
 
     # Load Stage 2 Weights
-    load_path = os.path.expanduser("~/SIGNLL/final_model_stage2.pt")
+    load_path = os.path.expanduser("~/SIGNLL/final_model_stage2_gated.pt")
     state_dict = torch.load(load_path, map_location='cpu')
     model.load_state_dict(state_dict)
     xm.mark_step()
