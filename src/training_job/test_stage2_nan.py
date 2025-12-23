@@ -11,11 +11,11 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler
 from training_data_download import training_data_download
 
-# Import base controller and utility functions from your uploaded module
+# Import base controller and utility functions
 from controller_model import Controller, apply_rotary_pos_emb
 
 # =========================================================================
-# 1. FIXED VECTORIZED GATE (As confirmed working)
+# 1. FIXED VECTORIZED GATE
 # =========================================================================
 class VectorizedEntropyGate(nn.Module):
     def __init__(self, d_ctrl: int, L: int):
@@ -29,16 +29,12 @@ class VectorizedEntropyGate(nn.Module):
         nn.init.constant_(self.net2.bias, 0.0)
 
     def forward(self, z, entropy):
-        B, L, D = z.shape
-        z_reshaped = z.reshape(B, L * D, 1)
-        out = self.net1(z_reshaped)
-        out = self.act(out)
-        out = self.net2(out)
-        gate = self.sigmoid(out)
-        return entropy * gate.reshape(B, L, 1)
+        # z: [B, L, D] -> [B, L*D, 1] for Grouped Conv
+        gate = self.sigmoid(self.net2(self.act(self.net1(z.reshape(z.size(0), -1, 1)))))
+        return entropy * gate.reshape(z.size(0), self.L, 1)
 
 # =========================================================================
-# 2. EMULATED CONTROLLER (Graph-Optimized + Dummy Entropy Logic)
+# 2. EMULATED CONTROLLER (XLA Linearized)
 # =========================================================================
 class DummyEntropyController(Controller):
     def __init__(self, **kwargs):
@@ -51,19 +47,22 @@ class DummyEntropyController(Controller):
         x = self.proj(x)
         x = apply_rotary_pos_emb(x, self.cos_cached, self.sin_cached)
         x = self.pre_ln(x)
-        attn_mask = torch.triu(torch.ones(L, L, device=teacher_cls.device), diagonal=1).bool()
         
+        # Use a pre-generated mask for speed
+        attn_mask = torch.triu(torch.ones(L, L, device=teacher_cls.device), diagonal=1).bool()
         z = x
         for layer in self.layers:
             z = layer(z, mask=attn_mask)
         z = self.post_ln(z) 
         
-        # Emulate classifier outputs
+        # Vectorized Classifier pass (List comprehensions compile better on XLA)
         class_logits = torch.stack([self.classifier_heads[l](z[:, l, :]) for l in range(L)], dim=1)
-        # Full Stage 2 emulation: Inject dummy entropy (0.5) to isolate Halting Head training
+        
+        # Dummy Entropy Injection (0.5)
         all_entropies = torch.full((B, L, 1), 0.5, device=z.device, dtype=z.dtype)
         all_gated_entropies = self.entropy_gate_module(z, all_entropies)
 
+        # Vectorized Halting pass
         halting_logits = torch.cat([
             self.halting_heads[l](torch.cat([z[:, l, :], all_gated_entropies[:, l, :]], dim=-1)) 
             for l in range(L)
@@ -72,7 +71,7 @@ class DummyEntropyController(Controller):
         return halting_logits, class_logits, z
 
 # =========================================================================
-# 3. ROBUST SAM OPTIMIZER (XLA Optimized with Float32 Norms)
+# 3. ROBUST SAM OPTIMIZER (Fixed Logic for XLA + Float32 Norms)
 # =========================================================================
 class SAM(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer, rho=0.05, adaptive=False, max_norm=1.0, **kwargs):
@@ -111,70 +110,57 @@ class SAM(torch.optim.Optimizer):
     @torch.no_grad()
     def step(self, closure=None):
         closure = torch.enable_grad()(closure)
-        closure() # Initial gradients
+        closure() # Initial pass
         self.first_step(zero_grad=True)
-        closure() # Perturbed gradients
+        closure() # Perturbed pass
         self.second_step()
 
     def _grad_norm(self):
         shared_device = self.param_groups[0]["params"][0].device
+        # Force float32 to prevent bfloat16 SumOfSquares overflow
         grads = [
             ((torch.abs(p) if group["adaptive"] else 1.0) * p.grad).norm(p=2).to(dtype=torch.float32, device=shared_device)
-            for group in self.param_groups for p in group["params"]
-            if p.grad is not None
+            for group in self.param_groups for p in group["params"] if p.grad is not None
         ]
-        if not grads:
-            return torch.tensor(1.0, dtype=torch.float32, device=shared_device)
+        if not grads: return torch.tensor(1.0, dtype=torch.float32, device=shared_device)
         return torch.norm(torch.stack(grads), p=2)
 
 # =========================================================================
-# 4. FULL STAGE 2 TRAINING LOOP
+# 4. FULL EMULATED TRAINING LOOP
 # =========================================================================
 def train_loop(rank, flags):
     device = xm.xla_device()
     num_cores = xm.xrt_world_size()
     
-    L = 24
     model = DummyEntropyController(
-        L=L,
-        d_teacher=1024,
-        d_ctrl=flags["d_ctrl"],
-        n_layers=flags["transformer_layers"],
-        num_classes=2
+        L=24, d_teacher=1024, d_ctrl=flags["d_ctrl"], 
+        n_layers=flags["transformer_layers"], num_classes=2
     ).to(device)
     
-    # Sync weights
-    for param in model.parameters():
-        param.data = xm.all_reduce(xm.REDUCE_SUM, param.data) / num_cores
-    xm.mark_step()
-    xm.rendezvous("weights_synced") 
-
-    # Freeze Logic (Stage 2 Style)
+    # Freeze Logic
     for p in model.parameters(): p.requires_grad = False
     for p in model.halting_heads.parameters(): p.requires_grad = True
     for p in model.entropy_gate_module.parameters(): p.requires_grad = True
 
     model_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = SAM(model_params, optim.AdamW, lr=flags["lr"], max_norm=1.0)
+    optimizer = SAM(model_params, optim.AdamW, rho=0.05, lr=flags["lr"], max_norm=1.0)
     
-    total_chunks = 28
-    total_steps = total_chunks * flags["epochs"] * (flags["samples_per_shard"] // flags["batch_size"])
+    total_steps = 28 * flags["epochs"] * (flags["samples_per_shard"] // flags["batch_size"])
     scheduler = CosineAnnealingWarmRestarts(optimizer.base_optimizer, T_0=total_steps // 4, T_mult=2, eta_min=1e-6)
 
-    xm.master_print(f"\nSTARTING FULL EMULATED STAGE 2 TRAINING")
+    xm.master_print(f"\nSTARTING FULL STAGE 2 EMULATION (28 Chunks, 5 Epochs)")
     start_time = time.time()
 
-    for chunk_idx in range(total_chunks):
+    for chunk_idx in range(28):
         current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
-        if rank == 0: xm.master_print(f"\nProcessing Chunk {chunk_idx + 1}/{total_chunks}: {current_chunk_filename}")
+        if rank == 0: xm.master_print(f"\nChunk {chunk_idx+1}/28 | {current_chunk_filename}")
 
         data = training_data_download(core_id=rank, filename=current_chunk_filename, max_entries=flags["samples_per_shard"])
         teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
+        if teacher_cls_full.shape[1] == 25: teacher_cls_full = teacher_cls_full[:, 1:25, :]
         teacher_label_full = torch.from_numpy(data['classifications']).long()
         
-        if teacher_cls_full.shape[1] == 25: teacher_cls_full = teacher_cls_full[:, 1:25, :]
-        
-        # Slicing
+        # distributed slicing
         N_target = (teacher_cls_full.shape[0] // num_cores) * num_cores
         dataset = TensorDataset(teacher_cls_full[:N_target], teacher_label_full[:N_target])
         data_loader = DataLoader(dataset, sampler=RandomSampler(dataset), batch_size=flags["batch_size"], drop_last=True)
@@ -191,9 +177,8 @@ def train_loop(rank, flags):
                     halting_logits, class_logits, _ = model(teacher_cls)
                     is_correct = (torch.argmax(class_logits, dim=-1) == teacher_label.unsqueeze(1)).float()
                     
-                    # Halting Loss
+                    # Loss
                     loss = F.binary_cross_entropy_with_logits(halting_logits, is_correct)
-                    # Smooth Entropy Regularization
                     h = torch.sigmoid(halting_logits).clamp(1e-6, 1.0-1e-6)
                     loss += -0.0025 * (-(h * h.log() + (1-h) * (1-h).log())).mean()
                     
@@ -208,17 +193,14 @@ def train_loop(rank, flags):
 
             if rank == 0:
                 elapsed = time.time() - start_time
-                xm.master_print(f"Chunk {chunk_idx+1} | Ep {epoch+1} | Time: {elapsed:.1f}s | Sample Probs: {[f'{p:.2f}' for p in diag_probs.tolist()]}")
+                xm.master_print(f"Chunk {chunk_idx+1} | Ep {epoch+1} | {elapsed:.1f}s | Sample Probs: {[f'{p:.2f}' for p in diag_probs.tolist()]}")
 
-        # Periodic Checkpoint
         if (chunk_idx + 1) % 5 == 0 and rank == 0:
-            save_path = f"emulated_stage2_chunk_{chunk_idx+1}.pt"
-            torch.save(model.state_dict(), save_path)
-            xm.master_print(f"Checkpoint saved: {save_path}")
+            torch.save(model.state_dict(), f"emulated_stage2_chunk_{chunk_idx+1}.pt")
 
     if rank == 0:
         torch.save(model.state_dict(), "final_emulated_stage2.pt")
-        xm.master_print("✅ Full Emulated Stage 2 Training Complete.")
+        xm.master_print("✅ Emulated Stage 2 Training Complete.")
 
 def _mp_fn(rank, flags):
     torch.set_default_tensor_type('torch.FloatTensor')
@@ -226,11 +208,7 @@ def _mp_fn(rank, flags):
 
 if __name__ == "__main__":
     BASE_FLAGS = {
-        "d_ctrl": 512, 
-        "transformer_layers": 4, 
-        "lr": 5e-4, 
-        "batch_size": 64, 
-        "epochs": 5, 
-        "samples_per_shard": 39000
+        "d_ctrl": 512, "transformer_layers": 4, "lr": 5e-4, 
+        "batch_size": 64, "epochs": 5, "samples_per_shard": 39000
     }
     xmp.spawn(_mp_fn, args=(BASE_FLAGS,), start_method='fork')
