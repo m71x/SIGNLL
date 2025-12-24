@@ -8,13 +8,12 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts 
 
 from torch.utils.data import TensorDataset, DataLoader, SequentialSampler, RandomSampler
-from torch.utils.data.distributed import DistributedSampler
+# from training_data_download import training_data_download # Not needed for dummy test
 
 from controller_model import Controller
-from training_data_download import training_data_download
 
 # =========================================================================
-# TRAINING LOOP 
+# TRAINING LOOP (DUMMY DATA & STAGE 2 ONLY)
 # =========================================================================
 def train_loop(rank, flags):
     device = xm.xla_device()
@@ -38,269 +37,140 @@ def train_loop(rank, flags):
     
     xm.rendezvous("weights_synced") 
 
-    # Calculate step counts
-    total_samples = flags["samples_per_shard"]
-    num_batches_per_chunk = total_samples // flags["batch_size"]
-    global_step = 0
-
-    diag_sample_pos = None
-    diag_sample_neg = None
-
     # =========================================================================
-    # STAGE LOOP: 1 -> Backbone/Classifiers, 2 -> Halting Heads + Gates
+    # STAGE LOOP: SKIPPING 1, RUNNING 2
     # =========================================================================
-    for stage in [1, 2]:
+    # We only run Stage 2 for this test
+    for stage in [2]:
         
         # --- PHASE SETUP ---
-        if stage == 1:
-            stage_name = "STAGE 1: Backbone & Classifiers (Halting & Gates FROZEN)"
-            for param in model.parameters(): 
-                param.requires_grad = True
+        stage_name = "STAGE 2 TEST: Halting Heads + Entropy Gates (Backbone FROZEN)"
+        for param in model.parameters(): 
+            param.requires_grad = False
+        
+        # Unfreeze halting heads
+        for param in model.halting_heads.parameters(): 
+            param.requires_grad = True
             
-            # Freeze halting heads
-            for param in model.halting_heads.parameters(): 
-                param.requires_grad = False
-            
-            # Freeze optimized entropy gate module
-            for param in model.entropy_gate_module.parameters(): 
-                param.requires_grad = False
-            
-        elif stage == 2:
-            stage_name = "STAGE 2: Halting Heads + Entropy Gates (Backbone FROZEN)"
-            for param in model.parameters(): 
-                param.requires_grad = False
-            
-            # Unfreeze halting heads
-            for param in model.halting_heads.parameters(): 
-                param.requires_grad = True
-                
-            # Unfreeze optimized entropy gate module
-            for param in model.entropy_gate_module.parameters(): 
-                param.requires_grad = True
+        # Unfreeze optimized entropy gate module
+        for param in model.entropy_gate_module.parameters(): 
+            param.requires_grad = True
 
         if rank == 0:
             xm.master_print(f"\n{'#'*80}")
-            xm.master_print(f"STARTING {stage_name}")
+            xm.master_print(f"STARTING {stage_name} (DUMMY DATA)")
             xm.master_print(f"{'#'*80}")
         
         # --- OPTIMIZER SETUP ---
         model_params = [p for p in model.parameters() if p.requires_grad]
-        
-        if rank == 0:
-            num_params = sum(p.numel() for p in model_params)
-            xm.master_print(f"Trainable parameters: {num_params:,}")
-        
-        # CHANGED: Use standard AdamW for both stages (SAM removed)
         optimizer = optim.AdamW(model_params, lr=flags["lr"], weight_decay=1e-2)
 
         # --- SCHEDULER SETUP ---
-        total_steps_in_stage = 28 * flags["epochs"] * num_batches_per_chunk
-        T_0 = total_steps_in_stage // 4
-        
-        # CHANGED: Passed optimizer directly (no base_optimizer check needed)
-        scheduler = CosineAnnealingWarmRestarts(
-            optimizer, 
-            T_0=T_0, 
-            T_mult=2,   
-            eta_min=1e-6
-        )
-        if rank == 0:
-            xm.master_print(f"Scheduler: CosineAnnealingWarmRestarts, T_0={T_0} steps")
+        # Dummy scheduler for test
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=100, T_mult=1)
 
-        for chunk_idx in range(28): 
-            current_chunk_filename = f"embeddings_chunk_{chunk_idx}.npz"
-            
+        # Run 5 "Chunks" of dummy data
+        for chunk_idx in range(5): 
             if rank == 0:
-                xm.master_print(f"Stage {stage} | Chunk {chunk_idx + 1}/28 | Loading {current_chunk_filename}")
-            # --- Load Data ---
-            data = training_data_download(
-                core_id=rank,
-                filename=current_chunk_filename,
-                max_entries=flags["samples_per_shard"]
-            )
+                xm.master_print(f"Stage {stage} | Chunk {chunk_idx + 1}/5 | Generatng Dummy Data...")
+
+            # --- DUMMY DATA GENERATION ---
+            # Simulate: [Batch*Steps, L, D] -> We just make enough for 10 batches
+            steps_per_chunk = 10
+            N_dummy = flags["batch_size"] * steps_per_chunk
             
-            if data is None: 
-                raise RuntimeError(f"[Core {rank}] Failed load chunk {chunk_idx}")
-
-            teacher_cls_full = torch.from_numpy(data['all_layer_cls_tokens']).float()
-            teacher_label_full = torch.from_numpy(data['classifications']).long()
+            # [N, L=24, D=1024]
+            teacher_cls_full = torch.randn(N_dummy, 24, 1024)
+            # [N] Random labels 0 or 1
+            teacher_label_full = torch.randint(0, 2, (N_dummy,)).long()
             
-            # --- Soft Targets ---
-            if 'teacher_logits' in data:
-                t_logits = torch.from_numpy(data['teacher_logits']).float()
-                T_distill = 2.0
-                teacher_log_probs_full = F.log_softmax(t_logits / T_distill, dim=-1)
-            else:
-                num_classes = 2
-                smoothing = 0.1
-                t_one_hot = torch.zeros(teacher_label_full.size(0), num_classes).scatter_(
-                    1, teacher_label_full.unsqueeze(1), 1
-                )
-                teacher_probs_full = t_one_hot * (1.0 - smoothing) + (smoothing / num_classes)
-                teacher_log_probs_full = torch.log(teacher_probs_full.clamp(min=1e-10))
-
-            if teacher_cls_full.shape[1] == 25:
-                teacher_cls_full = teacher_cls_full[:, 1:25, :]
+            # Pos Weight (Static)
+            pos_weight_tensor = torch.tensor([1.0]).float().to(device)
             
-            # --- Data Slicing ---
-            N_total_local = teacher_cls_full.shape[0]
-            N_target = (N_total_local // num_cores) * 32
-
-            teacher_cls_full = teacher_cls_full[:N_target]
-            teacher_label_full = teacher_label_full[:N_target]
-            teacher_log_probs_full = teacher_log_probs_full[:N_target] 
-
-            # Stage 1 Pos Weight (Static)
-            neg_samples = (teacher_label_full == 0).sum().item()
-            pos_samples = (teacher_label_full == 1).sum().item()
-            pos_weight_val = neg_samples / (pos_samples + 1e-6)
-            pos_weight_tensor = torch.tensor([pos_weight_val]).float().to(device)
-
-            bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight_tensor).to(device)
-            
-            dataset = TensorDataset(teacher_cls_full, teacher_label_full, teacher_log_probs_full)
+            dataset = TensorDataset(teacher_cls_full, teacher_label_full)
             sampler = RandomSampler(dataset)
             
             data_loader = DataLoader(
                 dataset, sampler=sampler, batch_size=flags["batch_size"], 
-                drop_last=True, num_workers=2
+                drop_last=True, num_workers=0 # No workers for dummy
             )
             
-            # --- Epoch Loop ---
-            for epoch in range(flags["epochs"]):
+            # --- Epoch Loop (Just 1 epoch for test) ---
+            for epoch in range(1):
                 model.train()
                 diag_sample_pos = None
                 diag_sample_neg = None
 
-                for batch_idx, (teacher_cls, teacher_label, teacher_log_probs) in enumerate(data_loader):
-                    if stage == 2: 
-                        global_step += 1
-                    
+                for batch_idx, (teacher_cls, teacher_label) in enumerate(data_loader):
                     teacher_cls = teacher_cls.to(device)
                     teacher_label = teacher_label.to(device)
-                    teacher_log_probs = teacher_log_probs.to(device)
                     
-                    # --- STAGE 1: Standard Training ---
-                    if stage == 1:
-                        halting_logits, class_logits, z = model(teacher_cls) 
-                        
-                        if rank == 0 and batch_idx == 0:
+                    # --- STAGE 2 LOGIC ---
+                    # Forward pass
+                    halting_logits, class_logits, z = model(teacher_cls)
+                    
+                    predictions = torch.argmax(class_logits, dim=-1)
+                    is_correct = (predictions == teacher_label.unsqueeze(1)).float()
+                    
+                    # CLASS-AWARE REBALANCING
+                    n_pos = (teacher_label == 1).sum().float()
+                    n_neg = (teacher_label == 0).sum().float()
+                    neg_weight_val = (n_pos / (n_neg + 1e-6)).clamp(min=1.0)
+                    
+                    sample_weights = torch.ones_like(halting_logits)
+                    sample_weights[teacher_label == 0] = neg_weight_val.item()
+                    
+                    # Halting Loss
+                    loss_halt = F.binary_cross_entropy_with_logits(
+                        halting_logits, 
+                        is_correct, 
+                        weight=sample_weights
+                    )
+                    
+                    # Entropy regularization
+                    h = torch.sigmoid(halting_logits)
+                    h_safe = h.clamp(min=1e-6, max=1.0 - 1e-6)
+                    
+                    entropy_weight = 0.0025 
+                    h_entropy = -(h_safe * h_safe.log() + (1 - h_safe) * (1 - h_safe).log())
+                    loss_entropy = -entropy_weight * h_entropy.mean()
+                    
+                    loss = loss_halt + loss_entropy
+                    
+                    # --- FIX: DIAGNOSTICS FOR STAGE 2 ---
+                    # Move to CPU on ALL ranks to preserve SPMD graph consistency
+                    if batch_idx == 0:
+                        c_logits_cpu = class_logits.detach().cpu()
+                        h_logits_cpu = halting_logits.detach().cpu()
+                        lbl_cpu = teacher_label.detach().cpu()
+
+                        if rank == 0:
                             def extract_sample(label_val):
-                                indices = (teacher_label == label_val).nonzero(as_tuple=True)[0]
+                                # Safe to use nonzero() on CPU tensor
+                                indices = (lbl_cpu == label_val).nonzero(as_tuple=True)[0]
                                 if indices.numel() > 0:
-                                    idx = indices[0]
+                                    idx = indices[0].item()
                                     return {
-                                        'cls': class_logits[idx].detach().cpu(),
-                                        'halt': halting_logits[idx].detach().cpu(),
-                                        'lbl': teacher_label[idx].detach().cpu()
+                                        'cls': c_logits_cpu[idx],
+                                        'halt': h_logits_cpu[idx],
+                                        'lbl': lbl_cpu[idx]
                                     }
                                 return None
                             
                             diag_sample_pos = extract_sample(1)
                             diag_sample_neg = extract_sample(0)
 
-                        # --- LOSS CALCULATION ---
-                        labels = teacher_label.float().unsqueeze(1).expand(-1, L)
-                        
-                        if class_logits.size(-1) == 2:
-                            class_logits_positive = class_logits[:, :, 1]
-                            student_log_probs = F.log_softmax(class_logits, dim=-1)
-                        else:
-                            class_logits_positive = class_logits.squeeze(-1)
-                            student_log_probs = F.log_softmax(
-                                torch.stack([-class_logits_positive, class_logits_positive], dim=-1),
-                                dim=-1
-                            )
-                        
-                        loss_hard = bce_loss_fn(class_logits_positive, labels)
+                    # Backward pass
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    xm.optimizer_step(optimizer)
+                    scheduler.step()
+                    xm.mark_step()
 
-                        teacher_log_probs_expanded = teacher_log_probs.unsqueeze(1).expand(-1, L, -1)
-                        kl_elementwise = teacher_log_probs_expanded.exp() * (
-                            teacher_log_probs_expanded - student_log_probs
-                        )
-                        loss_soft = kl_elementwise.sum(dim=-1)
-
-                        alpha = 0.5
-                        ce_per_layer = (alpha * loss_hard) + ((1 - alpha) * loss_soft)
-
-                        loss_contrast = F.mse_loss(z[:, 1:, :], z[:, :-1, :])
-
-                        loss_cls = ce_per_layer.mean()
-                        loss_halt = torch.tensor(0.0, device=device)
-                        loss = (loss_cls * 2) + (0.1 * loss_contrast)
-
-                        optimizer.zero_grad()
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                        xm.optimizer_step(optimizer)
-                        scheduler.step()
-                        xm.mark_step()
-
-                    # --- STAGE 2: Standard Training (SAM Removed) ---
-                    elif stage == 2:
-                        # Forward pass
-                        halting_logits, class_logits, z = model(teacher_cls)
-                        
-                        predictions = torch.argmax(class_logits, dim=-1)
-                        is_correct = (predictions == teacher_label.unsqueeze(1)).float()
-                        
-                        # CLASS-AWARE REBALANCING (Kept as requested)
-                        n_pos = (teacher_label == 1).sum().float()
-                        n_neg = (teacher_label == 0).sum().float()
-                        neg_weight_val = (n_pos / (n_neg + 1e-6)).clamp(min=1.0)
-                        
-                        sample_weights = torch.ones_like(halting_logits)
-                        sample_weights[teacher_label == 0] = neg_weight_val.item()
-                        
-                        # Halting Loss
-                        loss_halt = F.binary_cross_entropy_with_logits(
-                            halting_logits, 
-                            is_correct, 
-                            weight=sample_weights
-                        )
-                        
-                        # Entropy regularization
-                        h = torch.sigmoid(halting_logits)
-                        h_safe = h.clamp(min=1e-6, max=1.0 - 1e-6)
-                        
-                        entropy_weight = 0.0025 
-                        h_entropy = -(h_safe * h_safe.log() + (1 - h_safe) * (1 - h_safe).log())
-                        loss_entropy = -entropy_weight * h_entropy.mean()
-                        
-                        loss = loss_halt + loss_entropy
-                        
-                        # Diagnostics (Rank 0 only)
-                        if rank == 0 and batch_idx == 0:
-                            def extract_sample(label_val):
-                                indices = (teacher_label == label_val).nonzero(as_tuple=True)[0]
-                                if indices.numel() > 0:
-                                    idx = indices[0]
-                                    return {
-                                        'cls': class_logits[idx].detach().cpu(),
-                                        'halt': halting_logits[idx].detach().cpu(),
-                                        'lbl': teacher_label[idx].detach().cpu()
-                                    }
-                                return None
-                            
-                            with torch.no_grad():
-                                diag_sample_pos = extract_sample(1)
-                                diag_sample_neg = extract_sample(0)
-
-                        # Backward pass
-                        optimizer.zero_grad()
-                        loss.backward()
-                        # CHANGED: Added explicit clipping since SAM's internal clipping is gone
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                        xm.optimizer_step(optimizer)
-                        scheduler.step()
-                        xm.mark_step()
-
+                # --- END OF CHUNK LOGGING ---
                 loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
-                
-                if stage == 1:
-                    loss_log = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
-                else:
-                    loss_log = loss_sum 
+                loss_log = loss_sum 
                 
                 xm.rendezvous(f"ep_end_st{stage}_ch{chunk_idx}_ep{epoch}")
                 
@@ -308,24 +178,15 @@ def train_loop(rank, flags):
                     current_lr = scheduler.get_last_lr()[0]
                     xm.master_print("-" * 60)
                     xm.master_print(f"STAGE {stage} | CHUNK {chunk_idx+1} | EPOCH {epoch+1}")
-                    xm.master_print(f"  LR:         {current_lr:.2e}")
                     xm.master_print(f"  Total Loss: {loss_sum / num_cores:.4f}")
-                    if stage == 1:
-                        xm.master_print(f"  Cls Loss:   {loss_log / num_cores:.4f}")
-                    else:
-                        xm.master_print(f"  Halt Loss:  {loss_log / num_cores:.4f}")
+                    xm.master_print(f"  Halt Loss:  {loss_log / num_cores:.4f}")
                     
                     def format_sample(data, name):
                         if data is None: 
                             return f"  {name}: No sample found."
                         out = [f"  > {name} (Label {data['lbl'].item()}):"]
-                        if stage == 1:
-                            probs = torch.softmax(data['cls'], dim=-1) 
-                            cls1_probs = probs[:, 1]
-                            out.append(f"    CLS Probs (Class 1): {[f'{p:.2f}' for p in cls1_probs.tolist()]}")
-                        else:
-                            h_probs = torch.sigmoid(data['halt'])
-                            out.append(f"    HALT Probs: {[f'{p:.2f}' for p in h_probs.tolist()]}")
+                        h_probs = torch.sigmoid(data['halt'])
+                        out.append(f"    HALT Probs: {[f'{p:.2f}' for p in h_probs.tolist()]}")
                         return "\n".join(out)
 
                     xm.master_print("  DIAGNOSTICS:")
@@ -335,13 +196,8 @@ def train_loop(rank, flags):
             xm.rendezvous(f"chunk_end_st{stage}_ch{chunk_idx}")
 
     xm.rendezvous("ready_to_save_final")
-    save_path = os.path.expanduser("~/SIGNLL/final_model_stage2_gated.pt")
-    
     if rank == 0:
-        xm.master_print(f"Saving final model: {save_path}")
-        torch.save(model.state_dict(), save_path)
-        xm.master_print("✅ Training Complete with Gated Entropy.")
-
+        xm.master_print("✅ TEST PASSED: Stage 2 completed without hang.")
     xm.rendezvous("save_complete_safe_exit")
 
 def _mp_fn(rank, flags):
@@ -360,9 +216,9 @@ if __name__ == "__main__":
         "transformer_layers": 4,
         "lr": 5e-4,
         "batch_size": 64,   
-        "epochs": 5,
-        "samples_per_shard": 39000
+        "epochs": 1,
+        "samples_per_shard": 1000 # Dummy count
     }  
     
-    print("Starting Two-Stage Training with Gated Entropy.")
+    print("Starting Dummy Stage 2 Test.")
     xmp.spawn(_mp_fn, args=(BASE_FLAGS,), start_method='fork')
