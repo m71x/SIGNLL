@@ -112,7 +112,7 @@ def train_loop(rank, flags):
             
             if rank == 0:
                 xm.master_print(f"Stage {stage} | Chunk {chunk_idx + 1}/28 | Loading {current_chunk_filename}")
-
+            time.sleep(rank * 1.5)
             # --- Load Data ---
             data = training_data_download(
                 core_id=rank,
