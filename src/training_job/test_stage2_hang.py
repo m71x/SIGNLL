@@ -211,7 +211,7 @@ def train_loop(rank, flags):
                         
                         # Diagnostics (Rank 0)
                         if rank == 0 and batch_idx == 0:
-                            xm.mark_step() # Ensure step is done before pulling data
+                            xm.mark_step() 
                             with torch.no_grad():
                                 d_halt, d_cls, _ = model(teacher_cls)
                                 def extract_sample(label_val):
@@ -235,21 +235,10 @@ def train_loop(rank, flags):
                         predictions = torch.argmax(class_logits, dim=-1)
                         is_correct = (predictions == teacher_label.unsqueeze(1)).float()
                         
-                        # CLASS-AWARE REBALANCING (STABILIZED)
-                        # 1. Calculate counts
-                        n_pos = (teacher_label == 1).sum().float()
-                        n_neg = (teacher_label == 0).sum().float()
-                        
-                        # 2. Ratio with MAX CLAMP
-                        # FIX: Added max=50.0 to prevent gradient explosion on sparse batches
-                        neg_weight_tensor = (n_pos / (n_neg + 1e-6)).clamp(min=1.0, max=50.0)
-                        
-                        # 3. Create weight tensor [B, 1] using Arithmetic (No torch.where)
-                        mask_neg_float = (teacher_label == 0).float().unsqueeze(1) 
-                        weights_b1 = 1.0 + (mask_neg_float * (neg_weight_tensor - 1.0))
-                        
-                        # 4. Explicitly expand to [B, L] to match logits shape exactly
-                        sample_weights = weights_b1.expand(-1, L)
+                        # CLASS-AWARE REBALANCING (REMOVED TO PREVENT CRASH)
+                        # We use static weights for now to ensure stability.
+                        # Dynamic weighting on TPU caused 'Accelerator Halted' due to gradient explosion.
+                        sample_weights = torch.ones_like(halting_logits)
                         
                         # Halting Loss
                         loss_halt = F.binary_cross_entropy_with_logits(
@@ -260,7 +249,8 @@ def train_loop(rank, flags):
                         
                         # Entropy regularization
                         h = torch.sigmoid(halting_logits)
-                        h_safe = h.clamp(min=1e-6, max=1.0 - 1e-6)
+                        # Increased epsilon to 1e-4 for extra safety
+                        h_safe = h.clamp(min=1e-4, max=1.0 - 1e-4)
                         
                         entropy_weight = 0.0025 
                         h_entropy = -(h_safe * h_safe.log() + (1 - h_safe) * (1 - h_safe).log())
@@ -278,7 +268,7 @@ def train_loop(rank, flags):
 
                         # Diagnostics (Rank 0)
                         if rank == 0 and batch_idx == 0:
-                            xm.mark_step() # Ensure step completion before diagnostics
+                            xm.mark_step() 
                             with torch.no_grad():
                                 d_halt, d_cls, _ = model(teacher_cls)
                                 def extract_sample(label_val):
