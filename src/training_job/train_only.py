@@ -125,8 +125,8 @@ def train_loop(rank, flags):
             dataset = TensorDataset(teacher_cls, teacher_lbl)
             sampler = DistributedSampler(
                 dataset,
-                num_replicas=num_cores,
-                rank=rank,
+                num_replicas=1, # Tell it this is the only process for THIS dataset
+                rank=0,         # This core is the "master" of its own unique data
                 shuffle=True,
                 drop_last=False
             )
