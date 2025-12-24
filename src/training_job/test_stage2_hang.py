@@ -47,9 +47,9 @@ def train_loop(rank, flags):
     diag_sample_neg = None
 
     # =========================================================================
-    # STAGE LOOP: SKIPPING DIRECTLY TO STAGE 2 FOR TESTING
+    # STAGE LOOP: 1 -> Backbone/Classifiers, 2 -> Halting Heads + Gates
     # =========================================================================
-    for stage in [2]: # <--- MODIFIED HERE
+    for stage in [2]: # Skipping to Stage 2 for testing as requested
         
         # --- PHASE SETUP ---
         if stage == 1:
@@ -223,9 +223,7 @@ def train_loop(rank, flags):
                         # --- SAFE DIAGNOSTICS (Post-Step) ---
                         if rank == 0 and batch_idx == 0:
                             with torch.no_grad():
-                                # Re-run forward pass for diagnostics to avoid graph locking
                                 d_halt, d_cls, _ = model(teacher_cls)
-                                
                                 def extract_sample(label_val):
                                     indices = (teacher_label == label_val).nonzero(as_tuple=True)[0]
                                     if indices.numel() > 0:
@@ -236,7 +234,6 @@ def train_loop(rank, flags):
                                             'lbl': teacher_label[idx].detach().cpu()
                                         }
                                     return None
-                                
                                 diag_sample_pos = extract_sample(1)
                                 diag_sample_neg = extract_sample(0)
 
@@ -253,8 +250,10 @@ def train_loop(rank, flags):
                         n_neg = (teacher_label == 0).sum().float()
                         neg_weight_tensor = (n_pos / (n_neg + 1e-6)).clamp(min=1.0)
                         
-                        # FIXED: Use torch.where instead of .item() to avoid CPU Sync/Hang
-                        mask_neg = (teacher_label == 0).unsqueeze(1).unsqueeze(2) # Broadcast to [B, L, 1]
+                        # FIXED: ONLY UNSQUEEZE ONCE to get [B, 1] (Rank 2)
+                        # This matches halting_logits [B, L] (Rank 2)
+                        mask_neg = (teacher_label == 0).unsqueeze(1) 
+                        
                         sample_weights = torch.ones_like(halting_logits)
                         sample_weights = torch.where(mask_neg, neg_weight_tensor, sample_weights)
                         
@@ -286,9 +285,7 @@ def train_loop(rank, flags):
                         # --- SAFE DIAGNOSTICS (Post-Step) ---
                         if rank == 0 and batch_idx == 0:
                             with torch.no_grad():
-                                # Re-run forward pass for diagnostics to avoid graph locking
                                 d_halt, d_cls, _ = model(teacher_cls)
-                                
                                 def extract_sample(label_val):
                                     indices = (teacher_label == label_val).nonzero(as_tuple=True)[0]
                                     if indices.numel() > 0:
@@ -299,7 +296,6 @@ def train_loop(rank, flags):
                                             'lbl': teacher_label[idx].detach().cpu()
                                         }
                                     return None
-                                
                                 diag_sample_pos = extract_sample(1)
                                 diag_sample_neg = extract_sample(0)
 
