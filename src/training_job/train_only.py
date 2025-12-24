@@ -41,6 +41,9 @@ def train_loop(rank, flags):
     xm.mark_step()
     xm.rendezvous("weights_synced")
 
+    diag_sample_pos = None
+    diag_sample_neg = None
+
     # =========================================================================
     # STAGE LOOP
     # =========================================================================
@@ -93,7 +96,9 @@ def train_loop(rank, flags):
             filename = f"embeddings_chunk_{chunk_idx}.npz"
 
             if rank == 0:
-                xm.master_print(f"Stage {stage} | Chunk {chunk_idx+1}/28 | Loading {filename}")
+                xm.master_print(
+                    f"Stage {stage} | Chunk {chunk_idx+1}/28 | Loading {filename}"
+                )
 
             data = training_data_download(
                 core_id=rank,
@@ -141,32 +146,125 @@ def train_loop(rank, flags):
                 sampler.set_epoch(epoch)
                 model.train()
 
-                for x, y in loader:
+                diag_sample_pos = None
+                diag_sample_neg = None
+
+                for batch_idx, (x, y) in enumerate(loader):
                     x = x.to(device)
                     y = y.to(device)
 
-                    halting_logits, class_logits, _ = model(x)
+                    # Capture z for contrastive loss
+                    halting_logits, class_logits, z = model(x)
 
                     # -----------------------------
                     # Stage-specific losses
                     # -----------------------------
                     if stage == 1:
-                        # classification only
-                        cls_logits = class_logits[:, :, 1]
-                        labels = y.float().unsqueeze(1).expand_as(cls_logits)
-                        loss = F.binary_cross_entropy_with_logits(cls_logits, labels)
+                        # 1. Calculate Weights (Dynamic per batch)
+                        n_pos = (y == 1).sum().float()
+                        n_neg = (y == 0).sum().float()
+                        pos_weight_val = n_neg / (n_pos + 1e-6)
+                        pos_weight_tensor = torch.tensor([pos_weight_val], device=device)
+
+                        # 2. Hard Loss (BCEWithLogits + pos_weight)
+                        # Expand labels to match [B, L]
+                        labels_expanded = y.float().unsqueeze(1).expand(-1, class_logits.shape[1])
+                        
+                        class_logits_positive = class_logits[:, :, 1]
+                        student_log_probs = F.log_softmax(class_logits, dim=-1)
+                        
+                        loss_hard = F.binary_cross_entropy_with_logits(
+                            class_logits_positive, 
+                            labels_expanded, 
+                            pos_weight=pos_weight_tensor, 
+                            reduction='none'
+                        )
+
+                        # 3. Soft Loss (Synthetic teacher generation since file doesn't have logits)
+                        # We use label smoothing to approximate teacher behavior
+                        num_classes = 2
+                        smoothing = 0.1
+                        t_one_hot = torch.zeros(y.size(0), num_classes, device=device).scatter_(1, y.unsqueeze(1), 1)
+                        teacher_probs = t_one_hot * (1.0 - smoothing) + (smoothing / num_classes)
+                        teacher_log_probs = torch.log(teacher_probs.clamp(min=1e-10))
+                        
+                        teacher_log_probs_expanded = teacher_log_probs.unsqueeze(1).expand(-1, class_logits.shape[1], -1)
+                        
+                        # KL Divergence
+                        kl_elementwise = teacher_log_probs_expanded.exp() * (
+                            teacher_log_probs_expanded - student_log_probs
+                        )
+                        loss_soft = kl_elementwise.sum(dim=-1)
+
+                        # 4. Contrastive Loss (MSE on z)
+                        loss_contrast = F.mse_loss(z[:, 1:, :], z[:, :-1, :])
+
+                        # 5. Combine
+                        alpha = 0.5
+                        ce_per_layer = (alpha * loss_hard) + ((1 - alpha) * loss_soft)
+                        loss_cls = ce_per_layer.mean()
+                        
+                        loss = (loss_cls * 2) + (0.1 * loss_contrast)
+
+                        # ---- diagnostics (stage 1 only) ----
+                        if rank == 0 and batch_idx == 0:
+                            with torch.no_grad():
+                                def extract_sample(label_val):
+                                    indices = (y == label_val).nonzero(as_tuple=True)[0]
+                                    if indices.numel() > 0:
+                                        idx = indices[0]
+                                        return {
+                                            "cls": class_logits[idx].detach().cpu(),
+                                            "lbl": y[idx].detach().cpu()
+                                        }
+                                    return None
+
+                                diag_sample_pos = extract_sample(1)
+                                diag_sample_neg = extract_sample(0)
+
                     else:
                         preds = torch.argmax(class_logits, dim=-1)
                         is_correct = (preds == y.unsqueeze(1)).float()
 
+                        # 1. Class-Aware Rebalancing Weights
+                        n_pos = (y == 1).sum().float()
+                        n_neg = (y == 0).sum().float()
+                        neg_weight_val = (n_pos / (n_neg + 1e-6)).clamp(min=1.0)
+
+                        sample_weights = torch.ones_like(halting_logits)
+                        sample_weights[y == 0] = neg_weight_val.item()
+
+                        # 2. Halting Loss
                         loss_halt = F.binary_cross_entropy_with_logits(
-                            halting_logits, is_correct
+                            halting_logits, 
+                            is_correct, 
+                            weight=sample_weights
                         )
 
-                        h = torch.sigmoid(halting_logits).clamp(1e-6, 1 - 1e-6)
-                        entropy = -(h * h.log() + (1 - h) * (1 - h).log())
+                        # 3. Entropy Regularization
+                        h = torch.sigmoid(halting_logits)
+                        h_safe = h.clamp(min=1e-6, max=1.0 - 1e-6)
+                        entropy_weight = 0.0025
+                        h_entropy = -(h_safe * h_safe.log() + (1 - h_safe) * (1 - h_safe).log())
+                        loss_entropy = -entropy_weight * h_entropy.mean()
 
-                        loss = loss_halt - 0.0025 * entropy.mean()
+                        loss = loss_halt + loss_entropy
+
+                        # ---- diagnostics (stage 2) ----
+                        if rank == 0 and batch_idx == 0:
+                            with torch.no_grad():
+                                def extract_sample(label_val):
+                                    indices = (y == label_val).nonzero(as_tuple=True)[0]
+                                    if indices.numel() > 0:
+                                        idx = indices[0]
+                                        return {
+                                            "halt": halting_logits[idx].detach().cpu(),
+                                            "lbl": y[idx].detach().cpu()
+                                        }
+                                    return None
+
+                                diag_sample_pos = extract_sample(1)
+                                diag_sample_neg = extract_sample(0)
 
                     optimizer.zero_grad()
                     loss.backward()
@@ -183,13 +281,39 @@ def train_loop(rank, flags):
                 xm.rendezvous(f"ep_end_st{stage}_ch{chunk_idx}_ep{epoch}")
 
                 if rank == 0:
-                    lr = scheduler.get_last_lr()[0]
+                    current_lr = scheduler.get_last_lr()[0]
                     xm.master_print("-" * 60)
                     xm.master_print(
                         f"STAGE {stage} | CHUNK {chunk_idx+1} | EPOCH {epoch+1}"
                     )
-                    xm.master_print(f"  LR:   {lr:.2e}")
-                    xm.master_print(f"  Loss: {loss_sum / num_cores:.4f}")
+                    xm.master_print(f"  LR:         {current_lr:.2e}")
+                    xm.master_print(f"  Total Loss: {loss_sum / num_cores:.4f}")
+
+                    if stage == 1:
+                        xm.master_print(f"  Cls Loss:   {loss_sum / num_cores:.4f}")
+                    else:
+                        xm.master_print(f"  Halt Loss:  {loss_sum / num_cores:.4f}")
+
+                    def format_sample(data, name):
+                        if data is None:
+                            return f"  {name}: No sample found."
+                        out = [f"  > {name} (Label {data['lbl'].item()}):"]
+                        if stage == 1:
+                            probs = torch.softmax(data["cls"], dim=-1)
+                            cls1_probs = probs[:, 1]
+                            out.append(
+                                f"    CLS Probs (Class 1): {[f'{p:.2f}' for p in cls1_probs.tolist()]}"
+                            )
+                        else:
+                            h_probs = torch.sigmoid(data["halt"])
+                            out.append(
+                                f"    HALT Probs: {[f'{p:.2f}' for p in h_probs.tolist()]}"
+                            )
+                        return "\n".join(out)
+
+                    xm.master_print("  DIAGNOSTICS:")
+                    xm.master_print(format_sample(diag_sample_pos, "Sample POS"))
+                    xm.master_print(format_sample(diag_sample_neg, "Sample NEG"))
 
             xm.rendezvous(f"chunk_end_st{stage}_ch{chunk_idx}")
 
