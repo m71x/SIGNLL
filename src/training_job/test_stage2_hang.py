@@ -43,22 +43,21 @@ def train_loop(rank, flags):
     num_batches_per_chunk = total_samples // flags["batch_size"]
     global_step = 0
 
+    diag_sample_pos = None
+    diag_sample_neg = None
+
     # =========================================================================
-    # STAGE LOOP: 1 -> Backbone/Classifiers, 2 -> Halting Heads + Gates
+    # STAGE LOOP: SKIPPING DIRECTLY TO STAGE 2 FOR TESTING
     # =========================================================================
-    for stage in [2]: # Skipping to Stage 2 for testing as requested
+    for stage in [2]: 
         
         # --- PHASE SETUP ---
         if stage == 1:
             stage_name = "STAGE 1: Backbone & Classifiers (Halting & Gates FROZEN)"
             for param in model.parameters(): 
                 param.requires_grad = True
-            
-            # Freeze halting heads
             for param in model.halting_heads.parameters(): 
                 param.requires_grad = False
-            
-            # Freeze optimized entropy gate module
             for param in model.entropy_gate_module.parameters(): 
                 param.requires_grad = False
             
@@ -66,12 +65,8 @@ def train_loop(rank, flags):
             stage_name = "STAGE 2: Halting Heads + Entropy Gates (Backbone FROZEN)"
             for param in model.parameters(): 
                 param.requires_grad = False
-            
-            # Unfreeze halting heads
             for param in model.halting_heads.parameters(): 
                 param.requires_grad = True
-                
-            # Unfreeze optimized entropy gate module
             for param in model.entropy_gate_module.parameters(): 
                 param.requires_grad = True
 
@@ -165,14 +160,8 @@ def train_loop(rank, flags):
             # --- Epoch Loop ---
             for epoch in range(flags["epochs"]):
                 model.train()
-                
-                # FIX 1: Use running averages instead of accumulating tensors
-                running_loss = 0.0
-                num_batches = 0
-                
-                # FIX 2: Store only scalar values for diagnostics
-                diag_halt_pos = None
-                diag_halt_neg = None
+                diag_sample_pos = None
+                diag_sample_neg = None
 
                 for batch_idx, (teacher_cls, teacher_label, teacher_log_probs) in enumerate(data_loader):
                     if stage == 2: 
@@ -186,7 +175,6 @@ def train_loop(rank, flags):
                     if stage == 1:
                         halting_logits, class_logits, z = model(teacher_cls) 
                         
-                        # --- LOSS CALCULATION ---
                         labels = teacher_label.float().unsqueeze(1).expand(-1, L)
                         
                         if class_logits.size(-1) == 2:
@@ -209,11 +197,9 @@ def train_loop(rank, flags):
 
                         alpha = 0.5
                         ce_per_layer = (alpha * loss_hard) + ((1 - alpha) * loss_soft)
-
                         loss_contrast = F.mse_loss(z[:, 1:, :], z[:, :-1, :])
 
                         loss_cls = ce_per_layer.mean()
-                        loss_halt = torch.tensor(0.0, device=device)
                         loss = (loss_cls * 2) + (0.1 * loss_contrast)
 
                         optimizer.zero_grad()
@@ -221,13 +207,25 @@ def train_loop(rank, flags):
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         xm.optimizer_step(optimizer)
                         scheduler.step()
-                        
-                        # FIX 3: CRITICAL - mark_step after EVERY batch to prevent graph accumulation
                         xm.mark_step()
                         
-                        # FIX 4: Update running average with detached scalar
-                        running_loss += loss.detach().item()
-                        num_batches += 1
+                        # Diagnostics (Rank 0)
+                        if rank == 0 and batch_idx == 0:
+                            xm.mark_step() # Ensure step is done before pulling data
+                            with torch.no_grad():
+                                d_halt, d_cls, _ = model(teacher_cls)
+                                def extract_sample(label_val):
+                                    indices = (teacher_label == label_val).nonzero(as_tuple=True)[0]
+                                    if indices.numel() > 0:
+                                        idx = indices[0]
+                                        return {
+                                            'cls': d_cls[idx].detach().cpu(),
+                                            'halt': d_halt[idx].detach().cpu(),
+                                            'lbl': teacher_label[idx].detach().cpu()
+                                        }
+                                    return None
+                                diag_sample_pos = extract_sample(1)
+                                diag_sample_neg = extract_sample(0)
 
                     # --- STAGE 2: Standard Training ---
                     elif stage == 2:
@@ -237,15 +235,21 @@ def train_loop(rank, flags):
                         predictions = torch.argmax(class_logits, dim=-1)
                         is_correct = (predictions == teacher_label.unsqueeze(1)).float()
                         
-                        # CLASS-AWARE REBALANCING (OPTIMIZED)
+                        # CLASS-AWARE REBALANCING (STABILIZED)
+                        # 1. Calculate counts
                         n_pos = (teacher_label == 1).sum().float()
                         n_neg = (teacher_label == 0).sum().float()
-                        neg_weight_tensor = (n_pos / (n_neg + 1e-6)).clamp(min=1.0)
                         
-                        mask_neg = (teacher_label == 0).unsqueeze(1) 
+                        # 2. Ratio with MAX CLAMP
+                        # FIX: Added max=50.0 to prevent gradient explosion on sparse batches
+                        neg_weight_tensor = (n_pos / (n_neg + 1e-6)).clamp(min=1.0, max=50.0)
                         
-                        sample_weights = torch.ones_like(halting_logits)
-                        sample_weights = torch.where(mask_neg, neg_weight_tensor, sample_weights)
+                        # 3. Create weight tensor [B, 1] using Arithmetic (No torch.where)
+                        mask_neg_float = (teacher_label == 0).float().unsqueeze(1) 
+                        weights_b1 = 1.0 + (mask_neg_float * (neg_weight_tensor - 1.0))
+                        
+                        # 4. Explicitly expand to [B, L] to match logits shape exactly
+                        sample_weights = weights_b1.expand(-1, L)
                         
                         # Halting Loss
                         loss_halt = F.binary_cross_entropy_with_logits(
@@ -254,22 +258,15 @@ def train_loop(rank, flags):
                             weight=sample_weights
                         )
                         
-                        # Stable entropy calculation
+                        # Entropy regularization
                         h = torch.sigmoid(halting_logits)
-                        h_safe = h.clamp(min=1e-7, max=1.0 - 1e-7)
+                        h_safe = h.clamp(min=1e-6, max=1.0 - 1e-6)
                         
                         entropy_weight = 0.0025 
                         h_entropy = -(h_safe * h_safe.log() + (1 - h_safe) * (1 - h_safe).log())
-                        h_entropy = torch.nan_to_num(h_entropy, nan=0.0, posinf=0.0, neginf=0.0)
                         loss_entropy = -entropy_weight * h_entropy.mean()
                         
                         loss = loss_halt + loss_entropy
-                        
-                        # Safety check before backward
-                        if not torch.isfinite(loss):
-                            if rank == 0:
-                                xm.master_print(f"WARNING: Non-finite loss at batch {batch_idx}, skipping")
-                            continue
                         
                         # Backward pass
                         optimizer.zero_grad()
@@ -277,36 +274,33 @@ def train_loop(rank, flags):
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         xm.optimizer_step(optimizer)
                         scheduler.step()
-                        
-                        # FIX 5: CRITICAL - mark_step after EVERY batch
                         xm.mark_step()
-                        
-                        # FIX 6: Update running average with detached scalar
-                        running_loss += loss.detach().item()
-                        num_batches += 1
-                        
-                        # FIX 7: Extract diagnostics ONLY on first batch, convert to scalars immediately
-                        if rank == 0 and batch_idx == 0:
-                            with torch.no_grad():
-                                h_probs = torch.sigmoid(halting_logits)
-                                pos_mask = teacher_label == 1
-                                neg_mask = teacher_label == 0
-                                
-                                if pos_mask.any():
-                                    # Store as Python list of floats (not tensors)
-                                    diag_halt_pos = h_probs[pos_mask][0].cpu().tolist()
-                                if neg_mask.any():
-                                    diag_halt_neg = h_probs[neg_mask][0].cpu().tolist()
 
-                # FIX 8: Compute average loss (already scalar, no graph)
-                avg_loss = running_loss / max(num_batches, 1)
+                        # Diagnostics (Rank 0)
+                        if rank == 0 and batch_idx == 0:
+                            xm.mark_step() # Ensure step completion before diagnostics
+                            with torch.no_grad():
+                                d_halt, d_cls, _ = model(teacher_cls)
+                                def extract_sample(label_val):
+                                    indices = (teacher_label == label_val).nonzero(as_tuple=True)[0]
+                                    if indices.numel() > 0:
+                                        idx = indices[0]
+                                        return {
+                                            'cls': d_cls[idx].detach().cpu(),
+                                            'halt': d_halt[idx].detach().cpu(),
+                                            'lbl': teacher_label[idx].detach().cpu()
+                                        }
+                                    return None
+                                diag_sample_pos = extract_sample(1)
+                                diag_sample_neg = extract_sample(0)
+
+                loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
                 
-                # FIX 9: Create scalar tensor for reduction (no graph accumulation)
-                loss_tensor = torch.tensor(avg_loss, device=device)
-                loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss_tensor)
+                if stage == 1:
+                    loss_log = xm.all_reduce(xm.REDUCE_SUM, loss_cls)
+                else:
+                    loss_log = loss_sum 
                 
-                # FIX 10: mark_step BEFORE rendezvous
-                xm.mark_step()
                 xm.rendezvous(f"ep_end_st{stage}_ch{chunk_idx}_ep{epoch}")
                 
                 if rank == 0:
@@ -314,16 +308,29 @@ def train_loop(rank, flags):
                     xm.master_print("-" * 60)
                     xm.master_print(f"STAGE {stage} | CHUNK {chunk_idx+1} | EPOCH {epoch+1}")
                     xm.master_print(f"  LR:         {current_lr:.2e}")
-                    xm.master_print(f"  Avg Loss:   {loss_sum.item() / num_cores:.4f}")
+                    xm.master_print(f"  Total Loss: {loss_sum / num_cores:.4f}")
+                    if stage == 1:
+                        xm.master_print(f"  Cls Loss:   {loss_log / num_cores:.4f}")
+                    else:
+                        xm.master_print(f"  Halt Loss:  {loss_log / num_cores:.4f}")
                     
-                    # Print diagnostics if available (already Python lists)
-                    if stage == 2:
-                        if diag_halt_pos:
-                            xm.master_print(f"  Sample POS Halt: {[f'{p:.2f}' for p in diag_halt_pos]}")
-                        if diag_halt_neg:
-                            xm.master_print(f"  Sample NEG Halt: {[f'{p:.2f}' for p in diag_halt_neg]}")
+                    def format_sample(data, name):
+                        if data is None: 
+                            return f"  {name}: No sample found."
+                        out = [f"  > {name} (Label {data['lbl'].item()}):"]
+                        if stage == 1:
+                            probs = torch.softmax(data['cls'], dim=-1) 
+                            cls1_probs = probs[:, 1]
+                            out.append(f"    CLS Probs (Class 1): {[f'{p:.2f}' for p in cls1_probs.tolist()]}")
+                        else:
+                            h_probs = torch.sigmoid(data['halt'])
+                            out.append(f"    HALT Probs: {[f'{p:.2f}' for p in h_probs.tolist()]}")
+                        return "\n".join(out)
 
-            xm.mark_step()
+                    xm.master_print("  DIAGNOSTICS:")
+                    xm.master_print(format_sample(diag_sample_pos, "Sample POS"))
+                    xm.master_print(format_sample(diag_sample_neg, "Sample NEG"))
+
             xm.rendezvous(f"chunk_end_st{stage}_ch{chunk_idx}")
 
     xm.rendezvous("ready_to_save_final")
