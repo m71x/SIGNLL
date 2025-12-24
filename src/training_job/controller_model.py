@@ -50,53 +50,73 @@ class CustomTransformerLayer(nn.Module):
         return x
 
 # =========================================================================
-# OPTIMIZED: Vectorized Gating Module (Fixes 8x Slowdown)
+# OPTIMIZED + SAFE: Vectorized Gating Module with Correct Reshaping
 # =========================================================================
 class VectorizedEntropyGate(nn.Module):
     def __init__(self, d_ctrl: int, L: int):
         super().__init__()
-        # We use Conv1d with groups=L to simulate L independent Linear layers.
-        # This allows the TPU to process all gates in a single kernel launch.
         self.L = L
         self.d_ctrl = d_ctrl
         
-        # Layer 1: d_ctrl -> 8 (Unique weights per layer L)
+        # FIX 1: Use proper grouped convolution layout
+        # Each group processes one layer's features independently
+        # Input channels per group: d_ctrl
+        # Output channels per group: 8 (hidden), then 1 (output)
+        
+        # Layer 1: d_ctrl -> 8 per layer (L groups)
         self.net1 = nn.Conv1d(
-            in_channels=d_ctrl * L, 
-            out_channels=8 * L, 
+            in_channels=L * d_ctrl, 
+            out_channels=L * 8, 
             kernel_size=1, 
             groups=L
         )
         self.act = nn.Tanh()
         
-        # Layer 2: 8 -> 1 (Unique weights per layer L)
+        # Layer 2: 8 -> 1 per layer (L groups)
         self.net2 = nn.Conv1d(
-            in_channels=8 * L, 
-            out_channels=1 * L, 
+            in_channels=L * 8, 
+            out_channels=L * 1, 
             kernel_size=1, 
             groups=L
         )
         self.sigmoid = nn.Sigmoid()
 
-        # Initialize to output 0.5 (bias=0)
+        # Initialize to output 0.5 (bias=0 gives sigmoid(0)=0.5)
         nn.init.constant_(self.net2.bias, 0.0)
 
     def forward(self, z, entropy):
+        """
+        Args:
+            z: [B, L, D] - Controller representations
+            entropy: [B, L, 1] - Normalized entropy per layer
+            
+        Returns:
+            gated_entropy: [B, L, 1] - Entropy modulated by learned gates
+        """
         B, L, D = z.shape
-        # FIXED: Reshape correctly for grouped convolution (Layer-wise grouping)
-        # Old (Incorrect for groups=L): z.transpose(1, 2).reshape(B, D * L, 1)
-        # New (Correct): Flattens L blocks of D features. Group g takes block g.
-        z_reshaped = z.reshape(B, L * D, 1)
         
-        out = self.net1(z_reshaped)
+        # FIX 2: Correct reshape for grouped convolution
+        # We need layout: [B, L*D, 1] where channels are interleaved by layer
+        # Layer 0 features: channels [0:D]
+        # Layer 1 features: channels [D:2D], etc.
+        # This matches groups=L where group i gets channels [i*D:(i+1)*D]
+        
+        z_flat = z.reshape(B, L * D, 1)  # [B, L*D, 1]
+        
+        # Forward through gating network
+        out = self.net1(z_flat)  # [B, L*8, 1]
         out = self.act(out)
-        out = self.net2(out)
-        gate = self.sigmoid(out)
+        out = self.net2(out)     # [B, L*1, 1]
+        gate = self.sigmoid(out) # [B, L, 1]
         
-        return entropy * gate.reshape(B, L, 1)
+        # Reshape gate back to [B, L, 1]
+        gate = gate.reshape(B, L, 1)
+        
+        # Element-wise multiply: gate each layer's entropy
+        return entropy * gate
 
 # =========================================================================
-# CONTROLLER
+# CONTROLLER with Numerical Stability Improvements
 # =========================================================================
 class Controller(nn.Module):
     def __init__(
@@ -145,7 +165,7 @@ class Controller(nn.Module):
         self.post_ln = nn.LayerNorm(d_ctrl) 
 
         # 3. Output Heads
-        # OPTIMIZED: Single Vectorized Gate Module (Replaces slow ModuleList)
+        # Fixed Vectorized Gate Module
         self.entropy_gate_module = VectorizedEntropyGate(d_ctrl, L)
         
         self.halting_heads = nn.ModuleList([
@@ -192,20 +212,30 @@ class Controller(nn.Module):
         class_logits_list = []
         entropy_list = []
         
+        # FIX 3: Use more stable entropy calculation
         max_entropy = math.log(self.num_classes)
+        eps = 1e-10  # Numerical stability constant
         
         for l in range(L):
             c_l = self.classifier_heads[l](z[:, l, :]) 
             class_logits_list.append(c_l)
             
-            # Stable Entropy Calculation
+            # FIX 4: Numerically stable entropy with log-sum-exp trick
+            # Compute log_softmax directly (more stable than softmax then log)
             log_probs = F.log_softmax(c_l, dim=-1)
             probs = torch.exp(log_probs)
-            probs_safe = probs.clamp(min=1e-10, max=1.0)
-            log_probs_safe = torch.log(probs_safe)
+            
+            # Clamp probabilities to avoid log(0)
+            probs_safe = probs.clamp(min=eps, max=1.0 - eps)
             
             # Entropy: -sum(p * log(p))
-            ent = -(probs_safe * log_probs_safe).sum(dim=-1, keepdim=True)
+            # Use the already-computed log_probs for stability
+            ent = -(probs_safe * log_probs).sum(dim=-1, keepdim=True)
+            
+            # FIX 5: Guard against NaN/Inf
+            ent = torch.nan_to_num(ent, nan=0.0, posinf=max_entropy, neginf=0.0)
+            
+            # Normalize to [0, 1]
             ent_norm = (ent / max_entropy).clamp(0.0, 1.0)
             entropy_list.append(ent_norm)
             

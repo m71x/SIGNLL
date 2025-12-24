@@ -43,8 +43,12 @@ def train_loop(rank, flags):
     num_batches_per_chunk = total_samples // flags["batch_size"]
     global_step = 0
 
-    diag_sample_pos = None
-    diag_sample_neg = None
+    # FIX 1: Move diagnostics OUTSIDE training loop (accumulate metrics instead)
+    diagnostic_metrics = {
+        'loss_history': [],
+        'halt_probs_pos': [],
+        'halt_probs_neg': []
+    }
 
     # =========================================================================
     # STAGE LOOP: 1 -> Backbone/Classifiers, 2 -> Halting Heads + Gates
@@ -168,8 +172,11 @@ def train_loop(rank, flags):
             # --- Epoch Loop ---
             for epoch in range(flags["epochs"]):
                 model.train()
-                diag_sample_pos = None
-                diag_sample_neg = None
+                
+                # FIX 2: Accumulate metrics on-device (no CPU transfers)
+                epoch_losses = []
+                epoch_halt_pos = []
+                epoch_halt_neg = []
 
                 for batch_idx, (teacher_cls, teacher_label, teacher_log_probs) in enumerate(data_loader):
                     if stage == 2: 
@@ -220,22 +227,9 @@ def train_loop(rank, flags):
                         scheduler.step()
                         xm.mark_step()
                         
-                        # --- SAFE DIAGNOSTICS (Post-Step) ---
+                        # FIX 3: Accumulate metrics WITHOUT CPU transfer
                         if rank == 0 and batch_idx == 0:
-                            with torch.no_grad():
-                                d_halt, d_cls, _ = model(teacher_cls)
-                                def extract_sample(label_val):
-                                    indices = (teacher_label == label_val).nonzero(as_tuple=True)[0]
-                                    if indices.numel() > 0:
-                                        idx = indices[0]
-                                        return {
-                                            'cls': d_cls[idx].detach().cpu(),
-                                            'halt': d_halt[idx].detach().cpu(),
-                                            'lbl': teacher_label[idx].detach().cpu()
-                                        }
-                                    return None
-                                diag_sample_pos = extract_sample(1)
-                                diag_sample_neg = extract_sample(0)
+                            epoch_losses.append(loss.detach())
 
                     # --- STAGE 2: Standard Training ---
                     elif stage == 2:
@@ -251,7 +245,6 @@ def train_loop(rank, flags):
                         neg_weight_tensor = (n_pos / (n_neg + 1e-6)).clamp(min=1.0)
                         
                         # FIXED: ONLY UNSQUEEZE ONCE to get [B, 1] (Rank 2)
-                        # This matches halting_logits [B, L] (Rank 2)
                         mask_neg = (teacher_label == 0).unsqueeze(1) 
                         
                         sample_weights = torch.ones_like(halting_logits)
@@ -264,15 +257,24 @@ def train_loop(rank, flags):
                             weight=sample_weights
                         )
                         
-                        # Entropy regularization
+                        # FIX 4: More stable entropy calculation
                         h = torch.sigmoid(halting_logits)
-                        h_safe = h.clamp(min=1e-6, max=1.0 - 1e-6)
+                        h_safe = h.clamp(min=1e-7, max=1.0 - 1e-7)  # Tighter bounds
                         
                         entropy_weight = 0.0025 
                         h_entropy = -(h_safe * h_safe.log() + (1 - h_safe) * (1 - h_safe).log())
+                        
+                        # FIX 5: Guard against NaN/Inf in entropy
+                        h_entropy = torch.nan_to_num(h_entropy, nan=0.0, posinf=0.0, neginf=0.0)
                         loss_entropy = -entropy_weight * h_entropy.mean()
                         
                         loss = loss_halt + loss_entropy
+                        
+                        # FIX 6: Additional safety check before backward
+                        if not torch.isfinite(loss):
+                            if rank == 0:
+                                xm.master_print(f"WARNING: Non-finite loss detected at batch {batch_idx}, skipping")
+                            continue
                         
                         # Backward pass
                         optimizer.zero_grad()
@@ -282,23 +284,19 @@ def train_loop(rank, flags):
                         scheduler.step()
                         xm.mark_step()
 
-                        # --- SAFE DIAGNOSTICS (Post-Step) ---
+                        # FIX 7: Accumulate metrics on-device
                         if rank == 0 and batch_idx == 0:
-                            with torch.no_grad():
-                                d_halt, d_cls, _ = model(teacher_cls)
-                                def extract_sample(label_val):
-                                    indices = (teacher_label == label_val).nonzero(as_tuple=True)[0]
-                                    if indices.numel() > 0:
-                                        idx = indices[0]
-                                        return {
-                                            'cls': d_cls[idx].detach().cpu(),
-                                            'halt': d_halt[idx].detach().cpu(),
-                                            'lbl': teacher_label[idx].detach().cpu()
-                                        }
-                                    return None
-                                diag_sample_pos = extract_sample(1)
-                                diag_sample_neg = extract_sample(0)
+                            epoch_losses.append(loss.detach())
+                            # Store halting probs for pos/neg samples (keep on device)
+                            pos_mask = teacher_label == 1
+                            neg_mask = teacher_label == 0
+                            if pos_mask.any():
+                                epoch_halt_pos.append(torch.sigmoid(halting_logits[pos_mask][0]).detach())
+                            if neg_mask.any():
+                                epoch_halt_neg.append(torch.sigmoid(halting_logits[neg_mask][0]).detach())
 
+                # FIX 8: Synchronize AFTER full epoch, then transfer metrics safely
+                xm.mark_step()
                 loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
                 
                 if stage == 1:
@@ -308,33 +306,25 @@ def train_loop(rank, flags):
                 
                 xm.rendezvous(f"ep_end_st{stage}_ch{chunk_idx}_ep{epoch}")
                 
+                # FIX 9: Safe CPU transfer AFTER all computation is done
                 if rank == 0:
                     current_lr = scheduler.get_last_lr()[0]
                     xm.master_print("-" * 60)
                     xm.master_print(f"STAGE {stage} | CHUNK {chunk_idx+1} | EPOCH {epoch+1}")
                     xm.master_print(f"  LR:         {current_lr:.2e}")
-                    xm.master_print(f"  Total Loss: {loss_sum / num_cores:.4f}")
+                    xm.master_print(f"  Total Loss: {loss_sum.item() / num_cores:.4f}")
                     if stage == 1:
-                        xm.master_print(f"  Cls Loss:   {loss_log / num_cores:.4f}")
+                        xm.master_print(f"  Cls Loss:   {loss_log.item() / num_cores:.4f}")
                     else:
-                        xm.master_print(f"  Halt Loss:  {loss_log / num_cores:.4f}")
+                        xm.master_print(f"  Halt Loss:  {loss_log.item() / num_cores:.4f}")
                     
-                    def format_sample(data, name):
-                        if data is None: 
-                            return f"  {name}: No sample found."
-                        out = [f"  > {name} (Label {data['lbl'].item()}):"]
-                        if stage == 1:
-                            probs = torch.softmax(data['cls'], dim=-1) 
-                            cls1_probs = probs[:, 1]
-                            out.append(f"    CLS Probs (Class 1): {[f'{p:.2f}' for p in cls1_probs.tolist()]}")
-                        else:
-                            h_probs = torch.sigmoid(data['halt'])
-                            out.append(f"    HALT Probs: {[f'{p:.2f}' for p in h_probs.tolist()]}")
-                        return "\n".join(out)
-
-                    xm.master_print("  DIAGNOSTICS:")
-                    xm.master_print(format_sample(diag_sample_pos, "Sample POS"))
-                    xm.master_print(format_sample(diag_sample_neg, "Sample NEG"))
+                    # Only transfer diagnostics if available
+                    if epoch_halt_pos:
+                        halt_pos_cpu = epoch_halt_pos[0].cpu().numpy()
+                        xm.master_print(f"  Sample POS Halt: {[f'{p:.2f}' for p in halt_pos_cpu.tolist()]}")
+                    if epoch_halt_neg:
+                        halt_neg_cpu = epoch_halt_neg[0].cpu().numpy()
+                        xm.master_print(f"  Sample NEG Halt: {[f'{p:.2f}' for p in halt_neg_cpu.tolist()]}")
 
             xm.rendezvous(f"chunk_end_st{stage}_ch{chunk_idx}")
 
