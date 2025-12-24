@@ -91,7 +91,6 @@ def train_loop(rank, flags):
                 model.train()
                 diag_sample_pos, diag_sample_neg = None, None
 
-                # FIXED: Unpacking 3 variables (teacher_cls, teacher_label, teacher_log_probs)
                 for batch_idx, (teacher_cls, teacher_label, teacher_log_probs) in enumerate(data_loader):
                     global_step += 1
                     teacher_cls = teacher_cls.to(device)
@@ -103,7 +102,9 @@ def train_loop(rank, flags):
                     # 2. CREATE DUMMY CLASS PROBABILITIES
                     # Since Stage 1 is skipped, we simulate high confidence to provide stable entropy to the heads.
                     with torch.no_grad():
-                        B, L_dim, _ = halting_logits.shape
+                        # FIXED: halting_logits is [B, L], so we only unpack 2 values
+                        B, L_dim = halting_logits.shape 
+                        
                         dummy_logits = torch.zeros(B, L_dim, 2, device=device)
                         # High confidence for correct label (Logit 5.0 vs 0.0)
                         dummy_logits.scatter_(2, teacher_label.view(-1, 1, 1).expand(-1, L_dim, 1), 5.0)
