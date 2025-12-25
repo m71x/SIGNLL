@@ -56,7 +56,6 @@ class VectorizedEntropyGate(nn.Module):
     def __init__(self, d_ctrl: int, L: int):
         super().__init__()
         # We use Conv1d with groups=L to simulate L independent Linear layers
-        # This runs in 1 TPU kernel instead of 24 separate ones.
         self.L = L
         self.d_ctrl = d_ctrl
         
@@ -87,7 +86,6 @@ class VectorizedEntropyGate(nn.Module):
         B, L, D = z.shape
         
         # 1. Reshape for Conv1d: [B, D*L, 1]
-        # We permute to put features in channel dim, then flatten L*D
         z_reshaped = z.transpose(1, 2).reshape(B, D * L, 1)
         
         # 2. Forward Pass (Vectorized)
@@ -100,6 +98,43 @@ class VectorizedEntropyGate(nn.Module):
         gate = gate.reshape(B, L, 1)
         
         return entropy * gate
+
+# =========================================================================
+# OPTIMIZED: Vectorized Halting Heads
+# =========================================================================
+class VectorizedHaltingHead(nn.Module):
+    def __init__(self, d_in: int, L: int, bias_init: float = -4.0):
+        super().__init__()
+        self.L = L
+        self.d_in = d_in
+        
+        # Replaces L independent Linear(d_in, 1) layers with a single grouped Conv1d
+        self.net = nn.Conv1d(
+            in_channels=d_in * L,
+            out_channels=1 * L,
+            kernel_size=1,
+            groups=L 
+        )
+        
+        # Initialization to match nn.Linear defaults
+        nn.init.kaiming_normal_(self.net.weight, mode='fan_in', nonlinearity='relu')
+        if self.net.bias is not None:
+            nn.init.constant_(self.net.bias, bias_init)
+
+    def forward(self, x):
+        # x: [B, L, D_in]
+        B, L, D = x.shape
+        
+        # Flatten L * D to put Layer 0's features, then Layer 1's features...
+        # Note: This is different from the Gate reshape because here 
+        # we strictly want independent layer weights, so we keep L blocks contiguous.
+        x_reshaped = x.reshape(B, L * D, 1)
+        
+        # Conv1d with groups=L will split in_channels into L parts.
+        # Part 0 will take x_reshaped[:, 0:D, :], which is Layer 0's data.
+        out = self.net(x_reshaped) # [B, L, 1]
+        
+        return out.reshape(B, L, 1)
 
 # =========================================================================
 # CONTROLLER
@@ -154,21 +189,17 @@ class Controller(nn.Module):
         # OPTIMIZED: Single Vectorized Gate Module (Replaces slow ModuleList)
         self.entropy_gate_module = VectorizedEntropyGate(d_ctrl, L)
         
-        self.halting_heads = nn.ModuleList([
-            nn.Linear(d_ctrl + 1, 1) for _ in range(L)
-        ])
+        # OPTIMIZED: Single Vectorized Halting Head Module (Replaces slow ModuleList)
+        self.halting_heads = VectorizedHaltingHead(d_ctrl + 1, L, halting_bias_init)
         
         self.classifier_heads = nn.ModuleList([
             nn.Linear(d_ctrl, self.num_classes) for _ in range(L)
         ])
 
-        # 4. Initialization
+        # 4. Initialization (Apply base init, then specific overrides happen in submodules)
         self.apply(self._init_weights)
-
-        # 5. Override Halting Bias
-        with torch.no_grad():
-            for head in self.halting_heads:
-                head.bias.fill_(halting_bias_init)
+        
+        # Note: VectorizedHaltingHead handles its own bias init, so we don't need the loop here.
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -177,6 +208,7 @@ class Controller(nn.Module):
         elif isinstance(module, nn.LayerNorm):
             nn.init.constant_(module.weight, 1.0)
             nn.init.constant_(module.bias, 0.0)
+        # Note: We do not init Conv1d here as they are manually initialized in their specific classes
 
     def forward(self, teacher_cls: torch.Tensor):
         B, L, D = teacher_cls.shape
@@ -222,17 +254,13 @@ class Controller(nn.Module):
         # Input: z [B, L, D], all_entropies [B, L, 1] -> Output: [B, L, 1]
         all_gated_entropies = self.entropy_gate_module(z, all_entropies)
 
-        # 4. Compute Halting
-        halting_logits_list = []
-        for l in range(L):
-            # Extract the pre-computed gate for this layer
-            gated_ent_l = all_gated_entropies[:, l, :] # [B, 1]
-            
-            combined_input = torch.cat([z[:, l, :], gated_ent_l], dim=-1)
-            h_l = self.halting_heads[l](combined_input) 
-            halting_logits_list.append(h_l)
+        # 4. OPTIMIZED: Compute Halting (Vectorized)
+        # Combine [B, L, D] and [B, L, 1] -> [B, L, D+1]
+        combined_input = torch.cat([z, all_gated_entropies], dim=-1)
         
-        halting_logits = torch.cat(halting_logits_list, dim=-1) 
+        # Pass through vectorized head -> [B, L, 1] -> squeeze to [B, L]
+        halting_logits = self.halting_heads(combined_input).squeeze(-1)
+        
         class_logits = torch.stack(class_logits_list, dim=1)
         
         return halting_logits, class_logits, z
