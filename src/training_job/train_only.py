@@ -334,7 +334,7 @@ def _mp_fn(rank, flags):
 
 if __name__ == "__main__":
     FLAGS = {
-        "d_ctrl": 512,
+        "d_ctrl": 1024,
         "transformer_layers": 4,
         "lr": 5e-4,
         "batch_size": 64,
