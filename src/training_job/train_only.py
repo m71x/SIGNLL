@@ -32,10 +32,12 @@ def train_loop(rank, flags):
         n_layers=flags["transformer_layers"],
         num_classes=2
     ).to(device)
-
+    xm.master_print("model initialized")
+    xm.mark_step()
     # Sync initial weights
     if rank == 0:
         xm.master_print("Synchronizing initial weights...")
+    xm.mark_step()
     for p in model.parameters():
         p.data = xm.all_reduce(xm.REDUCE_SUM, p.data) / num_cores
     xm.mark_step()
