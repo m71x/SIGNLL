@@ -45,7 +45,7 @@ def train_loop(rank, flags):
     diag_sample_neg = None
 
     # =========================================================================
-    # STAGE LOOP
+    # STAGE LOOP (Skips Stage 1 for testing Stage 2 stability)
     # =========================================================================
     for stage in [2]:
 
@@ -153,16 +153,14 @@ def train_loop(rank, flags):
                     # Stage-specific losses
                     # -----------------------------
                     if stage == 1:
-                        # (Stage 1 logic is skipped in this script, preserving structure)
+                        # (Stage 1 logic is skipped in this script)
                         pass
 
                     else: # STAGE 2
                         preds = torch.argmax(class_logits, dim=-1)
                         
-                        # --- FIX: Ensure shapes match [B, L, 1] ---
-                        # class_logits is [B, L, 2], preds is [B, L]
-                        # y.unsqueeze(1) is [B, 1], broadcasting gives [B, L]
-                        # We unsqueeze the result to get [B, L, 1] to match halting_logits
+                        # --- FIX 1: TENSOR SHAPE ---
+                        # Unsqueeze output to match halting_logits [B, L, 1]
                         is_correct = (preds == y.unsqueeze(1)).float().unsqueeze(-1)
 
                         # 1. Class-Aware Rebalancing Weights
@@ -170,11 +168,17 @@ def train_loop(rank, flags):
                         n_neg = (y == 0).sum().float()
                         neg_weight_val = (n_pos / (n_neg + 1e-6)).clamp(min=1.0)
 
-                        sample_weights = torch.ones_like(halting_logits)
-                        sample_weights[y == 0] = neg_weight_val.item()
+                        # --- FIX 2: STATIC GRAPH (Prevents Recompilation Hang) ---
+                        # Previous code used sample_weights[y==0] = val, which causes 
+                        # XLA to recompile every batch. Switched to torch.where.
+                        weights = torch.where(
+                            y == 0, 
+                            neg_weight_val, 
+                            torch.tensor(1.0, device=device)
+                        )
+                        sample_weights = weights.unsqueeze(-1) # [B, L, 1]
 
                         # 2. Halting Loss
-                        # Now both inputs are [B, L, 1]
                         loss_halt = F.binary_cross_entropy_with_logits(
                             halting_logits, 
                             is_correct, 
@@ -230,7 +234,6 @@ def train_loop(rank, flags):
                         if data is None: return f"  {name}: No sample found."
                         out = [f"  > {name} (Label {data['lbl'].item()}):"]
                         h_probs = torch.sigmoid(data["halt"])
-                        # Handle potential extra dim in visualization
                         if h_probs.dim() > 1: h_probs = h_probs.squeeze(-1)
                         out.append(f"    HALT Probs: {[f'{p:.2f}' for p in h_probs.tolist()]}")
                         return "\n".join(out)
