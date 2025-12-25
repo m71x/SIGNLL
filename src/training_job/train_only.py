@@ -45,9 +45,9 @@ def train_loop(rank, flags):
     diag_sample_neg = None
 
     # =========================================================================
-    # STAGE LOOP
+    # STAGE LOOP (Skips Stage 1 for testing Stage 2 stability)
     # =========================================================================
-    for stage in [1, 2]:
+    for stage in [2]:
 
         # -----------------------------
         # Phase setup
@@ -80,14 +80,28 @@ def train_loop(rank, flags):
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = optim.AdamW(trainable_params, lr=flags["lr"], weight_decay=1e-2)
 
-        total_steps = 28 * flags["epochs"] * max(
-            1, flags["samples_per_shard"] // flags["batch_size"]
-        )
-        T_0 = max(1, total_steps // 4)
+        # --- SAFE SCHEDULER LOGIC ---
+        # 1. Enforce hard limit on data size to prevent XLA deadlocks
+        SAFE_SHARD_SIZE = 38000 
+        
+        # 2. Calculate exact number of batches per chunk
+        batches_per_chunk = SAFE_SHARD_SIZE // flags["batch_size"]
+        
+        # 3. Total steps = chunks * epochs * batches
+        total_steps_in_stage = 28 * flags["epochs"] * batches_per_chunk
+        
+        # 4. T_0 for 4 restarts (or use full length for 1 decay)
+        T_0 = max(1, total_steps_in_stage // 4)
 
         scheduler = CosineAnnealingWarmRestarts(
-            optimizer, T_0=T_0, T_mult=2, eta_min=1e-6
+            optimizer, 
+            T_0=T_0, 
+            T_mult=1, # Linear spacing of restarts
+            eta_min=1e-6
         )
+        
+        if rank == 0:
+            xm.master_print(f"Scheduler T_0: {T_0} steps (Total steps: {total_steps_in_stage})")
 
         # =========================================================================
         # CHUNK LOOP
@@ -113,39 +127,35 @@ def train_loop(rank, flags):
                 teacher_cls = teacher_cls[:, 1:25, :]
 
             # -----------------------------
-            # Slice evenly across replicas
+            # CRITICAL: Hard Truncate for XLA Stability
             # -----------------------------
-            total_bs = flags["batch_size"] * num_cores
-            n_groups = teacher_cls.shape[0] // total_bs
-            N = n_groups * total_bs
-
-            teacher_cls = teacher_cls[:N]
-            teacher_lbl = teacher_lbl[:N]
-
+            # Ensure every single core has EXACTLY the same amount of data
+            if teacher_cls.shape[0] >= SAFE_SHARD_SIZE:
+                teacher_cls = teacher_cls[:SAFE_SHARD_SIZE]
+                teacher_lbl = teacher_lbl[:SAFE_SHARD_SIZE]
+            else:
+                # Should not happen if samples_per_shard is 39000 and SAFE is 38000
+                xm.master_print(f"WARNING: Chunk {chunk_idx} size {teacher_cls.shape[0]} < SAFE_SHARD_SIZE")
+            
             dataset = TensorDataset(teacher_cls, teacher_lbl)
-            sampler = DistributedSampler(
-                dataset,
-                num_replicas=1, # Tell it this is the only process for THIS dataset
-                rank=0,         # This core is the "master" of its own unique data
-                shuffle=True,
-                drop_last=False
-            )
+            
+            # Using RandomSampler instead of DistributedSampler because we manually
+            # downloaded unique chunks per core.
+            sampler = torch.utils.data.RandomSampler(dataset)
 
             loader = DataLoader(
                 dataset,
                 sampler=sampler,
                 batch_size=flags["batch_size"],
-                num_workers=0,
-                drop_last=True
+                num_workers=0, # Must be 0 for XLA stability
+                drop_last=True # Drop incomplete batches
             )
 
             # =========================================================================
             # EPOCH LOOP
             # =========================================================================
             for epoch in range(flags["epochs"]):
-                sampler.set_epoch(epoch)
                 model.train()
-
                 diag_sample_pos = None
                 diag_sample_neg = None
 
@@ -160,69 +170,10 @@ def train_loop(rank, flags):
                     # Stage-specific losses
                     # -----------------------------
                     if stage == 1:
-                        # 1. Calculate Weights (Dynamic per batch)
-                        n_pos = (y == 1).sum().float()
-                        n_neg = (y == 0).sum().float()
-                        pos_weight_val = n_neg / (n_pos + 1e-6)
-                        pos_weight_tensor = torch.tensor([pos_weight_val], device=device)
+                        # ... (Stage 1 code omitted since we are skipping it, but structure remains) ...
+                        pass
 
-                        # 2. Hard Loss (BCEWithLogits + pos_weight)
-                        # Expand labels to match [B, L]
-                        labels_expanded = y.float().unsqueeze(1).expand(-1, class_logits.shape[1])
-                        
-                        class_logits_positive = class_logits[:, :, 1]
-                        student_log_probs = F.log_softmax(class_logits, dim=-1)
-                        
-                        loss_hard = F.binary_cross_entropy_with_logits(
-                            class_logits_positive, 
-                            labels_expanded, 
-                            pos_weight=pos_weight_tensor, 
-                            reduction='none'
-                        )
-
-                        # 3. Soft Loss (Synthetic teacher generation since file doesn't have logits)
-                        # We use label smoothing to approximate teacher behavior
-                        num_classes = 2
-                        smoothing = 0.1
-                        t_one_hot = torch.zeros(y.size(0), num_classes, device=device).scatter_(1, y.unsqueeze(1), 1)
-                        teacher_probs = t_one_hot * (1.0 - smoothing) + (smoothing / num_classes)
-                        teacher_log_probs = torch.log(teacher_probs.clamp(min=1e-10))
-                        
-                        teacher_log_probs_expanded = teacher_log_probs.unsqueeze(1).expand(-1, class_logits.shape[1], -1)
-                        
-                        # KL Divergence
-                        kl_elementwise = teacher_log_probs_expanded.exp() * (
-                            teacher_log_probs_expanded - student_log_probs
-                        )
-                        loss_soft = kl_elementwise.sum(dim=-1)
-
-                        # 4. Contrastive Loss (MSE on z)
-                        loss_contrast = F.mse_loss(z[:, 1:, :], z[:, :-1, :])
-
-                        # 5. Combine
-                        alpha = 0.5
-                        ce_per_layer = (alpha * loss_hard) + ((1 - alpha) * loss_soft)
-                        loss_cls = ce_per_layer.mean()
-                        
-                        loss = (loss_cls * 2) + (0.1 * loss_contrast)
-
-                        # ---- diagnostics (stage 1 only) ----
-                        if rank == 0 and batch_idx == 0:
-                            with torch.no_grad():
-                                def extract_sample(label_val):
-                                    indices = (y == label_val).nonzero(as_tuple=True)[0]
-                                    if indices.numel() > 0:
-                                        idx = indices[0]
-                                        return {
-                                            "cls": class_logits[idx].detach().cpu(),
-                                            "lbl": y[idx].detach().cpu()
-                                        }
-                                    return None
-
-                                diag_sample_pos = extract_sample(1)
-                                diag_sample_neg = extract_sample(0)
-
-                    else:
+                    else: # STAGE 2
                         preds = torch.argmax(class_logits, dim=-1)
                         is_correct = (preds == y.unsqueeze(1)).float()
 
@@ -269,7 +220,7 @@ def train_loop(rank, flags):
                     optimizer.zero_grad()
                     loss.backward()
                     xm.optimizer_step(optimizer)
-                    scheduler.step()
+                    scheduler.step() # Step every batch
                     xm.mark_step()
 
                 # -----------------------------
@@ -289,9 +240,7 @@ def train_loop(rank, flags):
                     xm.master_print(f"  LR:         {current_lr:.2e}")
                     xm.master_print(f"  Total Loss: {loss_sum / num_cores:.4f}")
 
-                    if stage == 1:
-                        xm.master_print(f"  Cls Loss:   {loss_sum / num_cores:.4f}")
-                    else:
+                    if stage == 2:
                         xm.master_print(f"  Halt Loss:  {loss_sum / num_cores:.4f}")
 
                     def format_sample(data, name):
@@ -299,11 +248,7 @@ def train_loop(rank, flags):
                             return f"  {name}: No sample found."
                         out = [f"  > {name} (Label {data['lbl'].item()}):"]
                         if stage == 1:
-                            probs = torch.softmax(data["cls"], dim=-1)
-                            cls1_probs = probs[:, 1]
-                            out.append(
-                                f"    CLS Probs (Class 1): {[f'{p:.2f}' for p in cls1_probs.tolist()]}"
-                            )
+                            pass 
                         else:
                             h_probs = torch.sigmoid(data["halt"])
                             out.append(
@@ -342,5 +287,5 @@ if __name__ == "__main__":
         "samples_per_shard": 39000
     }
 
-    print("Starting Stage-1 + Stage-2 Training (TPU-safe).")
+    print("Starting Stage-2 Training (TPU-safe, Vectorized).")
     xmp.spawn(_mp_fn, args=(FLAGS,), start_method="fork")
