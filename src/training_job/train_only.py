@@ -25,7 +25,6 @@ def train_loop(rank, flags):
     # Model initialization
     # -----------------------------
     L = 24
-    # The initialization now uses the optimized BatchLinear (einsum) which is XLA safe
     model = Controller(
         L=L,
         d_teacher=1024,
@@ -33,25 +32,14 @@ def train_loop(rank, flags):
         n_layers=flags["transformer_layers"],
         num_classes=2
     ).to(device)
-    
-    # Ensure graph is processed up to here
-    xm.master_print("model initialized")
-    xm.mark_step()
-    
-    if rank == 0:
-        xm.master_print("Model initialized on device.")
 
     # Sync initial weights
     if rank == 0:
         xm.master_print("Synchronizing initial weights...")
-    
     for p in model.parameters():
         p.data = xm.all_reduce(xm.REDUCE_SUM, p.data) / num_cores
-    
     xm.mark_step()
     xm.rendezvous("weights_synced")
-    if rank == 0:
-        xm.master_print("Weights synchronized.")
 
     diag_sample_pos = None
     diag_sample_neg = None
@@ -68,7 +56,7 @@ def train_loop(rank, flags):
             stage_name = "STAGE 1: Backbone + Classifiers (Halting/Gates FROZEN)"
             for p in model.parameters():
                 p.requires_grad = True
-            for p in model.halting_head_module.parameters():
+            for p in model.halting_heads.parameters():
                 p.requires_grad = False
             for p in model.entropy_gate_module.parameters():
                 p.requires_grad = False
@@ -76,7 +64,7 @@ def train_loop(rank, flags):
             stage_name = "STAGE 2: Halting Heads + Gates (Backbone FROZEN)"
             for p in model.parameters():
                 p.requires_grad = False
-            for p in model.halting_head_module.parameters():
+            for p in model.halting_heads.parameters():
                 p.requires_grad = True
             for p in model.entropy_gate_module.parameters():
                 p.requires_grad = True
@@ -137,8 +125,8 @@ def train_loop(rank, flags):
             dataset = TensorDataset(teacher_cls, teacher_lbl)
             sampler = DistributedSampler(
                 dataset,
-                num_replicas=1, 
-                rank=0,         
+                num_replicas=1, # Tell it this is the only process for THIS dataset
+                rank=0,         # This core is the "master" of its own unique data
                 shuffle=True,
                 drop_last=False
             )
@@ -179,7 +167,9 @@ def train_loop(rank, flags):
                         pos_weight_tensor = torch.tensor([pos_weight_val], device=device)
 
                         # 2. Hard Loss (BCEWithLogits + pos_weight)
+                        # Expand labels to match [B, L]
                         labels_expanded = y.float().unsqueeze(1).expand(-1, class_logits.shape[1])
+                        
                         class_logits_positive = class_logits[:, :, 1]
                         student_log_probs = F.log_softmax(class_logits, dim=-1)
                         
@@ -190,7 +180,8 @@ def train_loop(rank, flags):
                             reduction='none'
                         )
 
-                        # 3. Soft Loss
+                        # 3. Soft Loss (Synthetic teacher generation since file doesn't have logits)
+                        # We use label smoothing to approximate teacher behavior
                         num_classes = 2
                         smoothing = 0.1
                         t_one_hot = torch.zeros(y.size(0), num_classes, device=device).scatter_(1, y.unsqueeze(1), 1)
@@ -279,7 +270,6 @@ def train_loop(rank, flags):
                     loss.backward()
                     xm.optimizer_step(optimizer)
                     scheduler.step()
-                    # Mark step is critical inside the loop
                     xm.mark_step()
 
                 # -----------------------------
