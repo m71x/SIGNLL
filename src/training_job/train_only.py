@@ -159,8 +159,7 @@ def train_loop(rank, flags):
                     else: # STAGE 2
                         preds = torch.argmax(class_logits, dim=-1)
                         
-                        # --- FIX 1: TENSOR SHAPE ---
-                        # Unsqueeze output to match halting_logits [B, L, 1]
+                        # --- FIX 1: TENSOR SHAPE [B, L, 1] ---
                         is_correct = (preds == y.unsqueeze(1)).float().unsqueeze(-1)
 
                         # 1. Class-Aware Rebalancing Weights
@@ -168,15 +167,15 @@ def train_loop(rank, flags):
                         n_neg = (y == 0).sum().float()
                         neg_weight_val = (n_pos / (n_neg + 1e-6)).clamp(min=1.0)
 
-                        # --- FIX 2: STATIC GRAPH (Prevents Recompilation Hang) ---
-                        # Previous code used sample_weights[y==0] = val, which causes 
-                        # XLA to recompile every batch. Switched to torch.where.
+                        # --- FIX 2: STATIC GRAPH + CORRECT BROADCASTING ---
+                        # Use torch.where for static graph
                         weights = torch.where(
                             y == 0, 
                             neg_weight_val, 
                             torch.tensor(1.0, device=device)
                         )
-                        sample_weights = weights.unsqueeze(-1) # [B, L, 1]
+                        # CRITICAL FIX: Reshape to [Batch, 1, 1] to broadcast against [Batch, Length, 1]
+                        sample_weights = weights.view(-1, 1, 1)
 
                         # 2. Halting Loss
                         loss_halt = F.binary_cross_entropy_with_logits(
