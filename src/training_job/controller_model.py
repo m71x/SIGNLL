@@ -108,31 +108,45 @@ class VectorizedHaltingHead(nn.Module):
         self.L = L
         self.d_in = d_in
         
-        # Replaces L independent Linear(d_in, 1) layers with a single grouped Conv1d
-        self.net = nn.Conv1d(
+        # INCREASED PARAMETERS: 2-layer MLP (Expansion factor 4)
+        hidden_dim = d_in * 4 
+
+        # Layer 1: d_in -> hidden
+        self.net1 = nn.Conv1d(
             in_channels=d_in * L,
-            out_channels=1 * L,
+            out_channels=hidden_dim * L,
             kernel_size=1,
             groups=L 
         )
         
-        # Initialization to match nn.Linear defaults
-        nn.init.kaiming_normal_(self.net.weight, mode='fan_in', nonlinearity='relu')
-        if self.net.bias is not None:
-            nn.init.constant_(self.net.bias, bias_init)
+        self.act = nn.GELU()
+
+        # Layer 2: hidden -> 1
+        self.net2 = nn.Conv1d(
+            in_channels=hidden_dim * L,
+            out_channels=1 * L,
+            kernel_size=1,
+            groups=L
+        )
+        
+        # Initialization
+        nn.init.kaiming_normal_(self.net1.weight, mode='fan_in', nonlinearity='relu')
+        nn.init.constant_(self.net1.bias, 0.0)
+        
+        nn.init.kaiming_normal_(self.net2.weight, mode='fan_in', nonlinearity='relu')
+        if self.net2.bias is not None:
+            nn.init.constant_(self.net2.bias, bias_init)
 
     def forward(self, x):
         # x: [B, L, D_in]
         B, L, D = x.shape
         
-        # Flatten L * D to put Layer 0's features, then Layer 1's features...
-        # Note: This is different from the Gate reshape because here 
-        # we strictly want independent layer weights, so we keep L blocks contiguous.
+        # Flatten L * D 
         x_reshaped = x.reshape(B, L * D, 1)
         
-        # Conv1d with groups=L will split in_channels into L parts.
-        # Part 0 will take x_reshaped[:, 0:D, :], which is Layer 0's data.
-        out = self.net(x_reshaped) # [B, L, 1]
+        # MLP Forward (Vectorized)
+        x_hidden = self.act(self.net1(x_reshaped))
+        out = self.net2(x_hidden)
         
         return out.reshape(B, L, 1)
 
