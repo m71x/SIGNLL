@@ -188,7 +188,7 @@ def _mp_fn(rank, flags):
 
 if __name__ == "__main__":
     BASE_FLAGS = {
-        "d_ctrl": 512,
+        "d_ctrl": 1024,
         "transformer_layers": 4,
         "batch_size": 32,
         "samples_per_shard": 39000, 
