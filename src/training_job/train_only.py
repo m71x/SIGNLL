@@ -56,8 +56,7 @@ def train_loop(rank, flags):
             stage_name = "STAGE 1: Backbone + Classifiers (Halting/Gates FROZEN)"
             for p in model.parameters():
                 p.requires_grad = True
-            # CHANGED: Reference vectorized module
-            for p in model.halting_head_module.parameters():
+            for p in model.halting_heads.parameters():
                 p.requires_grad = False
             for p in model.entropy_gate_module.parameters():
                 p.requires_grad = False
@@ -65,8 +64,7 @@ def train_loop(rank, flags):
             stage_name = "STAGE 2: Halting Heads + Gates (Backbone FROZEN)"
             for p in model.parameters():
                 p.requires_grad = False
-            # CHANGED: Reference vectorized module
-            for p in model.halting_head_module.parameters():
+            for p in model.halting_heads.parameters():
                 p.requires_grad = True
             for p in model.entropy_gate_module.parameters():
                 p.requires_grad = True
