@@ -45,7 +45,7 @@ def train_loop(rank, flags):
     diag_sample_neg = None
 
     # =========================================================================
-    # STAGE LOOP (Skips Stage 1 for testing Stage 2 stability)
+    # STAGE LOOP
     # =========================================================================
     for stage in [2]:
 
@@ -81,22 +81,15 @@ def train_loop(rank, flags):
         optimizer = optim.AdamW(trainable_params, lr=flags["lr"], weight_decay=1e-2)
 
         # --- SAFE SCHEDULER LOGIC ---
-        # 1. Enforce hard limit on data size to prevent XLA deadlocks
         SAFE_SHARD_SIZE = 38000 
-        
-        # 2. Calculate exact number of batches per chunk
         batches_per_chunk = SAFE_SHARD_SIZE // flags["batch_size"]
-        
-        # 3. Total steps = chunks * epochs * batches
         total_steps_in_stage = 28 * flags["epochs"] * batches_per_chunk
-        
-        # 4. T_0 for 4 restarts (or use full length for 1 decay)
         T_0 = max(1, total_steps_in_stage // 4)
 
         scheduler = CosineAnnealingWarmRestarts(
             optimizer, 
             T_0=T_0, 
-            T_mult=1, # Linear spacing of restarts
+            T_mult=1,
             eta_min=1e-6
         )
         
@@ -126,29 +119,20 @@ def train_loop(rank, flags):
             if teacher_cls.shape[1] == 25:
                 teacher_cls = teacher_cls[:, 1:25, :]
 
-            # -----------------------------
-            # CRITICAL: Hard Truncate for XLA Stability
-            # -----------------------------
-            # Ensure every single core has EXACTLY the same amount of data
+            # Truncate for safety
             if teacher_cls.shape[0] >= SAFE_SHARD_SIZE:
                 teacher_cls = teacher_cls[:SAFE_SHARD_SIZE]
                 teacher_lbl = teacher_lbl[:SAFE_SHARD_SIZE]
-            else:
-                # Should not happen if samples_per_shard is 39000 and SAFE is 38000
-                xm.master_print(f"WARNING: Chunk {chunk_idx} size {teacher_cls.shape[0]} < SAFE_SHARD_SIZE")
             
             dataset = TensorDataset(teacher_cls, teacher_lbl)
-            
-            # Using RandomSampler instead of DistributedSampler because we manually
-            # downloaded unique chunks per core.
             sampler = torch.utils.data.RandomSampler(dataset)
 
             loader = DataLoader(
                 dataset,
                 sampler=sampler,
                 batch_size=flags["batch_size"],
-                num_workers=0, # Must be 0 for XLA stability
-                drop_last=True # Drop incomplete batches
+                num_workers=0,
+                drop_last=True
             )
 
             # =========================================================================
@@ -163,19 +147,23 @@ def train_loop(rank, flags):
                     x = x.to(device)
                     y = y.to(device)
 
-                    # Capture z for contrastive loss
                     halting_logits, class_logits, z = model(x)
 
                     # -----------------------------
                     # Stage-specific losses
                     # -----------------------------
                     if stage == 1:
-                        # ... (Stage 1 code omitted since we are skipping it, but structure remains) ...
+                        # (Stage 1 logic is skipped in this script, preserving structure)
                         pass
 
                     else: # STAGE 2
                         preds = torch.argmax(class_logits, dim=-1)
-                        is_correct = (preds == y.unsqueeze(1)).float()
+                        
+                        # --- FIX: Ensure shapes match [B, L, 1] ---
+                        # class_logits is [B, L, 2], preds is [B, L]
+                        # y.unsqueeze(1) is [B, 1], broadcasting gives [B, L]
+                        # We unsqueeze the result to get [B, L, 1] to match halting_logits
+                        is_correct = (preds == y.unsqueeze(1)).float().unsqueeze(-1)
 
                         # 1. Class-Aware Rebalancing Weights
                         n_pos = (y == 1).sum().float()
@@ -186,6 +174,7 @@ def train_loop(rank, flags):
                         sample_weights[y == 0] = neg_weight_val.item()
 
                         # 2. Halting Loss
+                        # Now both inputs are [B, L, 1]
                         loss_halt = F.binary_cross_entropy_with_logits(
                             halting_logits, 
                             is_correct, 
@@ -201,7 +190,6 @@ def train_loop(rank, flags):
 
                         loss = loss_halt + loss_entropy
 
-                        # ---- diagnostics (stage 2) ----
                         if rank == 0 and batch_idx == 0:
                             with torch.no_grad():
                                 def extract_sample(label_val):
@@ -220,15 +208,11 @@ def train_loop(rank, flags):
                     optimizer.zero_grad()
                     loss.backward()
                     xm.optimizer_step(optimizer)
-                    scheduler.step() # Step every batch
+                    scheduler.step()
                     xm.mark_step()
 
-                # -----------------------------
-                # Flush + logging
-                # -----------------------------
                 loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
                 xm.mark_step()
-
                 xm.rendezvous(f"ep_end_st{stage}_ch{chunk_idx}_ep{epoch}")
 
                 if rank == 0:
@@ -239,21 +223,16 @@ def train_loop(rank, flags):
                     )
                     xm.master_print(f"  LR:         {current_lr:.2e}")
                     xm.master_print(f"  Total Loss: {loss_sum / num_cores:.4f}")
-
                     if stage == 2:
                         xm.master_print(f"  Halt Loss:  {loss_sum / num_cores:.4f}")
 
                     def format_sample(data, name):
-                        if data is None:
-                            return f"  {name}: No sample found."
+                        if data is None: return f"  {name}: No sample found."
                         out = [f"  > {name} (Label {data['lbl'].item()}):"]
-                        if stage == 1:
-                            pass 
-                        else:
-                            h_probs = torch.sigmoid(data["halt"])
-                            out.append(
-                                f"    HALT Probs: {[f'{p:.2f}' for p in h_probs.tolist()]}"
-                            )
+                        h_probs = torch.sigmoid(data["halt"])
+                        # Handle potential extra dim in visualization
+                        if h_probs.dim() > 1: h_probs = h_probs.squeeze(-1)
+                        out.append(f"    HALT Probs: {[f'{p:.2f}' for p in h_probs.tolist()]}")
                         return "\n".join(out)
 
                     xm.master_print("  DIAGNOSTICS:")
@@ -262,9 +241,6 @@ def train_loop(rank, flags):
 
             xm.rendezvous(f"chunk_end_st{stage}_ch{chunk_idx}")
 
-    # =========================================================================
-    # Save
-    # =========================================================================
     xm.rendezvous("ready_to_save_final")
     if rank == 0:
         save_path = os.path.expanduser("~/SIGNLL/final_model_stage2_gated.pt")
