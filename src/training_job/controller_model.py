@@ -90,55 +90,48 @@ class VectorizedEntropyGate(nn.Module):
         return entropy * gate
 
 # =========================================================================
-# NEW: Vectorized Halting Head (Replaces Loop + MLP)
+# NEW: Vectorized Halting Head
 # =========================================================================
 class VectorizedHaltingHead(nn.Module):
-    def __init__(self, d_ctrl: int, hidden_dim: int, L: int, bias_init: float):
+    def __init__(self, input_dim: int, hidden_dim: int, L: int):
         super().__init__()
         self.L = L
-        in_dim = d_ctrl + 1 # (z + gated_entropy)
         
-        # Layer 1: Project (d_ctrl+1) -> hidden_dim
-        # groups=L ensures each of the 24 layers has its own unique weights
+        # Layer 1: Input -> Hidden (Unique weights per layer L)
+        # We group convolution by L, so each layer gets its own set of weights
+        # connecting its specific input features to its specific hidden features.
         self.net1 = nn.Conv1d(
-            in_channels=in_dim * L,
+            in_channels=input_dim * L,
             out_channels=hidden_dim * L,
             kernel_size=1,
             groups=L
         )
         self.act = nn.ReLU()
         
-        # Layer 2: Project hidden_dim -> 1
+        # Layer 2: Hidden -> 1 (Unique weights per layer L)
         self.net2 = nn.Conv1d(
             in_channels=hidden_dim * L,
             out_channels=1 * L,
             kernel_size=1,
             groups=L
         )
-        
-        # Initialize bias for the final layer
-        nn.init.constant_(self.net2.bias, bias_init)
 
-    def forward(self, z, gated_entropies):
-        # z: [B, L, D]
-        # gated_entropies: [B, L, 1]
-        B, L, D = z.shape
+    def forward(self, x):
+        # x shape: [B, L, input_dim]
+        B, L, D = x.shape
         
-        # 1. Concatenate inputs along feature dim: [B, L, D+1]
-        x = torch.cat([z, gated_entropies], dim=-1)
+        # Reshape to [B, L * D, 1]
+        # Since x is [B, L, D], flattening the last two dimensions groups 
+        # all features for Layer 0, then all for Layer 1, etc.
+        # This matches the 'groups=L' expectation of Conv1d.
+        x_flat = x.view(B, L * D, 1)
         
-        # 2. Reshape for Grouped Conv1d: [B, (D+1)*L, 1]
-        # We flatten L into the channel dimension
-        x = x.transpose(1, 2).reshape(B, -1, 1)
+        out = self.net1(x_flat)
+        out = self.act(out)
+        out = self.net2(out)
         
-        # 3. Forward Pass (Single Graph Ops)
-        x = self.net1(x)
-        x = self.act(x)
-        x = self.net2(x) # Output is [B, L*1, 1]
-        
-        # 4. Reshape back: [B, L, 1]
-        x = x.reshape(B, L, 1)
-        return x
+        # Output is [B, L, 1], squeeze to [B, L]
+        return out.view(B, L)
 
 # =========================================================================
 # CONTROLLER
@@ -163,6 +156,7 @@ class Controller(nn.Module):
         self.d_ctrl = d_ctrl
         self.num_classes = num_classes
         
+        # Default hidden dim to 2x control dim if not specified
         if halting_hidden_dim is None:
             halting_hidden_dim = d_ctrl * 2
 
@@ -170,6 +164,7 @@ class Controller(nn.Module):
         self.input_ln = nn.LayerNorm(d_teacher)
         self.proj = nn.Linear(d_teacher, d_ctrl)
         
+        # RoPE Initialization
         inv_freq = 1.0 / (10000 ** (torch.arange(0, d_ctrl, 2).float() / d_ctrl))
         self.register_buffer("inv_freq", inv_freq)
 
@@ -195,15 +190,12 @@ class Controller(nn.Module):
         # 3. Output Heads
         self.entropy_gate_module = VectorizedEntropyGate(d_ctrl, L)
         
-        # --- MODIFIED SECTION ---
-        # Replaced the list of MLPs with the single Vectorized Module
-        self.halting_heads = VectorizedHaltingHead(
-            d_ctrl=d_ctrl,
-            hidden_dim=halting_hidden_dim,
-            L=L,
-            bias_init=halting_bias_init
+        # REPLACED: Single Vectorized Module instead of ModuleList
+        self.halting_head_module = VectorizedHaltingHead(
+            input_dim=d_ctrl + 1, 
+            hidden_dim=halting_hidden_dim, 
+            L=L
         )
-        # ------------------------
         
         self.classifier_heads = nn.ModuleList([
             nn.Linear(d_ctrl, self.num_classes) for _ in range(L)
@@ -211,7 +203,11 @@ class Controller(nn.Module):
 
         # 4. Initialization
         self.apply(self._init_weights)
-        # Note: halting bias is already set inside VectorizedHaltingHead init
+
+        # 5. Override Halting Bias
+        # Access the second conv layer in the vectorized module to set bias
+        with torch.no_grad():
+            self.halting_head_module.net2.bias.fill_(halting_bias_init)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -237,30 +233,40 @@ class Controller(nn.Module):
             z = layer(z, mask=attn_mask)
         z = self.post_ln(z) 
         
-        # 2. Gather All Class Logits & Entropy
+        # 2. Gather All Class Logits & Entropy FIRST
         class_logits_list = []
         entropy_list = []
+        
         max_entropy = math.log(self.num_classes)
         
         for l in range(L):
             c_l = self.classifier_heads[l](z[:, l, :]) 
             class_logits_list.append(c_l)
             
+            # Stable Entropy Calc
             log_probs = F.log_softmax(c_l, dim=-1)
             probs = torch.exp(log_probs)
             probs_safe = probs.clamp(min=1e-10, max=1.0)
             log_probs_safe = torch.log(probs_safe)
+            
+            # Entropy: -sum(p * log(p))
             ent = -(probs_safe * log_probs_safe).sum(dim=-1, keepdim=True)
             ent_norm = (ent / max_entropy).clamp(0.0, 1.0)
             entropy_list.append(ent_norm)
             
+        # Stack: [B, L, 1]
         all_entropies = torch.stack(entropy_list, dim=1)
-        class_logits = torch.stack(class_logits_list, dim=1)
         
-        # 3. Vectorized Gating
+        # 3. OPTIMIZED: Run Vectorized Gate on ALL layers at once
         all_gated_entropies = self.entropy_gate_module(z, all_entropies)
 
-        # 4. OPTIMIZED: Vectorized Halting (Single Op)
-        halting_logits = self.halting_heads(z, all_gated_entropies)
+        # 4. OPTIMIZED: Compute Halting (Vectorized)
+        # Prepare inputs: [B, L, D] concatenated with [B, L, 1] -> [B, L, D+1]
+        combined_input = torch.cat([z, all_gated_entropies], dim=-1)
+        
+        # Single vectorized pass
+        halting_logits = self.halting_head_module(combined_input)
+        
+        class_logits = torch.stack(class_logits_list, dim=1)
         
         return halting_logits, class_logits, z
