@@ -229,7 +229,7 @@ def train_loop(rank, flags):
                         # 1. Class-Aware Rebalancing Weights
                         n_pos = (y == 1).sum().float()
                         n_neg = (y == 0).sum().float()
-                        neg_weight_val = (n_pos / (n_neg + 1e-6)).clamp(min=1.0)
+                        neg_weight_val = ((n_pos / (n_neg + 1e-6)).clamp(min=1.0)) * 5.0
 
                         sample_weights = torch.ones_like(halting_logits)
                         sample_weights[y == 0] = neg_weight_val.item()
