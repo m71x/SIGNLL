@@ -92,40 +92,50 @@ def load_npz_from_gcs(core_id: int, filename: str) -> Optional[Dict[str, np.ndar
 def training_data_download(core_id: int, filename: str, max_entries: int) -> Optional[Dict[str, np.ndarray]]:
     """
     Downloads NPZ data from GCS, slices, and shuffles the first N entries.
+    Retries indefinitely if an error occurs.
     """
-    # 1. Load the data
-    data = load_npz_from_gcs(core_id, filename)
-    if data is None:
-        return None
+    while True:
+        try:
+            # 1. Load the data
+            data = load_npz_from_gcs(core_id, filename)
+            
+            # Treat None return as a failure to trigger retry
+            if data is None:
+                raise ValueError("load_npz_from_gcs returned None")
 
-    cls_tokens = data['all_layer_cls_tokens']
-    classifications = data['classifications']
-    total_samples = cls_tokens.shape[0]
+            cls_tokens = data['all_layer_cls_tokens']
+            classifications = data['classifications']
+            total_samples = cls_tokens.shape[0]
 
-    # 2. Determine the slice size
-    N = min(total_samples, max_entries)
-    
-    print(f"[Core {core_id}] Data Prep: Total samples found: {total_samples}, Slicing to N: {N}")
+            # 2. Determine the slice size
+            N = min(total_samples, max_entries)
+            
+            print(f"[Core {core_id}] Data Prep: Total samples found: {total_samples}, Slicing to N: {N}")
 
-    if N == 0:
-        print(f"[Core {core_id}] ❌ Data slice resulted in 0 samples.")
-        return None
-    
-    # 3. Apply shuffle and slice
-    indices = np.arange(total_samples)
-    np.random.shuffle(indices)
-    shuffled_and_sliced_indices = indices[:N]
+            if N == 0:
+                raise ValueError(f"[Core {core_id}] ❌ Data slice resulted in 0 samples.")
+            
+            # 3. Apply shuffle and slice
+            indices = np.arange(total_samples)
+            np.random.shuffle(indices)
+            shuffled_and_sliced_indices = indices[:N]
 
-    shuffled_cls_tokens = cls_tokens[shuffled_and_sliced_indices]
-    shuffled_classifications = classifications[shuffled_and_sliced_indices]
-    
-    print(f"[Core {core_id}] ✅ Data successfully shuffled and sliced. Final samples: {shuffled_cls_tokens.shape[0]}")
-    
-    # 4. Return the shuffled data
-    return {
-        'all_layer_cls_tokens': shuffled_cls_tokens,
-        'classifications': shuffled_classifications
-    }
+            shuffled_cls_tokens = cls_tokens[shuffled_and_sliced_indices]
+            shuffled_classifications = classifications[shuffled_and_sliced_indices]
+            
+            print(f"[Core {core_id}] ✅ Data successfully shuffled and sliced. Final samples: {shuffled_cls_tokens.shape[0]}")
+            
+            # 4. Return the shuffled data
+            return {
+                'all_layer_cls_tokens': shuffled_cls_tokens,
+                'classifications': shuffled_classifications
+            }
+
+        except Exception as e:
+            print(f"[Core {core_id}] ⚠️ Error encountered in training_data_download: {e}")
+            print(f"[Core {core_id}] 🔄 Restarting download process in 10 seconds...")
+            time.sleep(10)
+            # The loop will continue and retry
 
 # ----------------------------------------------------------------------
 # Core Function for XLA Multiprocessing
