@@ -48,7 +48,7 @@ def train_loop(rank, flags):
     # =========================================================================
     # STAGE LOOP
     # =========================================================================
-    for stage in [2]:
+    for stage in [1, 2]:
 
         # -----------------------------
         # Phase setup
@@ -231,7 +231,7 @@ def train_loop(rank, flags):
                         # 1. Class-Aware Rebalancing
                         n_pos = (y == 1).sum().float()
                         n_neg = (y == 0).sum().float()
-                        neg_weight_val = ((n_pos / (n_neg + 1e-6)).clamp(min=1.0)) * 7.0
+                        neg_weight_val = ((n_pos / (n_neg + 1e-6)).clamp(min=1.0)) * 8.0
 
                         sample_weights = torch.ones_like(halting_logits)
                         sample_weights[y == 0] = neg_weight_val.item()
