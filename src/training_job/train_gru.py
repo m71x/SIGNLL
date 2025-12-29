@@ -11,7 +11,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import TensorDataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from controller_model import Controller
+from controller_gru import Controller
 from training_data_download import training_data_download
 
 # =========================================================================
