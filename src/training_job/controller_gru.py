@@ -87,7 +87,7 @@ class VectorizedEntropyGate(nn.Module):
         return entropy * gate
 
 # =========================================================================
-# CONTROLLER (Recurrent Architecture)
+# CONTROLLER (Recurrent Architecture with XLA Optimization)
 # =========================================================================
 class Controller(nn.Module):
     def __init__(
@@ -101,7 +101,7 @@ class Controller(nn.Module):
         dropout: float = 0.1,
         halting_bias_init: float = -4.0,
         num_classes: int = 2,
-        d_halt_hidden: int = 64  # NEW: Hidden dimension for GRU
+        d_halt_hidden: int = 64
     ):
         super().__init__()
         self.L = L
@@ -206,37 +206,42 @@ class Controller(nn.Module):
         # Input construction: [B, L, D+1]
         gru_inputs = torch.cat([z, all_gated_entropies], dim=-1)
         
-        halting_logits_list = []
-        saved_states_list = []
-        
         # Initial State: [B, d_hidden]
         h_prev = torch.zeros(B, self.d_halt_hidden, device=z.device)
         
+        # Use a list to collect results for compatibility and stacking later
+        saved_states_list = []
+
+        # === OPTIMIZED RECURRENT LOOP ===
+        # We perform ONLY the strict recurrence inside the loop to minimize graph size.
+        # Projections and Delta calculations are vectorized outside the loop.
         for l in range(L):
             input_l = gru_inputs[:, l, :] # [B, D+1]
             
-            # a. Update State
+            # Recurrence Step
             h_curr = self.halting_gru(input_l, h_prev)
-            
-            # b. Stabilize State (Prevent drift over 24 layers)
             h_curr = self.halt_ln(h_curr)
             
-            # c. Calculate Innovation (Delta)
-            delta = h_curr - h_prev
-            
-            # d. Halting Decision: Based on State + Delta
-            # [B, d_hidden * 2]
-            head_input = torch.cat([h_curr, delta], dim=-1)
-            h_logit = self.halting_proj(head_input)
-            
-            halting_logits_list.append(h_logit)
             saved_states_list.append(h_curr)
-            
-            # Update for next step
             h_prev = h_curr
+            
+        # === VECTORIZED PROJECTION ===
+        # Stack all states: [B, L, H]
+        h_stack = torch.stack(saved_states_list, dim=1)
         
-        halting_logits = torch.cat(halting_logits_list, dim=-1) 
+        # Compute Deltas Vectorized: h_t - h_{t-1}
+        # Prepend zeros for the first step delta
+        h_prev_shifted = torch.cat([torch.zeros_like(h_stack[:, :1, :]), h_stack[:, :-1, :]], dim=1)
+        deltas = h_stack - h_prev_shifted
+        
+        # Projection Input: [B, L, 2H]
+        head_input = torch.cat([h_stack, deltas], dim=-1)
+        
+        # Single Large Linear Projection (Much faster for XLA than 24 small ones)
+        # Output: [B, L, 1] -> squeeze to [B, L]
+        halting_logits = self.halting_proj(head_input).squeeze(-1)
+
         class_logits = torch.stack(class_logits_list, dim=1)
         
-        # RETURN SAVED STATES for Diversity Loss in Stage 2
+        # Return saved_states_list (list) to match train_gru.py expectation
         return halting_logits, class_logits, z, saved_states_list

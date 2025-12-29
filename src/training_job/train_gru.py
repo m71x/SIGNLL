@@ -31,7 +31,7 @@ def train_loop(rank, flags):
         d_ctrl=flags["d_ctrl"],
         n_layers=flags["transformer_layers"],
         num_classes=2,
-        d_halt_hidden=64  # NEW: Hidden dim for recurrence
+        d_halt_hidden=64
     ).to(device)
 
     # Sync initial weights
@@ -169,7 +169,7 @@ def train_loop(rank, flags):
                     # Stage-specific losses
                     # -----------------------------
                     if stage == 1:
-                        # 1. Calculate Weights (Dynamic per batch)
+                        # 1. Calculate Weights
                         n_pos = (y == 1).sum().float()
                         n_neg = (y == 0).sum().float()
                         pos_weight_val = n_neg / (n_pos + 1e-6)
@@ -209,7 +209,6 @@ def train_loop(rank, flags):
                         
                         loss = (loss_cls * 2) + (0.1 * loss_contrast)
 
-                        # ---- diagnostics (stage 1 only) ----
                         if rank == 0 and batch_idx == 0:
                             with torch.no_grad():
                                 def extract_sample(label_val):
@@ -251,7 +250,7 @@ def train_loop(rank, flags):
                         h_entropy = -(h_safe * h_safe.log() + (1 - h_safe) * (1 - h_safe).log())
                         loss_entropy = -entropy_weight * h_entropy.mean()
 
-                        # 4. INNOVATION / DIVERSITY LOSS (New for Recurrence)
+                        # 4. INNOVATION / DIVERSITY LOSS
                         # saved_states: List[24] of [B, 64] -> Stack: [B, 24, 64]
                         h_stack = torch.stack(saved_states, dim=1)
                         
@@ -260,17 +259,14 @@ def train_loop(rank, flags):
                         
                         # A. Stagnation Penalty: Penalize high Cosine Similarity
                         cos_sim = F.cosine_similarity(h_stack, h_prev, dim=-1)
-                        # If cos_sim > 0.9, add penalty
                         loss_diversity = F.relu(cos_sim - 0.9).mean() * 0.1
                         
                         # B. Magnitude Penalty: Force change
                         delta_mag = torch.norm(h_stack - h_prev, p=2, dim=-1)
-                        # If magnitude < 0.1, add penalty
                         loss_innovation = F.relu(0.1 - delta_mag).mean() * 0.1
                         
                         loss = loss_halt + loss_entropy + loss_diversity + loss_innovation
 
-                        # ---- diagnostics (stage 2) ----
                         if rank == 0 and batch_idx == 0:
                             with torch.no_grad():
                                 def extract_sample(label_val):
@@ -291,9 +287,6 @@ def train_loop(rank, flags):
                     scheduler.step()
                     xm.mark_step()
 
-                # -----------------------------
-                # Flush + logging
-                # -----------------------------
                 loss_sum = xm.all_reduce(xm.REDUCE_SUM, loss)
                 xm.mark_step()
 
@@ -336,9 +329,6 @@ def train_loop(rank, flags):
 
             xm.rendezvous(f"chunk_end_st{stage}_ch{chunk_idx}")
 
-    # =========================================================================
-    # Save
-    # =========================================================================
     xm.rendezvous("ready_to_save_final")
     if rank == 0:
         save_path = os.path.expanduser("~/SIGNLL/final_model_stage2_gated.pt")
