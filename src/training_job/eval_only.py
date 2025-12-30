@@ -5,6 +5,7 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 from torch.utils.data import TensorDataset, DataLoader, SequentialSampler
 
+# CHANGED: Import from the new recurrent controller file
 from controller_gru import Controller
 from training_data_download import training_data_download
 
@@ -66,7 +67,10 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
             teacher_cls = teacher_cls.to(device)
             teacher_label = teacher_label.to(device)
             #xm.master_print("teacher sample set up")
-            halting_logits, class_logits, _ = model(teacher_cls)
+            
+            # CHANGED: Unpack 4 values (logits, class_logits, z, states)
+            halting_logits, class_logits, _, _ = model(teacher_cls)
+            
             #xm.master_print("inference performedp")
             h_probs = torch.sigmoid(halting_logits)
             threshold_mask = (h_probs > threshold)
@@ -126,13 +130,14 @@ def evaluate_model(rank, model, chunk_idx, threshold, batch_size, samples_per_sh
 def eval_main(rank, flags):
     device = xm.xla_device()
     
-    # 1. Initialize Model
+    # 1. Initialize Model (Using New Architecture)
     model = Controller(
         L=24,
         d_teacher=1024,
         d_ctrl=flags["d_ctrl"],
         n_layers=flags["transformer_layers"],
-        num_classes=2
+        num_classes=2,
+        d_halt_hidden=64  # CHANGED: Added hidden dim arg to match training
     ).to(device)
 
     # 2. Loading Weights (All Ranks participate to avoid rendezvous mismatch)
