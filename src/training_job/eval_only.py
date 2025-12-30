@@ -5,7 +5,7 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 from torch.utils.data import TensorDataset, DataLoader, SequentialSampler
 
-from controller_model import Controller
+from controller_gru import Controller
 from training_data_download import training_data_download
 
 # =========================================================================
