@@ -87,7 +87,7 @@ class VectorizedEntropyGate(nn.Module):
         return entropy * gate
 
 # =========================================================================
-# CONTROLLER (Recurrent Architecture with XLA Optimization)
+# CONTROLLER (Shared MLP Head + Recurrent Halting)
 # =========================================================================
 class Controller(nn.Module):
     def __init__(
@@ -131,20 +131,20 @@ class Controller(nn.Module):
         self.pre_ln = nn.LayerNorm(d_ctrl)
         self.post_ln = nn.LayerNorm(d_ctrl) 
 
-        # 3. Classifiers & Gating
+        # 3. Classifiers & Gating (OPTIMIZED)
         self.entropy_gate_module = VectorizedEntropyGate(d_ctrl, L)
-        self.classifier_heads = nn.ModuleList([
-            nn.Linear(d_ctrl, self.num_classes) for _ in range(L)
-        ])
         
-        # 4. NEW: Recurrent Halting Logic
-        # GRU Cell: Input = [Backbone(512) + GatedEntropy(1)]
+        # SHARED MLP HEAD: Replaces individual Linear heads
+        # Structure: Linear -> GELU -> Linear
+        self.shared_classifier = nn.Sequential(
+            nn.Linear(d_ctrl, d_ctrl),
+            nn.GELU(),
+            nn.Linear(d_ctrl, self.num_classes)
+        )
+        
+        # 4. Recurrent Halting Logic
         self.halting_gru = nn.GRUCell(d_ctrl + 1, d_halt_hidden)
-        
-        # Stabilization: LayerNorm on Hidden State
         self.halt_ln = nn.LayerNorm(d_halt_hidden)
-        
-        # Residual Halting Head: Input = [HiddenState(64) + Delta(64)]
         self.halting_proj = nn.Linear(d_halt_hidden * 2, 1)
 
         # Initialization
@@ -182,39 +182,33 @@ class Controller(nn.Module):
             z = layer(z, mask=attn_mask)
         z = self.post_ln(z) 
         
-        # --- 2. Class Logits & Entropy ---
-        class_logits_list = []
-        entropy_list = []
-        max_entropy = math.log(self.num_classes)
+        # --- 2. OPTIMIZED: Vectorized Class Logits (Shared MLP) ---
+        # Flatten [B, L, D] -> [B*L, D]
+        z_flat = z.view(-1, D)
         
-        for l in range(L):
-            c_l = self.classifier_heads[l](z[:, l, :]) 
-            class_logits_list.append(c_l)
-            
-            # Stable Entropy
-            log_probs = F.log_softmax(c_l, dim=-1)
-            probs = torch.exp(log_probs).clamp(min=1e-10, max=1.0)
-            ent = -(probs * log_probs).sum(dim=-1, keepdim=True)
-            entropy_list.append((ent / max_entropy).clamp(0.0, 1.0))
-            
-        all_entropies = torch.stack(entropy_list, dim=1)
+        # Project through Shared MLP: [B*L, num_classes]
+        logits_flat = self.shared_classifier(z_flat)
+        
+        # Reshape back: [B, L, num_classes]
+        class_logits = logits_flat.view(B, L, self.num_classes)
+        
+        # Stable Entropy Calculation (Vectorized)
+        max_entropy = math.log(self.num_classes)
+        log_probs = F.log_softmax(class_logits, dim=-1)
+        probs = torch.exp(log_probs).clamp(min=1e-10, max=1.0)
+        ent = -(probs * log_probs).sum(dim=-1, keepdim=True)
+        all_entropies = (ent / max_entropy).clamp(0.0, 1.0) # [B, L, 1]
         
         # Vectorized Gating
         all_gated_entropies = self.entropy_gate_module(z, all_entropies)
 
         # --- 3. Recurrent Halting (The Manager) ---
-        # Input construction: [B, L, D+1]
-        gru_inputs = torch.cat([z, all_gated_entropies], dim=-1)
+        gru_inputs = torch.cat([z, all_gated_entropies], dim=-1) # [B, L, D+1]
         
-        # Initial State: [B, d_hidden]
         h_prev = torch.zeros(B, self.d_halt_hidden, device=z.device)
-        
-        # Use a list to collect results for compatibility and stacking later
         saved_states_list = []
 
-        # === OPTIMIZED RECURRENT LOOP ===
-        # We perform ONLY the strict recurrence inside the loop to minimize graph size.
-        # Projections and Delta calculations are vectorized outside the loop.
+        # Recurrent Loop (Still needed for state dependency)
         for l in range(L):
             input_l = gru_inputs[:, l, :] # [B, D+1]
             
@@ -225,7 +219,7 @@ class Controller(nn.Module):
             saved_states_list.append(h_curr)
             h_prev = h_curr
             
-        # === VECTORIZED PROJECTION ===
+        # --- 4. OPTIMIZED: Vectorized Halting Projection ---
         # Stack all states: [B, L, H]
         h_stack = torch.stack(saved_states_list, dim=1)
         
@@ -237,11 +231,9 @@ class Controller(nn.Module):
         # Projection Input: [B, L, 2H]
         head_input = torch.cat([h_stack, deltas], dim=-1)
         
-        # Single Large Linear Projection (Much faster for XLA than 24 small ones)
+        # Single Large Linear Projection
         # Output: [B, L, 1] -> squeeze to [B, L]
         halting_logits = self.halting_proj(head_input).squeeze(-1)
 
-        class_logits = torch.stack(class_logits_list, dim=1)
-        
-        # Return saved_states_list (list) to match train_gru.py expectation
+        # Return saved_states_list (list) for compatibility with train_gru.py
         return halting_logits, class_logits, z, saved_states_list
