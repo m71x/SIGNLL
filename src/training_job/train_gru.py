@@ -92,7 +92,7 @@ def train_loop(rank, flags):
         total_steps = 28 * flags["epochs"] * max(
             1, flags["samples_per_shard"] // flags["batch_size"]
         )
-        T_0 = max(1, total_steps // 4)
+        T_0 = max(1, total_steps // 6)
 
         scheduler = CosineAnnealingWarmRestarts(
             optimizer, T_0=T_0, T_mult=2, eta_min=1e-6
@@ -343,7 +343,7 @@ def _mp_fn(rank, flags):
 
 if __name__ == "__main__":
     FLAGS = {
-        "d_ctrl": 512,
+        "d_ctrl": 1024,
         "transformer_layers": 4,
         "lr": 5e-4,
         "batch_size": 64,
