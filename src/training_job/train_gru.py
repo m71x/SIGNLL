@@ -15,6 +15,53 @@ from controller_gru import Controller
 from training_data_download import training_data_download
 
 # =========================================================================
+# HELPER: Supervised Contrastive Loss
+# =========================================================================
+def supervised_contrastive_loss(features, labels, temperature=0.1):
+    """
+    Args:
+        features: Hidden vectors [Batch_Size, Dim] (Should be normalized)
+        labels: Ground truth labels [Batch_Size]
+        temperature: Scalar temperature parameter
+    """
+    device = features.device
+    batch_size = features.shape[0]
+    
+    labels = labels.contiguous().view(-1, 1)
+    # Mask of shape [B, B]: 1 if i and j have same label, 0 otherwise
+    mask = torch.eq(labels, labels.T).float().to(device)
+
+    # Compute similarity matrix (Cosine Similarity since features are normalized)
+    # [B, B]
+    anchor_dot_contrast = torch.matmul(features, features.T) / temperature
+
+    # For numerical stability
+    logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+    logits = anchor_dot_contrast - logits_max.detach()
+
+    # Mask out self-contrast (diagonal)
+    logits_mask = torch.scatter(
+        torch.ones_like(mask),
+        1,
+        torch.arange(batch_size).view(-1, 1).to(device),
+        0
+    )
+    
+    # Mask to ignore self-comparisons in the positive mask
+    mask = mask * logits_mask
+
+    # Compute Log-Sum-Exp
+    exp_logits = torch.exp(logits) * logits_mask
+    log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)
+
+    # Compute mean log-likelihood for positive pairs
+    # Sum over j (positives), then divide by count of positives
+    mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-6)
+
+    # Loss is negative mean log likelihood
+    return -mean_log_prob_pos.mean()
+
+# =========================================================================
 # TRAINING LOOP
 # =========================================================================
 def train_loop(rank, flags):
@@ -200,8 +247,15 @@ def train_loop(rank, flags):
                         )
                         loss_soft = kl_elementwise.sum(dim=-1)
 
-                        # 4. Contrastive Loss
-                        loss_contrast = F.mse_loss(z[:, 1:, :], z[:, :-1, :])
+                        # 4. SUPERVISED CONTRASTIVE LOSS
+                        # z shape: [B, L, D]
+                        # We pool across L to get a stable "trajectory representation" [B, D]
+                        z_pooled = torch.mean(z, dim=1)
+                        
+                        # Normalize for Cosine Similarity
+                        features = F.normalize(z_pooled, dim=1)
+                        
+                        loss_contrast = supervised_contrastive_loss(features, y, temperature=0.1)
 
                         alpha = 0.5
                         ce_per_layer = (alpha * loss_hard) + ((1 - alpha) * loss_soft)
@@ -346,7 +400,7 @@ if __name__ == "__main__":
         "d_ctrl": 1024,
         "transformer_layers": 4,
         "lr": 5e-4,
-        "batch_size": 64,
+        "batch_size": 32,
         "epochs": 5,
         "samples_per_shard": 39000
     }
