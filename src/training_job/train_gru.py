@@ -62,6 +62,44 @@ def supervised_contrastive_loss(features, labels, temperature=0.1):
     return -mean_log_prob_pos.mean()
 
 # =========================================================================
+# HELPER: Monotonicity Loss
+# =========================================================================
+def monotonicity_loss(class_logits, labels, margin=0.0):
+    """
+    Penalizes the model if the loss at step t is greater than step t-1.
+    Enforces that performance should not degrade as we process more layers.
+    Args:
+        class_logits: [B, L, Num_Classes]
+        labels: [B]
+    """
+    B, L, C = class_logits.shape
+    device = class_logits.device
+    
+    # Expand labels: [B, L]
+    labels_exp = labels.unsqueeze(1).expand(-1, L)
+    
+    # Compute CE loss per step: [B, L]
+    # We use reduction='none' to preserve step-wise loss structure
+    ce_per_step = F.cross_entropy(
+        class_logits.reshape(-1, C), 
+        labels_exp.reshape(-1), 
+        reduction='none'
+    ).view(B, L)
+    
+    # Calculate difference: Loss(t) - Loss(t-1)
+    # Ideally, Loss(t) < Loss(t-1), so diff should be negative.
+    # If diff is positive (loss went UP), we penalize it.
+    loss_t = ce_per_step[:, 1:]
+    loss_prev = ce_per_step[:, :-1]
+    
+    diff = loss_t - loss_prev
+    
+    # Penalize violations (where loss increased)
+    penalty = F.relu(diff + margin)
+    
+    return penalty.mean()
+
+# =========================================================================
 # TRAINING LOOP
 # =========================================================================
 def train_loop(rank, flags):
@@ -251,17 +289,18 @@ def train_loop(rank, flags):
                         # z shape: [B, L, D]
                         # We pool across L to get a stable "trajectory representation" [B, D]
                         z_pooled = torch.mean(z, dim=1)
-                        
-                        # Normalize for Cosine Similarity
                         features = F.normalize(z_pooled, dim=1)
-                        
                         loss_contrast = supervised_contrastive_loss(features, y, temperature=0.1)
+
+                        # 5. MONOTONICITY LOSS
+                        loss_mono = monotonicity_loss(class_logits, y)
 
                         alpha = 0.5
                         ce_per_layer = (alpha * loss_hard) + ((1 - alpha) * loss_soft)
                         loss_cls = ce_per_layer.mean()
                         
-                        loss = (loss_cls * 2) + (0.1 * loss_contrast)
+                        # Combined Loss: CE + SupCon + Monotonicity
+                        loss = (loss_cls * 2) + (0.1 * loss_contrast) + (0.1 * loss_mono)
 
                         if rank == 0 and batch_idx == 0:
                             with torch.no_grad():

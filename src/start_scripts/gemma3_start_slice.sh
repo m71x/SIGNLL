@@ -27,7 +27,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
-    --worker=3
+    --worker=6
 #run inference
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
@@ -35,6 +35,11 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all \
   --command="tmux new -d -s signll 'cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/tpu_job/main2.py'"
 
+#check last system logs
+tail -n 100 /var/log/syslog
+
+#
+df -h
 #update workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
