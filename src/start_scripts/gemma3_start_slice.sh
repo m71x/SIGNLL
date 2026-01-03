@@ -27,7 +27,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
-    --worker=6
+    --worker=3
 #run inference
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
@@ -38,8 +38,24 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
 #check last system logs
 tail -n 100 /var/log/syslog
 
-#
+#live logs
+tail -f /var/log/syslog
+
+#check real time running processes and resources
+htop
+
+#shows real time system performance based on memory, swaps, I/O, and CPU usage
+vmstat 1
+
+#crash context
+journalctl -xe
+
+# check disk free
 df -h
+
+#check open ports
+ss -tulpn
+
 #update workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \

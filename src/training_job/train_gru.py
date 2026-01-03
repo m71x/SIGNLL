@@ -439,7 +439,7 @@ if __name__ == "__main__":
         "d_ctrl": 1024,
         "transformer_layers": 4,
         "lr": 5e-4,
-        "batch_size": 32,
+        "batch_size": 64,
         "epochs": 5,
         "samples_per_shard": 39000
     }
