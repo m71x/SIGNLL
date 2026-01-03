@@ -100,6 +100,34 @@ def monotonicity_loss(class_logits, labels, margin=0.0):
     return penalty.mean()
 
 # =========================================================================
+# HELPER: Focal Loss
+# =========================================================================
+def focal_loss(inputs, targets, alpha=0.25, gamma=2.0, reduction='mean'):
+    """
+    Focal Loss for addressing class imbalance.
+    Args:
+        inputs: Logits [B, ...]
+        targets: Labels [B, ...] (Same shape as inputs)
+        alpha: Weighting factor for the rare class (default 0.25)
+        gamma: Focusing parameter (default 2.0)
+    """
+    # Compute binary cross entropy (with logits)
+    bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+    
+    # pt is the probability of the true class
+    pt = torch.exp(-bce_loss)
+    
+    # Focal term: (1 - pt)^gamma
+    f_loss = alpha * (1 - pt) ** gamma * bce_loss
+
+    if reduction == 'mean':
+        return f_loss.mean()
+    elif reduction == 'sum':
+        return f_loss.sum()
+    else:
+        return f_loss
+
+# =========================================================================
 # TRAINING LOOP
 # =========================================================================
 def train_loop(rank, flags):
@@ -254,25 +282,20 @@ def train_loop(rank, flags):
                     # Stage-specific losses
                     # -----------------------------
                     if stage == 1:
-                        # 1. Calculate Weights
-                        n_pos = (y == 1).sum().float()
-                        n_neg = (y == 0).sum().float()
-                        pos_weight_val = n_neg / (n_pos + 1e-6)
-                        pos_weight_tensor = torch.tensor([pos_weight_val], device=device)
-
-                        # 2. Hard Loss
+                        # 1. FOCAL LOSS (Replaces Weighted BCE)
                         labels_expanded = y.float().unsqueeze(1).expand(-1, class_logits.shape[1])
                         class_logits_positive = class_logits[:, :, 1]
-                        student_log_probs = F.log_softmax(class_logits, dim=-1)
                         
-                        loss_hard = F.binary_cross_entropy_with_logits(
+                        # Use Alpha=0.8 to heavily weight the positive/rare class
+                        loss_hard = focal_loss(
                             class_logits_positive, 
                             labels_expanded, 
-                            pos_weight=pos_weight_tensor, 
-                            reduction='none'
+                            alpha=0.8, 
+                            gamma=2.0
                         )
 
-                        # 3. Soft Loss
+                        # 2. Soft Loss
+                        student_log_probs = F.log_softmax(class_logits, dim=-1)
                         num_classes = 2
                         smoothing = 0.1
                         t_one_hot = torch.zeros(y.size(0), num_classes, device=device).scatter_(1, y.unsqueeze(1), 1)
@@ -285,21 +308,19 @@ def train_loop(rank, flags):
                         )
                         loss_soft = kl_elementwise.sum(dim=-1)
 
-                        # 4. SUPERVISED CONTRASTIVE LOSS
-                        # z shape: [B, L, D]
-                        # We pool across L to get a stable "trajectory representation" [B, D]
+                        # 3. SUPERVISED CONTRASTIVE LOSS
                         z_pooled = torch.mean(z, dim=1)
                         features = F.normalize(z_pooled, dim=1)
                         loss_contrast = supervised_contrastive_loss(features, y, temperature=0.1)
 
-                        # 5. MONOTONICITY LOSS
+                        # 4. MONOTONICITY LOSS
                         loss_mono = monotonicity_loss(class_logits, y)
 
-                        alpha = 0.5
-                        ce_per_layer = (alpha * loss_hard) + ((1 - alpha) * loss_soft)
+                        alpha_weight = 0.5
+                        ce_per_layer = (alpha_weight * loss_hard) + ((1 - alpha_weight) * loss_soft)
                         loss_cls = ce_per_layer.mean()
                         
-                        # Combined Loss: CE + SupCon + Monotonicity
+                        # Combined Loss: CE/Focal + SupCon + Monotonicity
                         loss = (loss_cls * 2) + (0.1 * loss_contrast) + (0.1 * loss_mono)
 
                         if rank == 0 and batch_idx == 0:
@@ -321,40 +342,31 @@ def train_loop(rank, flags):
                         preds = torch.argmax(class_logits, dim=-1)
                         is_correct = (preds == y.unsqueeze(1)).float()
 
-                        # 1. Class-Aware Rebalancing
-                        n_pos = (y == 1).sum().float()
-                        n_neg = (y == 0).sum().float()
-                        neg_weight_val = ((n_pos / (n_neg + 1e-6)).clamp(min=1.0)) * 8.0
-
-                        sample_weights = torch.ones_like(halting_logits)
-                        sample_weights[y == 0] = neg_weight_val.item()
-
-                        # 2. Halting Loss
-                        loss_halt = F.binary_cross_entropy_with_logits(
+                        # 1. FOCAL LOSS for Halting (Replaces Weighted BCE)
+                        # Alpha=0.25 is standard for detection/halting
+                        loss_halt = focal_loss(
                             halting_logits, 
                             is_correct, 
-                            weight=sample_weights
+                            alpha=0.25, 
+                            gamma=2.0
                         )
 
-                        # 3. Entropy Regularization
+                        # 2. Entropy Regularization
                         h = torch.sigmoid(halting_logits)
                         h_safe = h.clamp(min=1e-6, max=1.0 - 1e-6)
                         entropy_weight = 0.0025
                         h_entropy = -(h_safe * h_safe.log() + (1 - h_safe) * (1 - h_safe).log())
                         loss_entropy = -entropy_weight * h_entropy.mean()
 
-                        # 4. INNOVATION / DIVERSITY LOSS
-                        # saved_states: List[24] of [B, 64] -> Stack: [B, 24, 64]
+                        # 3. INNOVATION / DIVERSITY LOSS
                         h_stack = torch.stack(saved_states, dim=1)
-                        
-                        # Shift to compare t vs t-1. Prepend zeros for first step
                         h_prev = torch.cat([torch.zeros_like(h_stack[:, :1, :]), h_stack[:, :-1, :]], dim=1)
                         
-                        # A. Stagnation Penalty: Penalize high Cosine Similarity
+                        # A. Stagnation Penalty
                         cos_sim = F.cosine_similarity(h_stack, h_prev, dim=-1)
                         loss_diversity = F.relu(cos_sim - 0.9).mean() * 0.1
                         
-                        # B. Magnitude Penalty: Force change
+                        # B. Magnitude Penalty
                         delta_mag = torch.norm(h_stack - h_prev, p=2, dim=-1)
                         loss_innovation = F.relu(0.1 - delta_mag).mean() * 0.1
                         
@@ -439,7 +451,7 @@ if __name__ == "__main__":
         "d_ctrl": 1024,
         "transformer_layers": 4,
         "lr": 5e-4,
-        "batch_size": 64,
+        "batch_size": 32,
         "epochs": 5,
         "samples_per_shard": 39000
     }
