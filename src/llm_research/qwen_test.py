@@ -31,7 +31,7 @@ import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 FLAGS = {
-    "model_id": "Qwen/Qwen2.5-Coder-32B-Instruct",
+    "model_id": "Qwen/Qwen2.5-Coder-7B-Instruct",
     "max_new_tokens": 512,
 }
 
