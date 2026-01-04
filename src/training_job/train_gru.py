@@ -205,7 +205,7 @@ def train_loop(rank, flags):
         total_steps = 28 * flags["epochs"] * max(
             1, flags["samples_per_shard"] // flags["batch_size"]
         )
-        T_0 = max(1, total_steps // 6)
+        T_0 = max(1, total_steps // 4)
 
         scheduler = CosineAnnealingWarmRestarts(
             optimizer, T_0=T_0, T_mult=2, eta_min=1e-6
