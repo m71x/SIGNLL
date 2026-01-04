@@ -10,11 +10,11 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 # CONFIGURATION
 # =========================================================================
 FLAGS = {
+    # We can try the 32B model now since we have 200GB+ RAM space in /dev/shm
     "model_id": "Qwen/Qwen2.5-Coder-32B-Instruct",
     "max_new_tokens": 512,
     "temperature": 0.7,
     "top_p": 0.9,
-    # Prompts to run across the devices
     "prompts": [
         "write a python function to merge two sorted lists.",
         "explain the difference between tcp and udp.",
@@ -32,36 +32,38 @@ def run_inference(rank, flags):
     device = xm.xla_device()
     world_size = xm.xrt_world_size()
     
-    # 2. Load Tokenizer (CPU-side is fine for tokenization)
-    # We only need one process to print, but all need the object to encode
-    tokenizer = AutoTokenizer.from_pretrained(flags["model_id"], trust_remote_code=True)
+    # 2. Set Cache to /dev/shm (RAM Disk) to bypass full disk
+    # This gives us ~200GB of space for the download
+    ram_cache_dir = "/dev/shm/huggingface_cache"
+    os.makedirs(ram_cache_dir, exist_ok=True)
+    
+    # 3. Load Tokenizer
+    # We download to our custom RAM path
+    tokenizer = AutoTokenizer.from_pretrained(
+        flags["model_id"], 
+        trust_remote_code=True, 
+        cache_dir=ram_cache_dir
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 3. Load Model directly to TPU
-    # low_cpu_mem_usage=True keeps RAM usage low during loading
+    # 4. Load Model directly to TPU
     if rank == 0:
-        print(f"Loading {flags['model_id']} to TPU devices...")
+        print(f"Downloading {flags['model_id']} to RAM ({ram_cache_dir})...")
     
-    # We use bfloat16 for TPU efficiency
+    # Load model with cache_dir pointed to RAM
     model = AutoModelForCausalLM.from_pretrained(
         flags["model_id"],
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
-        device_map=None # Prevent auto-placement, we manually move to device
+        device_map=None,
+        cache_dir=ram_cache_dir
     ).to(device)
     
-    # Optional: Compile the model graph with a dummy input first to speed up subsequent runs
-    # (Skipped here for brevity, but recommended for production)
-
-    # 4. Distribute Prompts
-    # We slice the prompt list so each core gets a few (or one) to process
-    # If len(prompts) < world_size, some cores will stay idle or process duplicates
+    # 5. Distribute Prompts
     my_prompts = flags["prompts"][rank % len(flags["prompts"])]
     
-    # Format prompt with Qwen's specific template
-    # (System prompt + User prompt)
     messages = [
         {"role": "system", "content": "You are Qwen, a helpful coding assistant."},
         {"role": "user", "content": my_prompts}
@@ -72,7 +74,7 @@ def run_inference(rank, flags):
         add_generation_prompt=True
     )
 
-    # 5. Tokenize & Move to TPU
+    # 6. Tokenize & Move to TPU
     inputs = tokenizer(
         text_input, 
         return_tensors="pt", 
@@ -85,8 +87,7 @@ def run_inference(rank, flags):
     if rank == 0:
         print("Starting generation...")
 
-    # 6. Generate
-    # We wrap generation in torch.no_grad()
+    # 7. Generate
     with torch.no_grad():
         generated_ids = model.generate(
             input_ids,
@@ -99,17 +100,13 @@ def run_inference(rank, flags):
             pad_token_id=tokenizer.pad_token_id
         )
 
-    # 7. Decode and Print
-    # Move back to CPU for decoding
+    # 8. Decode and Print
     generated_ids_cpu = generated_ids.cpu()
-    
-    # We only slice off the input tokens to see just the response
     input_len = input_ids.shape[1]
     response_tokens = generated_ids_cpu[:, input_len:]
     response_text = tokenizer.batch_decode(response_tokens, skip_special_tokens=True)[0]
 
-    # Print results from each core securely
-    # We use a rendezvous to prevent print interleaving mess
+    # Print results safely
     for i in range(world_size):
         xm.rendezvous(f"print_turn_{i}")
         if rank == i:
@@ -128,5 +125,5 @@ def _mp_fn(rank, flags):
     run_inference(rank, flags)
 
 if __name__ == "__main__":
-    print("Launching Qwen2.5-Coder Inference on TPU Pod...")
+    print("Launching Qwen2.5-Coder (Using /dev/shm for storage)...")
     xmp.spawn(_mp_fn, args=(FLAGS,), start_method="fork")

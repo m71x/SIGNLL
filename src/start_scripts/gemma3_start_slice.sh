@@ -23,11 +23,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --project=${PROJECT_ID} \
     --worker=all \
     --command="git clone https://github.com/m71x/SIGNLL"
-#ssh into worker 2
-gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
-    --zone=${ZONE} \
-    --project=${PROJECT_ID} \
-    --worker=3
+
 #run inference
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
@@ -62,6 +58,15 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all \
   --command="sudo apt update && sudo apt upgrade -y"
 
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --worker=all \
+  --command="sudo apt clean"
+
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --worker=all \
+  --command="sudo journalctl --vacuum-time=3d"
 #run non-tmux job
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
@@ -75,7 +80,13 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --project=${PROJECT_ID} \
   --worker=all \
   --command="cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/training_job/train4.py"
-  
+
+#ssh into worker 2
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+    --zone=${ZONE} \
+    --project=${PROJECT_ID} \
+    --worker=1
+
 #pull changes from git repo
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
@@ -95,14 +106,14 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="tmux new -d -s signll_train 'cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/training_job/train_gru.py'"
+  --command="tmux new -d -s signll_train 'cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/llm_research/qwen_test.py'"
 
 #run eval (no tmux)
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/training_job/eval_gru.py"  
+  --command="cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/llm_research/qwen_test.py"  
 
 #clone xla onto all workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
