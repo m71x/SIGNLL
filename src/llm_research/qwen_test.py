@@ -7,123 +7,67 @@ from torch_xla.distributed.spmd import Mesh
 import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# =========================================================================
-# CONFIGURATION
-# =========================================================================
+# Use /dev/shm for RAM-based storage
+os.environ["HF_HOME"] = "/dev/shm/huggingface"
+
 FLAGS = {
     "model_id": "Qwen/Qwen2.5-Coder-32B-Instruct",
     "max_new_tokens": 512,
 }
 
 def run_inference():
-    # 1. Enable SPMD Mode
     xr.use_spmd()
-    
     device = xm.xla_device()
+    
+    # 32 TPU devices setup
     num_devices = xr.global_runtime_device_count()
-    
-    # 2. Setup Device Mesh (1D Mesh across all 32 devices)
-    mesh_shape = (num_devices,)
-    device_ids = np.array(range(num_devices))
-    mesh = Mesh(device_ids, mesh_shape, ('model',))
+    mesh = Mesh(np.array(range(num_devices)), (num_devices,), ('model',))
 
-    # 3. Load Tokenizer (Master downloads, others wait)
-    # Using a barrier ensures only rank 0 downloads/caches first.
+    # Barrier: Only master downloads to RAM, others wait
     if xm.is_master_ordinal():
-        tokenizer = AutoTokenizer.from_pretrained(FLAGS["model_id"], trust_remote_code=True)
+        print(f"Master downloading {FLAGS['model_id']} to RAM (/dev/shm)...")
+        AutoTokenizer.from_pretrained(FLAGS["model_id"], trust_remote_code=True)
+        AutoModelForCausalLM.from_pretrained(FLAGS["model_id"], torch_dtype=torch.bfloat16, trust_remote_code=True)
     
-    # Wait for master to finish downloading tokenizer
-    xm.rendezvous("tokenizer_download_complete")
-    
-    if not xm.is_master_ordinal():
-        # Others load from the cache populated by master
-        tokenizer = AutoTokenizer.from_pretrained(FLAGS["model_id"], trust_remote_code=True)
+    xm.rendezvous("download_done") # All workers wait here
 
-    # 4. Load Model (Optimized for Sharding)
-    if xm.is_master_ordinal():
-        print(f"Loading {FLAGS['model_id']} and sharding across {num_devices} devices...")
-
-    # We use a barrier again to ensure only master downloads the model weights to cache.
-    # This prevents 32 processes from hammering the HF Hub simultaneously.
-    if xm.is_master_ordinal():
-        _ = AutoModelForCausalLM.from_pretrained(
-            FLAGS["model_id"],
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            # We just want to trigger the download/cache here, not keep the object
-        )
-    xm.rendezvous("model_download_complete")
-
-    # 5. Define Sharding Rules
-    # We define the partition spec *before* fully loading to device if possible,
-    # or use the sharding_context to help distribute the load.
+    # Load from the RAM cache created by master
+    tokenizer = AutoTokenizer.from_pretrained(FLAGS["model_id"])
     
-    # NOTE: 'low_cpu_mem_usage=True' uses the 'accelerate' library backend to 
-    # load weights on CPU meta device -> materialize -> move to device.
-    # To shard *immediately* across TPUs without holding full model in CPU RAM,
-    # we can use the XLA SPMD sharding context.
-    
-    print(f"Process {xm.get_ordinal()} loading model...")
-    
-    # This context manager applies the sharding automatically as layers are initialized/moved
+    # Use sharding context to spread across all 32 TPUs during load
     with xs.sharding_context(mesh):
-        # We assume the model fits in CPU RAM or is handled by accelerate's offloading.
-        # Since we are using low_cpu_mem_usage=True, it loads meta tensors first.
         model = AutoModelForCausalLM.from_pretrained(
             FLAGS["model_id"],
             torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
-            trust_remote_code=True,
-            device_map=None # Important: Let XLA handle device placement
+            trust_remote_code=True
         )
 
-    # Manual Sharding Application (Reinforcement)
-    # Sometimes auto-sharding needs explicit hints for weights
+    # Explicitly shard large weight matrices row-wise across the 32-device mesh
     for name, param in model.named_parameters():
         if param.dim() >= 2:
-            xs.mark_sharding(param, mesh, (0, -1)) # Shard row-wise
+            xs.mark_sharding(param, mesh, (0, -1)) 
         else:
-            xs.mark_sharding(param, mesh, (None,)) # Replicate
+            xs.mark_sharding(param, mesh, (None,)) 
 
-    # Move to device (If not already handled by context)
     model = model.to(device)
 
-    # 6. Inference logic
+    # Inference
     prompt = "Write a high-performance C++ implementation of a thread pool."
-    
-    # Tokenize
     inputs = tokenizer(prompt, return_tensors="pt")
     input_ids = inputs.input_ids.to(device)
-    attention_mask = inputs.attention_mask.to(device)
     
-    # Mark sharding on inputs
-    # Input ID shape is [Batch, SeqLen]. We replicate or shard batch.
-    # Since batch=1, we usually replicate or shard dim 0 (if batch > 1).
-    # For text generation, replicating inputs across the model mesh is often safer 
-    # unless you are doing Data Parallelism. Here we are doing Tensor Parallelism (sharding weights).
-    xs.mark_sharding(input_ids, mesh, (None, None)) 
-    xs.mark_sharding(attention_mask, mesh, (None, None))
+    # Replicate input across all devices (Standard for Tensor Parallelism)
+    xs.mark_sharding(input_ids, mesh, (None, None))
 
     if xm.is_master_ordinal():
         print("Generating...")
 
     with torch.no_grad():
-        output = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=FLAGS["max_new_tokens"],
-            do_sample=True,
-            temperature=0.7
-        )
+        output = model.generate(input_ids=input_ids, max_new_tokens=FLAGS["max_new_tokens"])
 
-    # 7. Decode and Print (Master only)
-    # Gather output from device 0 (or all if sharded results)
-    # generated tokens are usually replicated in this setup
-    output_cpu = output.cpu()
-    
     if xm.is_master_ordinal():
-        response = tokenizer.decode(output_cpu[0], skip_special_tokens=True)
-        print(f"\nRESPONSE:\n{response}")
+        print(f"\nRESPONSE:\n{tokenizer.decode(output[0], skip_special_tokens=True)}")
 
 if __name__ == "__main__":
     os.environ["PJRT_DEVICE"] = "TPU"

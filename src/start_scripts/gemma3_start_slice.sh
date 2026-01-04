@@ -67,6 +67,17 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --worker=all \
   --command="sudo journalctl --vacuum-time=3d"
+
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --worker=all \
+  --command="sudo journalctl --vacuum-size=500M"
+
+#flush hugging face cache
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --worker=all \
+  --command="rm -rf ~/.cache/huggingface/*"
 #run non-tmux job
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
