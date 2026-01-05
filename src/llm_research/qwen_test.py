@@ -1,4 +1,19 @@
 import os
+
+CACHE_DIR = "/dev/shm/huggingface"
+
+os.environ["HF_HOME"] = CACHE_DIR
+os.environ["HF_HUB_CACHE"] = f"{CACHE_DIR}/hub"
+os.environ["TRANSFORMERS_CACHE"] = f"{CACHE_DIR}/transformers"
+os.environ["HF_DATASETS_CACHE"] = f"{CACHE_DIR}/datasets"
+
+os.environ["TMPDIR"] = CACHE_DIR
+os.environ["TEMP"] = CACHE_DIR
+os.environ["TMP"] = CACHE_DIR
+
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
 import shutil
 import warnings
 import torch
@@ -12,14 +27,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, StoppingCriteria, 
 # =========================================================================
 # CONFIGURATION
 # =========================================================================
-cache_dir = "/dev/shm/huggingface"
-os.makedirs(cache_dir, exist_ok=True)
-os.environ["HF_HOME"] = cache_dir
-os.environ["TMPDIR"] = cache_dir 
-os.environ["TEMP"] = cache_dir
-os.environ["HF_HUB_DISABLE_XET"] = "1"
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0" 
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 
 warnings.filterwarnings("ignore")
 
@@ -69,7 +77,7 @@ def run_inference():
     # LOADING PHASE
     # =========================================================================
     if xr.local_ordinal() == 0:
-        print(f"Loading model from {cache_dir}...")
+        print(f"Loading model from {CACHE_DIR}...")
     
     tokenizer = AutoTokenizer.from_pretrained(FLAGS["model_id"], trust_remote_code=True)
     
