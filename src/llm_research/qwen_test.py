@@ -4,29 +4,15 @@ import shutil
 # =========================================================================
 # CRITICAL CONFIGURATION (MUST BE BEFORE OTHER IMPORTS)
 # =========================================================================
-# 1. Use RAM disk for storage to avoid filling root disk
 cache_dir = "/dev/shm/huggingface"
-os.makedirs(cache_dir, exist_ok=True) # Create it immediately
-
+os.makedirs(cache_dir, exist_ok=True)
 os.environ["HF_HOME"] = cache_dir
-
-# 2. Redirect standard temp directory to RAM disk
-# Hugging Face extracts files to temp before moving them to cache. 
-# If this points to /tmp (on root), you will still run out of space.
 os.environ["TMPDIR"] = cache_dir 
 os.environ["TEMP"] = cache_dir
-
-# 3. Force standard HTTP download (Fixes "CAS service error")
-# This must be set before huggingface_hub is imported by transformers
 os.environ["HF_HUB_DISABLE_XET"] = "1"
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0" 
-
-# 4. Suppress warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-# =========================================================================
-# IMPORTS (Now safe to import)
-# =========================================================================
 import warnings
 import torch
 import torch_xla.core.xla_model as xm
@@ -43,57 +29,48 @@ FLAGS = {
     "max_new_tokens": 512,
 }
 
-def clean_failed_runs():
-    """Attempts to clean the cache directory if it exists to free up space."""
-    # Only Rank 0 on each physical VM should clean up
-    if xr.local_ordinal() == 0:
-        # NOTE: Be careful wiping the whole dir if we are now using it as TMPDIR
-        # Only wipe if you are sure you want a fresh start
-        pass 
-
 def run_inference():
-    # Initialize TPU environment
     xr.use_spmd()
     device = xm.xla_device()
     num_devices = xr.global_runtime_device_count()
-    
-    # Define the mesh for 32 chips
-    # We shard on the 'model' axis
     mesh = Mesh(np.array(range(num_devices)), (num_devices,), ('model',))
 
-    # Clean up previous failed runs
-    # clean_failed_runs() # Disabled to prevent wiping TMPDIR mid-run
     xm.rendezvous("cleanup_complete")
 
     # =========================================================================
-    # DOWNLOAD PHASE (One process per Host)
+    # DOWNLOAD PHASE
     # =========================================================================
     if xr.local_ordinal() == 0:
-        print(f"Host {xr.global_ordinal()}: Downloading {FLAGS['model_id']} to RAM ({cache_dir})...")
+        print(f"Host {xr.global_ordinal()}: Checking/Downloading model...")
         try:
+            # Load tokenizer to ensure it's cached
             AutoTokenizer.from_pretrained(FLAGS["model_id"], trust_remote_code=True)
+            # Load model to cache
             AutoModelForCausalLM.from_pretrained(
                 FLAGS["model_id"], 
                 torch_dtype=torch.bfloat16, 
                 trust_remote_code=True
             )
-            print(f"Host {xr.global_ordinal()}: Download complete.")
+            print(f"Host {xr.global_ordinal()}: Ready.")
         except Exception as e:
             print(f"Host {xr.global_ordinal()} Download Failed: {e}")
             raise e
     
-    # Sync: Wait for all hosts to finish downloading
     xm.rendezvous("download_done")
 
     # =========================================================================
-    # LOADING PHASE (All Processes)
+    # LOADING PHASE
     # =========================================================================
     if xr.local_ordinal() == 0:
         print(f"Loading model from {cache_dir}...")
     
     tokenizer = AutoTokenizer.from_pretrained(FLAGS["model_id"], trust_remote_code=True)
     
-    # Load model to CPU memory first (using low_cpu_mem_usage to avoid spikes)
+    # [FIX 1] Explicitly set padding token if missing
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    
     model = AutoModelForCausalLM.from_pretrained(
         FLAGS["model_id"],
         torch_dtype=torch.bfloat16,
@@ -101,40 +78,50 @@ def run_inference():
         trust_remote_code=True
     )
 
-    # Move to TPU device (Lazy execution starts here)
-    # XLA won't fully materialize the 32B parameters on HBM until we step or mark sharding
     model = model.to(device)
 
-    # Apply Sharding IMMEDIATELY
-    # This instructs the compiler to split the weights across the mesh
+    # Apply Sharding
     for name, param in model.named_parameters():
         if param.dim() >= 2:
-            # Shard the first dimension (usually output features) across the 32 devices
             xs.mark_sharding(param, mesh, (0, None)) 
         else:
-            # Replicate 1D tensors (biases/layer norms)
             xs.mark_sharding(param, mesh, (None,)) 
 
     # =========================================================================
     # INFERENCE PHASE
     # =========================================================================
     prompt = "Write a high-performance C++ implementation of a thread pool."
-    inputs = tokenizer(prompt, return_tensors="pt")
-    input_ids = inputs.input_ids.to(device)
     
-    # Replicate input across all devices (Tensor Parallelism requirement)
+    # [FIX 2] Create inputs with explicit padding and attention mask
+    inputs = tokenizer(
+        prompt, 
+        return_tensors="pt", 
+        padding=True,       # Ensure consistent shape
+        truncation=True
+    )
+    
+    input_ids = inputs.input_ids.to(device)
+    attention_mask = inputs.attention_mask.to(device)
+    
+    # Replicate both input_ids and attention_mask
     xs.mark_sharding(input_ids, mesh, (None, None))
+    xs.mark_sharding(attention_mask, mesh, (None, None))
 
     if xr.global_ordinal() == 0:
         print("Generating...")
 
     with torch.no_grad():
+        # [FIX 3] Pass attention_mask and explicit eos_token_id
         output = model.generate(
-            input_ids=input_ids, 
-            max_new_tokens=FLAGS["max_new_tokens"]
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=FLAGS["max_new_tokens"],
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            do_sample=True,      # Optional: adds variety
+            temperature=0.7      # Optional: controls creativity
         )
 
-    # Gather and print (Master only)
     output_cpu = output.cpu()
     if xr.global_ordinal() == 0:
         print(f"\nRESPONSE:\n{tokenizer.decode(output_cpu[0], skip_special_tokens=True)}")
