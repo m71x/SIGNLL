@@ -103,12 +103,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --project=${PROJECT_ID} \
     --worker=0
 
-#pull changes from git repo
-gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
-  --zone=${ZONE} \
-  --project=${PROJECT_ID} \
-  --worker=all \
-  --command="cd ~/SIGNLL && git fetch origin && git reset --hard origin/main"
+
 
 #kill on all workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -124,6 +119,12 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all \
   --command="tmux new -d -s signll_train 'cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/llm_research/qwen_test.py'"
 
+#pull changes from git repo
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="cd ~/SIGNLL && git fetch origin && git reset --hard origin/main"
 #run eval (no tmux)
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \

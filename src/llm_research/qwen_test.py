@@ -148,7 +148,7 @@ def run_inference():
     for step in range(FLAGS["max_new_tokens"]):
         with torch.no_grad():
             outputs = model(
-                input_ids=generated[:, -1:],
+                input_ids=generated,
                 attention_mask=attn,
             )
             logits = outputs.logits[:, -1, :]
