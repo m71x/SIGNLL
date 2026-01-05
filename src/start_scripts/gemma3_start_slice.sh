@@ -103,7 +103,11 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --project=${PROJECT_ID} \
     --worker=0
 
-
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html"
 
 #kill on all workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
