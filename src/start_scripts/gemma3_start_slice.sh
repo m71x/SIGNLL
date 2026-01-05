@@ -101,7 +101,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
-    --worker=1
+    --worker=0
 
 #pull changes from git repo
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -138,6 +138,10 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --worker=all \
     --command="git clone https://github.com/pytorch/xla.git"
 
+
+#unmount and remount to erase tmpfs
+sudo umount /dev/shm
+sudo mount -t tmpfs tmpfs /dev/shm
 
 #install transformers on all workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
