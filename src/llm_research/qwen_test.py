@@ -9,7 +9,7 @@ from transformers import AutoTokenizer, FlaxAutoModelForCausalLM
 # ----------------------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------------------
-MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
+MODEL_ID = "google/gemma-7b"
 MAX_NEW_TOKENS = 30
 
 # ----------------------------------------------------------------------

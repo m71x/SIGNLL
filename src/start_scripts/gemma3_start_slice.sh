@@ -109,6 +109,11 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all \
   --command="pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html"
 
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="pip install flax"
 #kill on all workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
@@ -135,6 +140,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --project=${PROJECT_ID} \
   --worker=all \
   --command="cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/llm_research/qwen_test.py"  
+
 
 #clone xla onto all workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
