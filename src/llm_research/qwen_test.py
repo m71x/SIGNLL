@@ -37,7 +37,7 @@ warnings.filterwarnings("ignore")
 # ============================================================================
 FLAGS = {
     "model_id": "Qwen/Qwen2.5-Coder-32B-Instruct",
-    "max_new_tokens": 1,   # start with 1, increase later
+    "max_new_tokens": 200,   # start with 1, increase later
 }
 
 # ============================================================================
