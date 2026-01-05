@@ -149,10 +149,10 @@ def run_inference():
         attention_mask=attention_mask,
         max_new_tokens=FLAGS["max_new_tokens"],
         pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
+        eos_token_id=None,  # <--- CRITICAL CHANGE
         do_sample=False, 
         use_cache=True,
-        stopping_criteria=StoppingCriteriaList() 
+        stopping_criteria=StoppingCriteriaList()
     )
 
     # Trigger execution
