@@ -37,7 +37,7 @@ warnings.filterwarnings("ignore")
 # ============================================================================
 FLAGS = {
     "model_id": "Qwen/Qwen2.5-Coder-32B-Instruct",
-    "max_new_tokens": 1,
+    "max_new_tokens": 1,   # start with 1, increase later
 }
 
 # ============================================================================
@@ -83,7 +83,6 @@ def run_inference():
         trust_remote_code=True,
     )
 
-    # Stable EOS
     eos_token_id = (
         tokenizer.eos_token_id[0]
         if isinstance(tokenizer.eos_token_id, list)
@@ -102,7 +101,7 @@ def run_inference():
         trust_remote_code=True,
     )
 
-    # CRITICAL: Disable all dynamic stopping logic
+    # Absolutely required on TPU
     model.generation_config.eos_token_id = None
     model.generation_config.use_cache = False
 
@@ -118,7 +117,7 @@ def run_inference():
             xs.mark_sharding(param, mesh, (None,))
 
     # =========================================================================
-    # INFERENCE (STATIC DECODE ONLY)
+    # INPUTS
     # =========================================================================
     prompt = "Write a high-performance C++ implementation of a thread pool."
 
@@ -130,37 +129,51 @@ def run_inference():
     )
 
     input_ids = inputs.input_ids.to(device)
-    attention_mask = inputs.attention_mask.to(device)
+
+    # 🔴 CRITICAL: force attention mask to int32 ONCE
+    attention_mask = inputs.attention_mask.to(torch.int32).to(device)
 
     xs.mark_sharding(input_ids, mesh, (None, None))
     xs.mark_sharding(attention_mask, mesh, (None, None))
 
+    # =========================================================================
+    # MANUAL TPU-SAFE DECODING LOOP
+    # =========================================================================
     if xr.global_ordinal() == 0:
-        print("Generating (TPU-safe static decoding)...")
+        print("Generating (manual TPU-safe loop)...")
 
-    with torch.no_grad():
-        output = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=FLAGS["max_new_tokens"],
-            pad_token_id=tokenizer.pad_token_id,
-            do_sample=True,
-            temperature=0.7,
+    generated = input_ids
+    attn = attention_mask
 
-            # TPU CRITICAL FLAGS
-            use_cache=False,
-            synced_gpus=False,
+    for step in range(FLAGS["max_new_tokens"]):
+        with torch.no_grad():
+            outputs = model(
+                input_ids=generated[:, -1:],
+                attention_mask=attn,
+            )
+            logits = outputs.logits[:, -1, :]
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+        generated = torch.cat([generated, next_token], dim=1)
+
+        # 🔴 CRITICAL: keep dtype/device identical
+        new_mask = torch.ones(
+            next_token.shape,
+            dtype=attn.dtype,
+            device=attn.device,
         )
+        attn = torch.cat([attn, new_mask], dim=1)
+
+        xm.mark_step()
+
+        if eos_token_id is not None:
+            if (next_token == eos_token_id).all():
+                break
 
     # =========================================================================
-    # POST-PROCESS (CPU EOS TRIM)
+    # OUTPUT
     # =========================================================================
-    output_cpu = output.cpu()
-
-    if eos_token_id is not None:
-        eos_pos = (output_cpu[0] == eos_token_id).nonzero(as_tuple=True)[0]
-        if len(eos_pos) > 0:
-            output_cpu = output_cpu[:, : eos_pos[0] + 1]
+    output_cpu = generated.cpu()
 
     if xr.global_ordinal() == 0:
         print("\nRESPONSE:\n")
