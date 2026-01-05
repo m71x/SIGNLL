@@ -1,5 +1,32 @@
 import os
 import shutil
+
+# =========================================================================
+# CRITICAL CONFIGURATION (MUST BE BEFORE OTHER IMPORTS)
+# =========================================================================
+# 1. Use RAM disk for storage to avoid filling root disk
+cache_dir = "/dev/shm/huggingface"
+os.makedirs(cache_dir, exist_ok=True) # Create it immediately
+
+os.environ["HF_HOME"] = cache_dir
+
+# 2. Redirect standard temp directory to RAM disk
+# Hugging Face extracts files to temp before moving them to cache. 
+# If this points to /tmp (on root), you will still run out of space.
+os.environ["TMPDIR"] = cache_dir 
+os.environ["TEMP"] = cache_dir
+
+# 3. Force standard HTTP download (Fixes "CAS service error")
+# This must be set before huggingface_hub is imported by transformers
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0" 
+
+# 4. Suppress warnings
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+# =========================================================================
+# IMPORTS (Now safe to import)
+# =========================================================================
 import warnings
 import torch
 import torch_xla.core.xla_model as xm
@@ -9,19 +36,6 @@ from torch_xla.distributed.spmd import Mesh
 import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# =========================================================================
-# CONFIGURATION
-# =========================================================================
-# 1. Force standard HTTP download (Fixes "CAS service error" / "IO Error")
-os.environ["HF_HUB_DISABLE_XET"] = "1"
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0" 
-
-# 2. Use RAM disk for storage to avoid filling root disk
-cache_dir = "/dev/shm/huggingface"
-os.environ["HF_HOME"] = cache_dir
-
-# 3. Suppress warnings
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 warnings.filterwarnings("ignore")
 
 FLAGS = {
@@ -33,11 +47,9 @@ def clean_failed_runs():
     """Attempts to clean the cache directory if it exists to free up space."""
     # Only Rank 0 on each physical VM should clean up
     if xr.local_ordinal() == 0:
-        if os.path.exists(cache_dir):
-            try:
-                shutil.rmtree(cache_dir)
-            except Exception:
-                pass
+        # NOTE: Be careful wiping the whole dir if we are now using it as TMPDIR
+        # Only wipe if you are sure you want a fresh start
+        pass 
 
 def run_inference():
     # Initialize TPU environment
@@ -50,7 +62,7 @@ def run_inference():
     mesh = Mesh(np.array(range(num_devices)), (num_devices,), ('model',))
 
     # Clean up previous failed runs
-    clean_failed_runs()
+    # clean_failed_runs() # Disabled to prevent wiping TMPDIR mid-run
     xm.rendezvous("cleanup_complete")
 
     # =========================================================================
@@ -82,7 +94,6 @@ def run_inference():
     tokenizer = AutoTokenizer.from_pretrained(FLAGS["model_id"], trust_remote_code=True)
     
     # Load model to CPU memory first (using low_cpu_mem_usage to avoid spikes)
-    # REMOVED: with xs.sharding_context(mesh): <-- This caused the error
     model = AutoModelForCausalLM.from_pretrained(
         FLAGS["model_id"],
         torch_dtype=torch.bfloat16,
