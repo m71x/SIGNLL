@@ -43,9 +43,7 @@ def run_inference():
     if xr.local_ordinal() == 0:
         print(f"Host {xr.global_ordinal()}: Checking/Downloading model...")
         try:
-            # Load tokenizer to ensure it's cached
             AutoTokenizer.from_pretrained(FLAGS["model_id"], trust_remote_code=True)
-            # Load model to cache
             AutoModelForCausalLM.from_pretrained(
                 FLAGS["model_id"], 
                 torch_dtype=torch.bfloat16, 
@@ -66,10 +64,20 @@ def run_inference():
     
     tokenizer = AutoTokenizer.from_pretrained(FLAGS["model_id"], trust_remote_code=True)
     
-    # [FIX 1] Explicitly set padding token if missing
+    # [FIX 1] Handle EOS Token List -> Single Int
+    # Qwen often has multiple EOS tokens (e.g., <|endoftext|>, <|im_end|>). 
+    # XLA crashes if we pass a list. We pick the first one (usually <|im_end|>)
+    if isinstance(tokenizer.eos_token_id, list):
+        # Pick the first one for stability
+        stable_eos_token_id = tokenizer.eos_token_id[0] 
+    else:
+        stable_eos_token_id = tokenizer.eos_token_id
+
+    # [FIX 2] Ensure Pad Token exists
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+        # If eos_token_id is a list, use the stable single int we found
+        tokenizer.pad_token_id = stable_eos_token_id
+        tokenizer.pad_token = tokenizer.decode(stable_eos_token_id)
     
     model = AutoModelForCausalLM.from_pretrained(
         FLAGS["model_id"],
@@ -92,11 +100,11 @@ def run_inference():
     # =========================================================================
     prompt = "Write a high-performance C++ implementation of a thread pool."
     
-    # [FIX 2] Create inputs with explicit padding and attention mask
+    # [FIX 3] Explicit Padding and Attention Mask
     inputs = tokenizer(
         prompt, 
         return_tensors="pt", 
-        padding=True,       # Ensure consistent shape
+        padding=True,       
         truncation=True
     )
     
@@ -108,18 +116,18 @@ def run_inference():
     xs.mark_sharding(attention_mask, mesh, (None, None))
 
     if xr.global_ordinal() == 0:
-        print("Generating...")
+        print(f"Generating with EOS ID: {stable_eos_token_id}...")
 
     with torch.no_grad():
-        # [FIX 3] Pass attention_mask and explicit eos_token_id
+        # [FIX 4] Pass the SINGLE INTEGER eos_token_id
         output = model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_new_tokens=FLAGS["max_new_tokens"],
             pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            do_sample=True,      # Optional: adds variety
-            temperature=0.7      # Optional: controls creativity
+            eos_token_id=stable_eos_token_id, # <--- Crucial Fix: Must be Int, not List
+            do_sample=True,
+            temperature=0.7
         )
 
     output_cpu = output.cpu()
