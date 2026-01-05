@@ -101,9 +101,11 @@ def run_inference():
         trust_remote_code=True,
     )
 
-    # 🔑 CRITICAL SETTINGS
-    model.generation_config.eos_token_id = None
-    model.generation_config.use_cache = True
+    # 🔑 CRITICAL OPTIMIZATION: Use Static Cache
+    # This prevents the "recompile-every-step" issue by allocating a fixed-size
+    # KV cache graph that XLA can optimize once.
+    model.generation_config.cache_implementation = "static"
+    model.generation_config.pad_token_id = tokenizer.pad_token_id
 
     model = model.to(device)
 
@@ -135,55 +137,31 @@ def run_inference():
     xs.mark_sharding(attention_mask, mesh, (None, None))
 
     # =========================================================================
-    # PREFILL (FULL PROMPT — ONCE)
+    # GENERATE (OPTIMIZED)
     # =========================================================================
     if xr.global_ordinal() == 0:
-        print("Prefill (building KV cache)...")
+        print("Compiling and Generating (Static Cache)...")
 
-    with torch.no_grad():
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=True,
-        )
+    # The first run will trigger one large compilation (which may take a moment),
+    # but subsequent tokens will generate rapidly without recompiling.
+    output_ids = model.generate(
+        input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=FLAGS["max_new_tokens"],
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        do_sample=False,  # Greedy decoding
+        use_cache=True
+    )
 
-    past_key_values = outputs.past_key_values
-    next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-
-    generated = torch.cat([input_ids, next_token], dim=1)
-
+    # Trigger execution
     xm.mark_step()
-
-    # =========================================================================
-    # CACHED DECODE LOOP (FAST)
-    # =========================================================================
-    if xr.global_ordinal() == 0:
-        print("Decoding with KV cache...")
-
-    for step in range(FLAGS["max_new_tokens"] - 1):
-        with torch.no_grad():
-            outputs = model(
-                input_ids=next_token,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
-
-            past_key_values = outputs.past_key_values
-            logits = outputs.logits[:, -1, :]
-            next_token = torch.argmax(logits, dim=-1, keepdim=True)
-
-        generated = torch.cat([generated, next_token], dim=1)
-
-        xm.mark_step()
-
-        if eos_token_id is not None:
-            if (next_token == eos_token_id).all():
-                break
 
     # =========================================================================
     # OUTPUT
     # =========================================================================
-    output_cpu = generated.cpu()
+    # Move to CPU for decoding
+    output_cpu = output_ids.cpu()
 
     if xr.global_ordinal() == 0:
         print("\nRESPONSE:\n")
