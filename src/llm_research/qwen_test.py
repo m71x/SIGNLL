@@ -1,8 +1,16 @@
 import os
 import shutil
+import warnings
+import torch
+import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
+import torch_xla.distributed.spmd as xs
+from torch_xla.distributed.spmd import Mesh
+import numpy as np
+from transformers import AutoTokenizer, AutoModelForCausalLM, StoppingCriteria, StoppingCriteriaList
 
 # =========================================================================
-# CRITICAL CONFIGURATION (MUST BE BEFORE OTHER IMPORTS)
+# CONFIGURATION
 # =========================================================================
 cache_dir = "/dev/shm/huggingface"
 os.makedirs(cache_dir, exist_ok=True)
@@ -13,21 +21,22 @@ os.environ["HF_HUB_DISABLE_XET"] = "1"
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0" 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-import warnings
-import torch
-import torch_xla.core.xla_model as xm
-import torch_xla.runtime as xr
-import torch_xla.distributed.spmd as xs
-from torch_xla.distributed.spmd import Mesh
-import numpy as np
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
 warnings.filterwarnings("ignore")
 
 FLAGS = {
     "model_id": "Qwen/Qwen2.5-Coder-32B-Instruct",
     "max_new_tokens": 512,
 }
+
+# [FIX] Custom Stopping Criteria for TPU
+# Bypasses torch.isin which crashes on XLA with type errors
+class TPUStoppingCriteria(StoppingCriteria):
+    def __init__(self, eos_token_id):
+        self.eos_token_id = eos_token_id
+
+    def __call__(self, input_ids, scores, **kwargs):
+        # Simple equality check is stable on XLA
+        return input_ids[:, -1] == self.eos_token_id
 
 def run_inference():
     xr.use_spmd()
@@ -64,18 +73,14 @@ def run_inference():
     
     tokenizer = AutoTokenizer.from_pretrained(FLAGS["model_id"], trust_remote_code=True)
     
-    # [FIX 1] Handle EOS Token List -> Single Int
-    # Qwen often has multiple EOS tokens (e.g., <|endoftext|>, <|im_end|>). 
-    # XLA crashes if we pass a list. We pick the first one (usually <|im_end|>)
+    # 1. Determine Stable EOS Token
     if isinstance(tokenizer.eos_token_id, list):
-        # Pick the first one for stability
-        stable_eos_token_id = tokenizer.eos_token_id[0] 
+        stable_eos_token_id = tokenizer.eos_token_id[0]
     else:
         stable_eos_token_id = tokenizer.eos_token_id
 
-    # [FIX 2] Ensure Pad Token exists
+    # 2. Fix Padding
     if tokenizer.pad_token is None:
-        # If eos_token_id is a list, use the stable single int we found
         tokenizer.pad_token_id = stable_eos_token_id
         tokenizer.pad_token = tokenizer.decode(stable_eos_token_id)
     
@@ -85,6 +90,10 @@ def run_inference():
         low_cpu_mem_usage=True,
         trust_remote_code=True
     )
+
+    # 3. Prevent Default EOS Logic (which uses torch.isin)
+    # We must clear this in the config so generate() doesn't auto-add the crashing criteria
+    model.generation_config.eos_token_id = None
 
     model = model.to(device)
 
@@ -100,7 +109,6 @@ def run_inference():
     # =========================================================================
     prompt = "Write a high-performance C++ implementation of a thread pool."
     
-    # [FIX 3] Explicit Padding and Attention Mask
     inputs = tokenizer(
         prompt, 
         return_tensors="pt", 
@@ -111,21 +119,25 @@ def run_inference():
     input_ids = inputs.input_ids.to(device)
     attention_mask = inputs.attention_mask.to(device)
     
-    # Replicate both input_ids and attention_mask
     xs.mark_sharding(input_ids, mesh, (None, None))
     xs.mark_sharding(attention_mask, mesh, (None, None))
 
+    # [FIX] Use Custom Criteria
+    tpu_stopping_criteria = StoppingCriteriaList([
+        TPUStoppingCriteria(stable_eos_token_id)
+    ])
+
     if xr.global_ordinal() == 0:
-        print(f"Generating with EOS ID: {stable_eos_token_id}...")
+        print(f"Generating with Custom TPU Criteria (EOS: {stable_eos_token_id})...")
 
     with torch.no_grad():
-        # [FIX 4] Pass the SINGLE INTEGER eos_token_id
         output = model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_new_tokens=FLAGS["max_new_tokens"],
             pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=stable_eos_token_id, # <--- Crucial Fix: Must be Int, not List
+            stopping_criteria=tpu_stopping_criteria, # <--- Use our custom class
+            # eos_token_id=None,                     # <--- Do NOT pass this (uses default crashing logic)
             do_sample=True,
             temperature=0.7
         )
