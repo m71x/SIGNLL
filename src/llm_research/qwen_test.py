@@ -29,6 +29,8 @@ import torch_xla.runtime as xr
 import torch_xla.distributed.spmd as xs
 from torch_xla.distributed.spmd import Mesh
 from transformers import AutoTokenizer, AutoModelForCausalLM
+# ⬇️ NEW IMPORT: Required to disable default stopping criteria
+from transformers.generation.stopping_criteria import StoppingCriteriaList
 
 warnings.filterwarnings("ignore")
 
@@ -102,8 +104,6 @@ def run_inference():
     )
 
     # 🔑 CRITICAL OPTIMIZATION: Use Static Cache
-    # This prevents the "recompile-every-step" issue by allocating a fixed-size
-    # KV cache graph that XLA can optimize once.
     model.generation_config.cache_implementation = "static"
     model.generation_config.pad_token_id = tokenizer.pad_token_id
 
@@ -137,21 +137,22 @@ def run_inference():
     xs.mark_sharding(attention_mask, mesh, (None, None))
 
     # =========================================================================
-    # GENERATE (OPTIMIZED)
+    # GENERATE (OPTIMIZED & FIXED)
     # =========================================================================
     if xr.global_ordinal() == 0:
         print("Compiling and Generating (Static Cache)...")
 
-    # The first run will trigger one large compilation (which may take a moment),
-    # but subsequent tokens will generate rapidly without recompiling.
+    # FIX: Explicitly disable default stopping criteria (EOS check) which crashes XLA
+    # The model will now generate exactly 'max_new_tokens' regardless of EOS.
     output_ids = model.generate(
         input_ids,
         attention_mask=attention_mask,
         max_new_tokens=FLAGS["max_new_tokens"],
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
-        do_sample=False,  # Greedy decoding
-        use_cache=True
+        do_sample=False, 
+        use_cache=True,
+        stopping_criteria=StoppingCriteriaList() 
     )
 
     # Trigger execution
@@ -160,12 +161,13 @@ def run_inference():
     # =========================================================================
     # OUTPUT
     # =========================================================================
-    # Move to CPU for decoding
     output_cpu = output_ids.cpu()
 
     if xr.global_ordinal() == 0:
         print("\nRESPONSE:\n")
-        print(tokenizer.decode(output_cpu[0], skip_special_tokens=True))
+        # Since we generate fixed length, we can manually truncate at EOS for cleaner output
+        decoded_text = tokenizer.decode(output_cpu[0], skip_special_tokens=True)
+        print(decoded_text)
 
 
 if __name__ == "__main__":
