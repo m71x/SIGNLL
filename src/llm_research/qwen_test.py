@@ -110,7 +110,7 @@ def run_inference():
     for name, param in model.named_parameters():
         if param.dim() >= 2:
             # Shard the first dimension (usually output features) across the 32 devices
-            xs.mark_sharding(param, mesh, (0, -1)) 
+            xs.mark_sharding(param, mesh, (0, None)) 
         else:
             # Replicate 1D tensors (biases/layer norms)
             xs.mark_sharding(param, mesh, (None,)) 
