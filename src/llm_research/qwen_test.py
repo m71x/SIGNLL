@@ -19,7 +19,7 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["PJRT_DEVICE"] = "TPU"
 
 # ============================================================================
-# IMPORTS (AFTER ENV VARS)
+# IMPORTS
 # ============================================================================
 import warnings
 import torch
@@ -37,7 +37,7 @@ warnings.filterwarnings("ignore")
 # ============================================================================
 FLAGS = {
     "model_id": "Qwen/Qwen2.5-Coder-32B-Instruct",
-    "max_new_tokens": 30,   # start with 1, increase later
+    "max_new_tokens": 30,
 }
 
 # ============================================================================
@@ -101,9 +101,9 @@ def run_inference():
         trust_remote_code=True,
     )
 
-    # Absolutely required on TPU
+    # 🔑 CRITICAL SETTINGS
     model.generation_config.eos_token_id = None
-    model.generation_config.use_cache = False
+    model.generation_config.use_cache = True
 
     model = model.to(device)
 
@@ -117,7 +117,7 @@ def run_inference():
             xs.mark_sharding(param, mesh, (None,))
 
     # =========================================================================
-    # INPUTS
+    # INPUT
     # =========================================================================
     prompt = "Write a high-performance C++ implementation of a thread pool."
 
@@ -129,40 +129,50 @@ def run_inference():
     )
 
     input_ids = inputs.input_ids.to(device)
-
-    # 🔴 CRITICAL: force attention mask to int32 ONCE
     attention_mask = inputs.attention_mask.to(torch.int32).to(device)
 
     xs.mark_sharding(input_ids, mesh, (None, None))
     xs.mark_sharding(attention_mask, mesh, (None, None))
 
     # =========================================================================
-    # MANUAL TPU-SAFE DECODING LOOP
+    # PREFILL (FULL PROMPT — ONCE)
     # =========================================================================
     if xr.global_ordinal() == 0:
-        print("Generating (manual TPU-safe loop)...")
+        print("Prefill (building KV cache)...")
 
-    generated = input_ids
-    attn = attention_mask
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+        )
 
-    for step in range(FLAGS["max_new_tokens"]):
+    past_key_values = outputs.past_key_values
+    next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+
+    generated = torch.cat([input_ids, next_token], dim=1)
+
+    xm.mark_step()
+
+    # =========================================================================
+    # CACHED DECODE LOOP (FAST)
+    # =========================================================================
+    if xr.global_ordinal() == 0:
+        print("Decoding with KV cache...")
+
+    for step in range(FLAGS["max_new_tokens"] - 1):
         with torch.no_grad():
             outputs = model(
-                input_ids=generated,
-                attention_mask=attn,
+                input_ids=next_token,
+                past_key_values=past_key_values,
+                use_cache=True,
             )
+
+            past_key_values = outputs.past_key_values
             logits = outputs.logits[:, -1, :]
             next_token = torch.argmax(logits, dim=-1, keepdim=True)
 
         generated = torch.cat([generated, next_token], dim=1)
-
-        # 🔴 CRITICAL: keep dtype/device identical
-        new_mask = torch.ones(
-            next_token.shape,
-            dtype=attn.dtype,
-            device=attn.device,
-        )
-        attn = torch.cat([attn, new_mask], dim=1)
 
         xm.mark_step()
 
