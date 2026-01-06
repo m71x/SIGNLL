@@ -38,13 +38,12 @@ from transformers import AutoTokenizer, GenerationConfig
 MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 MAX_NEW_TOKENS = 50
 
-# [FIX] TPU MESH CONFIGURATION (32 Chips)
-# Since Batch Size is 1, we CANNOT use FSDP/DP (Data Parallelism).
-# We shift to Model/Sequence Parallelism to use the chips.
-DP_SIZE = 1     # Must be 1 for single-batch inference
-FSDP_SIZE = 1   # Must be 1 for single-batch inference
-TP_SIZE = 8     # Tensor Parallel: 8 matches Qwen's 8 KV heads nicely
-SP_SIZE = 4     # Sequence Parallel: 4 fills the remaining chips (1*1*8*4=32)
+# TPU MESH CONFIGURATION (32 Chips)
+# Using Model/Sequence Parallelism for single-batch inference
+DP_SIZE = 1     
+FSDP_SIZE = 1   
+TP_SIZE = 8     # Tensor Parallel (Matches Qwen Heads)
+SP_SIZE = 4     # Sequence Parallel (Must divide Total Sequence Length)
 
 # ----------------------------------------------------------------------
 # 2. LOAD TOKENIZER
@@ -64,7 +63,6 @@ if tokenizer.pad_token is None:
 # ----------------------------------------------------------------------
 print(f"\nLoading Model with EasyDeL...")
 print(f"Mesh Configuration: DP={DP_SIZE}, FSDP={FSDP_SIZE}, TP={TP_SIZE}, SP={SP_SIZE}")
-print(f"Available devices: {len(jax.devices())}")
 
 # Load model with corrected sharding axes
 result = AutoEasyDeLModelForCausalLM.from_pretrained(
@@ -72,7 +70,7 @@ result = AutoEasyDeLModelForCausalLM.from_pretrained(
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
     precision=jax.lax.Precision.DEFAULT,
-    # [FIX] Mapping axes to our new mesh config
+    # Mapping axes to our new mesh config
     sharding_axis_dims=(DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE),
     sharding_axis_names=('dp', 'fsdp', 'tp', 'sp'), 
     partition_axis=PartitionAxis(),
@@ -94,7 +92,7 @@ else:
 print("✓ Model loaded and sharded successfully!")
 
 # ----------------------------------------------------------------------
-# 4. PREPARE INPUT (With Padding Fix)
+# 4. PREPARE INPUT (FIXED PADDING LOGIC)
 # ----------------------------------------------------------------------
 prompt = "Write a high-performance C++ implementation of a thread pool."
 
@@ -118,19 +116,26 @@ inputs = tokenizer(
 input_ids = inputs["input_ids"]
 attention_mask = inputs.get("attention_mask", jnp.ones_like(input_ids))
 
-# [FIX] PAD INPUTS TO MULTIPLE OF SP_SIZE
-# When using Sequence Parallelism (SP > 1), the input length must be divisible by SP_SIZE.
-seq_len = input_ids.shape[1]
-remainder = seq_len % SP_SIZE
+# [CRITICAL FIX] PAD BASED ON TOTAL LENGTH (Input + Output)
+# The Cache (KV memory) is allocated for Input + Max_New_Tokens.
+# This TOTAL length must be divisible by SP_SIZE (4).
+
+current_len = input_ids.shape[1]
+predicted_total_len = current_len + MAX_NEW_TOKENS
+remainder = predicted_total_len % SP_SIZE
 
 if remainder != 0:
     pad_amt = SP_SIZE - remainder
-    print(f"Padding input length {seq_len} by {pad_amt} tokens to satisfy SP={SP_SIZE}...")
+    print(f"Padding input (len {current_len}) by {pad_amt} tokens.")
+    print(f"  -> Old Total: {predicted_total_len}")
+    print(f"  -> New Total: {predicted_total_len + pad_amt} (Divisible by {SP_SIZE})")
     
+    # Create padding
     pad_ids = jnp.full((input_ids.shape[0], pad_amt), tokenizer.pad_token_id, dtype=input_ids.dtype)
     pad_mask = jnp.zeros((attention_mask.shape[0], pad_amt), dtype=attention_mask.dtype)
     
-    input_ids = jnp.concatenate([pad_ids, input_ids], axis=1) # Pad left usually better for generation
+    # Left padding is standard for generation
+    input_ids = jnp.concatenate([pad_ids, input_ids], axis=1)
     attention_mask = jnp.concatenate([pad_mask, attention_mask], axis=1)
 
 print(f"Final Input shape: {input_ids.shape}")
@@ -152,11 +157,11 @@ generation_config = GenerationConfig(
     bos_token_id=tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else None,
 )
 
-# Compatibility patch
+# Compatibility patch for transformers/EasyDeL
 if not hasattr(generation_config, 'forced_decoder_ids'):
     generation_config.forced_decoder_ids = None
 
-# [FIX] CREATE MESH
+# Create Mesh Context
 print("Creating JAX Mesh context...")
 device_mesh = mesh_utils.create_device_mesh((DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE))
 mesh = Mesh(device_mesh, axis_names=('dp', 'fsdp', 'tp', 'sp'))
@@ -164,7 +169,6 @@ mesh = Mesh(device_mesh, axis_names=('dp', 'fsdp', 'tp', 'sp'))
 print("Starting generation loop inside Mesh context...")
 
 with mesh:
-    # Compile and run generation
     outputs = model.generate(
         input_ids,
         attention_mask=attention_mask,
