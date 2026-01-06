@@ -78,7 +78,7 @@ result = AutoEasyDeLModelForCausalLM.from_pretrained(
         "max_sequence_length": 2048,  # EasyDeL often looks for this key specifically
         "gradient_checkpointing": "",
         "use_scan_mlp": False,
-    }
+    },
     config=config,  # [FIX] Pass the modified config here
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
