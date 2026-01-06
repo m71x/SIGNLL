@@ -61,7 +61,8 @@ tokenizer = AutoTokenizer.from_pretrained(
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-# Load Config and FORCE smaller context
+# [CRITICAL FIX] MANUALLY REDUCE CONTEXT WINDOW
+# The default is 128k, which causes OOM. We cap it to MAX_CONTEXT_LENGTH.
 config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True, cache_dir=CACHE_DIR)
 config.max_position_embeddings = MAX_CONTEXT_LENGTH
 config.sliding_window = None # Disable sliding window to simplify memory usage
@@ -73,12 +74,11 @@ print(f"✓ Forced max_position_embeddings to: {config.max_position_embeddings}"
 print(f"\nLoading Model with EasyDeL...")
 print(f"Mesh Configuration: DP={DP_SIZE}, FSDP={FSDP_SIZE}, TP={TP_SIZE}, SP={SP_SIZE}")
 
-# Load model with Explicit Input Shape
-# This input_shape argument is CRITICAL to prevent JAX from allocating the full 128k buffer.
+# [FIX] Removed 'input_shape' argument which caused the TypeError.
+# The 'config' object passed below is sufficient to control the memory allocation.
 result = AutoEasyDeLModelForCausalLM.from_pretrained(
     MODEL_ID,
-    config=config,
-    input_shape=(1, MAX_CONTEXT_LENGTH), # [FIX] Force static shape compilation
+    config=config,  # This tells EasyDeL to use our smaller context window
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
     precision=jax.lax.Precision.DEFAULT,
@@ -127,12 +127,7 @@ inputs = tokenizer(
 input_ids = inputs["input_ids"]
 attention_mask = inputs.get("attention_mask", jnp.ones_like(input_ids))
 
-# [FIX] PAD BASED ON TOTAL LENGTH
-# We pad so that (Input + Output) matches our fixed MAX_CONTEXT_LENGTH context window?
-# Actually, for SP=4 compatibility, we just need the CURRENT input to be divisible by 4.
-# But since we fixed the model shape to MAX_CONTEXT_LENGTH, we should pad appropriately.
-# For simplicity in this test, we just pad to be divisible by SP_SIZE.
-
+# Pad input for SP compatibility
 current_len = input_ids.shape[1]
 remainder = current_len % SP_SIZE
 
@@ -143,7 +138,6 @@ if remainder != 0:
     pad_ids = jnp.full((input_ids.shape[0], pad_amt), tokenizer.pad_token_id, dtype=input_ids.dtype)
     pad_mask = jnp.zeros((attention_mask.shape[0], pad_amt), dtype=attention_mask.dtype)
     
-    # Left padding
     input_ids = jnp.concatenate([pad_ids, input_ids], axis=1)
     attention_mask = jnp.concatenate([pad_mask, attention_mask], axis=1)
 
