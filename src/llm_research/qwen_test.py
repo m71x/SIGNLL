@@ -129,7 +129,7 @@ print("\n" + "="*80)
 print("GENERATING RESPONSE...")
 print("="*80)
 
-# Create a proper generation config
+# Create a proper generation config with all needed attributes
 from transformers import GenerationConfig
 
 generation_config = GenerationConfig(
@@ -143,6 +143,14 @@ generation_config = GenerationConfig(
     bos_token_id=tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else None,
 )
 
+# Add missing attributes that EasyDeL expects
+if not hasattr(generation_config, 'forced_decoder_ids'):
+    generation_config.forced_decoder_ids = None
+if not hasattr(generation_config, 'forced_bos_token_id'):
+    generation_config.forced_bos_token_id = None
+if not hasattr(generation_config, 'forced_eos_token_id'):
+    generation_config.forced_eos_token_id = None
+
 # Generate with the model
 try:
     outputs = model.generate(
@@ -151,13 +159,26 @@ try:
         generation_config=generation_config,
     )
 except Exception as e:
-    print(f"Generation with config failed: {e}")
-    print("Trying simpler generation...")
-    # Fallback to manual generation
-    outputs = model.generate(
-        input_ids,
-        max_new_tokens=MAX_NEW_TOKENS,
-    )
+    print(f"Generation with full config failed: {e}")
+    print("Trying simplest generation...")
+    # Fallback: use model's default generation config
+    try:
+        outputs = model.generate(
+            input_ids,
+            max_new_tokens=MAX_NEW_TOKENS,
+        )
+    except Exception as e2:
+        print(f"Simple generation also failed: {e2}")
+        print("Trying manual decoding loop...")
+        # Last resort: manual generation
+        current_ids = input_ids
+        for _ in range(MAX_NEW_TOKENS):
+            logits = model(current_ids).logits
+            next_token = jnp.argmax(logits[:, -1, :], axis=-1, keepdims=True)
+            current_ids = jnp.concatenate([current_ids, next_token], axis=1)
+            if next_token[0] == tokenizer.eos_token_id:
+                break
+        outputs = type('obj', (object,), {'sequences': current_ids})()
 
 # Extract generated sequences
 if hasattr(outputs, 'sequences'):
