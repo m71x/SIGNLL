@@ -39,10 +39,10 @@ MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 MAX_NEW_TOKENS = 50
 
 # TPU MESH CONFIGURATION (32 Chips)
-DP_SIZE = 1     
-FSDP_SIZE = 1   
-TP_SIZE = 8     # Tensor Parallel (Matches Qwen Heads)
-SP_SIZE = 4     # Sequence Parallel
+DP_SIZE = 1     # Data Parallel: 4 independent replicas
+FSDP_SIZE = 1   # Fully Sharded DP: Not needed here
+TP_SIZE = 32     # Tensor Parallel: Split model across 8 chips
+SP_SIZE = 1     # Sequence Parallel: DISABLED (Set to 1)
 
 # ----------------------------------------------------------------------
 # 2. LOAD TOKENIZER & CONFIG
