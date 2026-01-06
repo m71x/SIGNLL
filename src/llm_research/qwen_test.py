@@ -62,8 +62,8 @@ print(f"\nLoading Model with EasyDeL...")
 print(f"Mesh Configuration: FSDP={FSDP_SIZE}, TP={TP_SIZE}, SP={SP_SIZE}")
 print(f"Available devices: {len(jax.devices())}")
 
-# Load model and parameters with automatic sharding
-model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+# Load model with automatic sharding
+result = AutoEasyDeLModelForCausalLM.from_pretrained(
     MODEL_ID,
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
@@ -74,13 +74,23 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
     shard_attention_computation=True,
     trust_remote_code=True,
     cache_dir=CACHE_DIR,
+    auto_shard_params=True,  # Ensure automatic parameter sharding
     config_kwargs={
         "gradient_checkpointing": "",
         "use_scan_mlp": False,
     }
 )
 
+# Handle different return types
+if isinstance(result, tuple):
+    model, params = result
+else:
+    model = result
+    params = model.params if hasattr(model, 'params') else None
+
 print("✓ Model loaded and sharded successfully!")
+print(f"✓ Model type: {type(model)}")
+print(f"✓ Params available: {params is not None}")
 
 # ----------------------------------------------------------------------
 # 4. PREPARE INPUT
@@ -121,18 +131,33 @@ print("GENERATING RESPONSE...")
 print("="*80)
 
 # Generate with the model
-outputs = model.generate(
-    input_ids,
-    attention_mask=attention_mask,
-    params=params,
-    max_new_tokens=MAX_NEW_TOKENS,
-    temperature=0.7,
-    top_p=0.9,
-    top_k=50,
-    do_sample=True,
-    eos_token_id=tokenizer.eos_token_id,
-    pad_token_id=tokenizer.pad_token_id,
-)
+if params is not None:
+    # Use params separately if available
+    outputs = model.generate(
+        input_ids,
+        attention_mask=attention_mask,
+        params=params,
+        max_new_tokens=MAX_NEW_TOKENS,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=50,
+        do_sample=True,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    )
+else:
+    # Params are already in the model
+    outputs = model.generate(
+        input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=MAX_NEW_TOKENS,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=50,
+        do_sample=True,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    )
 
 # Extract generated sequences
 if hasattr(outputs, 'sequences'):
