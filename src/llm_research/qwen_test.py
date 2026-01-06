@@ -1,4 +1,26 @@
+# ============================================================================
+# MUST COME FIRST — ENVIRONMENT SETUP
+# ============================================================================
 import os
+
+CACHE_DIR = "/dev/shm/huggingface"
+
+os.environ["HF_HOME"] = CACHE_DIR
+os.environ["HF_HUB_CACHE"] = f"{CACHE_DIR}/hub"
+os.environ["TRANSFORMERS_CACHE"] = f"{CACHE_DIR}/transformers"
+os.environ["HF_DATASETS_CACHE"] = f"{CACHE_DIR}/datasets"
+
+os.environ["TMPDIR"] = CACHE_DIR
+os.environ["TEMP"] = CACHE_DIR
+os.environ["TMP"] = CACHE_DIR
+
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+os.environ["PJRT_DEVICE"] = "TPU"
+
+# ============================================================================
+# IMPORTS (AFTER ENV VARS)
+# ============================================================================
 import jax
 import jax.numpy as jnp
 from easydel import (
@@ -7,9 +29,6 @@ from easydel import (
     PartitionAxis,
 )
 from transformers import AutoTokenizer
-
-# Ensure TPU is used
-os.environ["PJRT_DEVICE"] = "TPU"
 
 # ----------------------------------------------------------------------
 # 1. CONFIGURATION
@@ -29,7 +48,8 @@ SP_SIZE = 1    # Sequence Parallelism
 print("Loading Tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(
     MODEL_ID, 
-    trust_remote_code=True
+    trust_remote_code=True,
+    cache_dir=CACHE_DIR
 )
 
 if tokenizer.pad_token is None:
@@ -55,6 +75,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
     input_shape=(1, 1),
     device=jax.devices()[0],
     trust_remote_code=True,
+    cache_dir=CACHE_DIR,
     config_kwargs={
         "gradient_checkpointing": "",
         "use_scan_mlp": False,
