@@ -35,7 +35,7 @@ from transformers import AutoTokenizer, GenerationConfig, AutoConfig
 # ----------------------------------------------------------------------
 # 1. CONFIGURATION
 # ----------------------------------------------------------------------
-MODEL_ID = "Qwen/Qwen2.5-Coder-7B-Instruct"
+MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 MAX_NEW_TOKENS = 1900
 
 # TPU MESH CONFIGURATION (32 Chips)
@@ -103,7 +103,7 @@ print("✓ Model loaded and sharded successfully!")
 # ----------------------------------------------------------------------
 # 4. PREPARE INPUT
 # ----------------------------------------------------------------------
-prompt = "Write a high-performance C++ implementation of a thread pool."
+prompt = "Write a python program that shows an example of the diamond problem in inheritance."
 
 if hasattr(tokenizer, "apply_chat_template"):
     messages = [{"role": "user", "content": prompt}]
