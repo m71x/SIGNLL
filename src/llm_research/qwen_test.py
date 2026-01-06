@@ -30,7 +30,7 @@ from easydel import (
     AutoEasyDeLModelForCausalLM,
     PartitionAxis,
 )
-from transformers import AutoTokenizer, GenerationConfig, AutoConfig # [FIX] Added AutoConfig
+from transformers import AutoTokenizer, GenerationConfig, AutoConfig
 
 # ----------------------------------------------------------------------
 # 1. CONFIGURATION
@@ -38,14 +38,19 @@ from transformers import AutoTokenizer, GenerationConfig, AutoConfig # [FIX] Add
 MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 MAX_NEW_TOKENS = 50
 
+# [CRITICAL] LIMIT CONTEXT WINDOW
+# We restrict the model to 2048 tokens to prevent OOM errors.
+# This saves memory by shrinking the Attention Mask from ~1GB to ~4MB.
+MAX_CONTEXT_LENGTH = 2048 
+
 # TPU MESH CONFIGURATION (32 Chips)
 DP_SIZE = 1     
 FSDP_SIZE = 1   
-TP_SIZE = 8     # Tensor Parallel (Matches Qwen Heads)
+TP_SIZE = 8     # Tensor Parallel
 SP_SIZE = 4     # Sequence Parallel
 
 # ----------------------------------------------------------------------
-# 2. LOAD TOKENIZER & CONFIG
+# 2. LOAD TOKENIZER & CONFIGURE MODEL
 # ----------------------------------------------------------------------
 print("Loading Tokenizer and Config...")
 tokenizer = AutoTokenizer.from_pretrained(
@@ -53,16 +58,14 @@ tokenizer = AutoTokenizer.from_pretrained(
     trust_remote_code=True,
     cache_dir=CACHE_DIR
 )
-
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-# [CRITICAL FIX] MANUALLY REDUCE CONTEXT WINDOW
-# The default is 128k (131072), which causes OOM on allocation.
-# We cap it to 4096 for this test to save memory.
+# Load Config and FORCE smaller context
 config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True, cache_dir=CACHE_DIR)
-config.max_position_embeddings = 4096 
-print(f"✓ Capped max_position_embeddings to: {config.max_position_embeddings}")
+config.max_position_embeddings = MAX_CONTEXT_LENGTH
+config.sliding_window = None # Disable sliding window to simplify memory usage
+print(f"✓ Forced max_position_embeddings to: {config.max_position_embeddings}")
 
 # ----------------------------------------------------------------------
 # 3. LOAD MODEL WITH EASYDEL
@@ -70,10 +73,12 @@ print(f"✓ Capped max_position_embeddings to: {config.max_position_embeddings}"
 print(f"\nLoading Model with EasyDeL...")
 print(f"Mesh Configuration: DP={DP_SIZE}, FSDP={FSDP_SIZE}, TP={TP_SIZE}, SP={SP_SIZE}")
 
-# Load model with corrected sharding axes AND modified config
+# Load model with Explicit Input Shape
+# This input_shape argument is CRITICAL to prevent JAX from allocating the full 128k buffer.
 result = AutoEasyDeLModelForCausalLM.from_pretrained(
     MODEL_ID,
-    config=config,  # [FIX] Pass the modified config here
+    config=config,
+    input_shape=(1, MAX_CONTEXT_LENGTH), # [FIX] Force static shape compilation
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
     precision=jax.lax.Precision.DEFAULT,
@@ -98,7 +103,7 @@ else:
 print("✓ Model loaded and sharded successfully!")
 
 # ----------------------------------------------------------------------
-# 4. PREPARE INPUT (With Padding Fix)
+# 4. PREPARE INPUT
 # ----------------------------------------------------------------------
 prompt = "Write a high-performance C++ implementation of a thread pool."
 
@@ -122,18 +127,23 @@ inputs = tokenizer(
 input_ids = inputs["input_ids"]
 attention_mask = inputs.get("attention_mask", jnp.ones_like(input_ids))
 
-# Pad based on TOTAL predicted length for SP compatibility
+# [FIX] PAD BASED ON TOTAL LENGTH
+# We pad so that (Input + Output) matches our fixed MAX_CONTEXT_LENGTH context window?
+# Actually, for SP=4 compatibility, we just need the CURRENT input to be divisible by 4.
+# But since we fixed the model shape to MAX_CONTEXT_LENGTH, we should pad appropriately.
+# For simplicity in this test, we just pad to be divisible by SP_SIZE.
+
 current_len = input_ids.shape[1]
-predicted_total_len = current_len + MAX_NEW_TOKENS
-remainder = predicted_total_len % SP_SIZE
+remainder = current_len % SP_SIZE
 
 if remainder != 0:
     pad_amt = SP_SIZE - remainder
-    print(f"Padding input (len {current_len}) by {pad_amt} tokens.")
+    print(f"Padding input (len {current_len}) by {pad_amt} tokens for SP compatibility.")
     
     pad_ids = jnp.full((input_ids.shape[0], pad_amt), tokenizer.pad_token_id, dtype=input_ids.dtype)
     pad_mask = jnp.zeros((attention_mask.shape[0], pad_amt), dtype=attention_mask.dtype)
     
+    # Left padding
     input_ids = jnp.concatenate([pad_ids, input_ids], axis=1)
     attention_mask = jnp.concatenate([pad_mask, attention_mask], axis=1)
 
