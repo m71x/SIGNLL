@@ -74,8 +74,8 @@ print(f"Mesh Configuration: DP={DP_SIZE}, FSDP={FSDP_SIZE}, TP={TP_SIZE}, SP={SP
 result = AutoEasyDeLModelForCausalLM.from_pretrained(
     MODEL_ID,
     config_kwargs={
-        "max_position_embeddings": 2048,
-        "max_sequence_length": 2048,  # EasyDeL often looks for this key specifically
+        "max_position_embeddings": 1024,
+        "max_sequence_length": 1024,  # EasyDeL often looks for this key specifically
         "gradient_checkpointing": "",
         "use_scan_mlp": False,
     },
