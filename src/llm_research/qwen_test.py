@@ -36,7 +36,7 @@ from transformers import AutoTokenizer, GenerationConfig, AutoConfig
 # 1. CONFIGURATION
 # ----------------------------------------------------------------------
 MODEL_ID = "Qwen/Qwen2.5-Coder-7B-Instruct"
-MAX_NEW_TOKENS = 2048
+MAX_NEW_TOKENS = 1900
 
 # TPU MESH CONFIGURATION (32 Chips)
 DP_SIZE = 1     # Data Parallel
