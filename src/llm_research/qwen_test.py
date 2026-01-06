@@ -18,85 +18,76 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 MAX_NEW_TOKENS = 30
 
-# TPU MESH CONFIGURATION (Targeting 32 Chips)
-# We use 8-way Tensor Parallelism (TP) to fit the huge weights
-# and 4-way Data Parallelism (DP) to utilize the remaining chips.
+# TPU MESH CONFIGURATION (Targeting 32 Chips / 64 TensorCores)
+# We use 8-way Tensor Parallelism (TP) to shard the 64GB weights.
+# 4-way Data Parallelism (DP) replicates that across the remaining chips.
 TP_SIZE = 8
 DP_SIZE = 4 
 
 # ----------------------------------------------------------------------
 # 2. SETUP DEVICE MESH
 # ----------------------------------------------------------------------
-# Create the mesh of devices (32 chips)
 devices = jax.devices()
 if len(devices) != TP_SIZE * DP_SIZE:
-    print(f"Warning: You have {len(devices)} devices, but configured mesh for {TP_SIZE*DP_SIZE}.")
-    # Fallback to creating a mesh that fits available devices if possible
-    
+    print(f"Warning: Found {len(devices)} devices, but configured for {TP_SIZE * DP_SIZE}.")
+
+# Mapping DP and TP to physical chips
 device_mesh = mesh_utils.create_device_mesh((DP_SIZE, TP_SIZE))
 mesh = Mesh(device_mesh, axis_names=('data', 'model'))
 
-print(f"Constructed Mesh: {mesh}")
+print(f"Constructed Mesh for 32 Chips: {mesh}")
 
 # ----------------------------------------------------------------------
-# 3. LOAD MODEL & TOKENIZER (CPU FIRST)
+# 3. LOAD MODEL & TOKENIZER (WITH WEIGHT CONVERSION)
 # ----------------------------------------------------------------------
 print("Loading Tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 
 print("Loading Configuration (Spoofing Llama)...")
-# FIX: Qwen2 is architecturally Llama. We swap the config type so Flax loads it.
 config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-config.model_type = "llama"
+config.model_type = "llama" # Architecturally compatible
 
-print("Loading Model to Host (CPU)...")
-# We load to CPU first to avoid OOM on a single TPU chip before sharding
+print("Loading and Converting Weights (PyTorch -> Flax)...")
+# FIX: Added from_pt=True to handle the absence of flax_model.msgpack
 model = FlaxLlamaForCausalLM.from_pretrained(
     MODEL_ID,
     config=config,
     dtype=jnp.bfloat16,
-    from_pt=True,
+    from_pt=True,           # <--- CRITICAL FIX
     trust_remote_code=True,
-    _do_init=False 
+    _do_init=False          # Skip random init to save memory
 )
 
 # ----------------------------------------------------------------------
-# 4. SHARDING RULES (CRITICAL FOR 32B)
+# 4. SHARDING RULES
 # ----------------------------------------------------------------------
-# This function maps parameter names to PartitionSpecs for 8-way Model Parallelism
 def get_sharding_rules(params):
     flat_params = flatten_dict(params)
     flat_sharding = {}
     
     for key, value in flat_params.items():
-        # Key is a tuple like ('model', 'layers', '0', 'self_attn', 'q_proj', 'kernel')
         name = key[-1]
         path = "/".join(key)
         
-        # Default: Replicate (None)
+        # Default: Replicate
         spec = P(None)
         
-        # Rule 1: Embeddings (Vocab Parallel)
+        # Vocab sharding
         if "embed_tokens" in path:
             spec = P(None, "model")
-            
-        # Rule 2: Attention Weights (Heads Parallel)
+        # Attention sharding (Heads)
         elif "self_attn" in path and "kernel" in name:
-            # Q, K, V projections: Split headers
             if any(x in path for x in ["q_proj", "k_proj", "v_proj"]):
                 spec = P(None, "model")
-            # Output projection: Split input dimension
             elif "o_proj" in path:
                 spec = P("model", None)
-                
-        # Rule 3: MLP (Tensor Parallel)
+        # MLP sharding
         elif "mlp" in path and "kernel" in name:
             if "gate_proj" in path or "up_proj" in path:
                 spec = P(None, "model")
             elif "down_proj" in path:
                 spec = P("model", None)
-                
-        # Rule 4: LM Head
+        # Output sharding
         elif "lm_head" in path and "kernel" in name:
             spec = P("model", None)
 
@@ -104,82 +95,48 @@ def get_sharding_rules(params):
         
     return unflatten_dict(flat_sharding)
 
-print("Sharding Model Parameters to TPUs...")
+print("Distributing 32B parameters across 32 TPU chips...")
 sharding_specs = get_sharding_rules(model.params)
-
-# Move parameters from CPU to TPU with the defined sharding layout
 model_params = jax.device_put(model.params, sharding_specs)
-
-# Free CPU memory
-model.params = None 
+model.params = None # Clear CPU shadow copy
 
 # ----------------------------------------------------------------------
-# 5. INPUT PROCESSING
+# 5. INFERENCE
 # ----------------------------------------------------------------------
 prompt = "Write a high-performance C++ implementation of a thread pool."
 inputs = tokenizer(prompt, return_tensors="np")
-input_ids_np = inputs["input_ids"]
 
-# Replicate input_ids across the 'data' axis
+# Shard input across Data Parallel axis
 input_sharding = NamedSharding(mesh, P('data', None))
-input_ids = jax.device_put(jnp.array(input_ids_np), input_sharding)
-
-# ----------------------------------------------------------------------
-# 6. INFERENCE FUNCTIONS (JIT COMPILED)
-# ----------------------------------------------------------------------
-
-# We bind the model params specifically to ensure JIT knows the layout
-def forward_fn(params, input_ids, past_key_values=None):
-    return model(
-        input_ids=input_ids,
-        past_key_values=past_key_values,
-        params=params,
-        use_cache=True,
-    )
+input_ids = jax.device_put(jnp.array(inputs["input_ids"]), input_sharding)
 
 @jax.jit
 def prefill(params, input_ids):
-    outputs = forward_fn(params, input_ids)
+    outputs = model(input_ids=input_ids, params=params, use_cache=True)
     next_token = jnp.argmax(outputs.logits[:, -1], axis=-1)
     return outputs.past_key_values, next_token
 
 @jax.jit
 def decode_step(carry, _):
     params, past_kv, token = carry
-    
-    outputs = forward_fn(params, token[:, None], past_kv)
+    outputs = model(input_ids=token[:, None], params=params, past_key_values=past_kv, use_cache=True)
     next_token = jnp.argmax(outputs.logits[:, -1], axis=-1)
-    
     return (params, outputs.past_key_values, next_token), next_token
 
-# ----------------------------------------------------------------------
-# 7. EXECUTION
-# ----------------------------------------------------------------------
-print("Running Prefill...")
+print("Running Inference...")
 past_kv, next_token = prefill(model_params, input_ids)
 
-print("Running Decode Loop...")
-# Scan requires carrying the params through if we want them available inside
-(final_params, final_kv, last_token), generated = jax.lax.scan(
+_, generated = jax.lax.scan(
     decode_step,
     (model_params, past_kv, next_token),
     xs=None,
-    length=MAX_NEW_TOKENS
+    length=MAX_NEW_TOKENS - 1
 )
 
 # ----------------------------------------------------------------------
-# 8. OUTPUT
+# 6. OUTPUT
 # ----------------------------------------------------------------------
-# Gather results back to CPU for decoding
-generated_cpu = np.array(generated)
-next_token_cpu = np.array(next_token)
-input_ids_cpu = np.array(input_ids)
-
-all_tokens = np.concatenate(
-    [input_ids_cpu, next_token_cpu[:, None], generated_cpu.T],
-    axis=1,
-)
-
+all_tokens = jnp.concatenate([input_ids, next_token[:, None], generated.T], axis=1)
 print("-" * 40)
-print(tokenizer.decode(all_tokens[0], skip_special_tokens=True))
+print(tokenizer.decode(np.array(all_tokens[0]), skip_special_tokens=True))
 print("-" * 40)
