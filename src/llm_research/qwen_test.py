@@ -73,6 +73,12 @@ print(f"Mesh Configuration: DP={DP_SIZE}, FSDP={FSDP_SIZE}, TP={TP_SIZE}, SP={SP
 # Load model with corrected sharding axes AND modified config
 result = AutoEasyDeLModelForCausalLM.from_pretrained(
     MODEL_ID,
+    config_kwargs={
+        "max_position_embeddings": 2048,
+        "max_sequence_length": 2048,  # EasyDeL often looks for this key specifically
+        "gradient_checkpointing": "",
+        "use_scan_mlp": False,
+    }
     config=config,  # [FIX] Pass the modified config here
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
@@ -83,10 +89,7 @@ result = AutoEasyDeLModelForCausalLM.from_pretrained(
     shard_attention_computation=True,
     trust_remote_code=True,
     cache_dir=CACHE_DIR,
-    config_kwargs={
-        "gradient_checkpointing": "",
-        "use_scan_mlp": False,
-    }
+    
 )
 
 if isinstance(result, tuple):
