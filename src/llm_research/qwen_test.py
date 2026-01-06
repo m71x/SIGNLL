@@ -23,6 +23,8 @@ os.environ["PJRT_DEVICE"] = "TPU"
 # ============================================================================
 import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh           # [FIX] Added import
+from jax.experimental import mesh_utils # [FIX] Added import
 from easydel import (
     AutoEasyDeLModelForCausalLM,
     EasyDeLState,
@@ -38,8 +40,8 @@ MAX_NEW_TOKENS = 30
 
 # TPU MESH CONFIGURATION (32 Chips)
 # Adjusting for better memory distribution: more FSDP, less TP
-FSDP_SIZE = 8  # Fully Sharded Data Parallel (increased)
-TP_SIZE = 4    # Tensor Parallelism (decreased)
+FSDP_SIZE = 8  # Fully Sharded Data Parallel
+TP_SIZE = 4    # Tensor Parallelism
 SP_SIZE = 1    # Sequence Parallelism
 
 # ----------------------------------------------------------------------
@@ -151,34 +153,48 @@ if not hasattr(generation_config, 'forced_bos_token_id'):
 if not hasattr(generation_config, 'forced_eos_token_id'):
     generation_config.forced_eos_token_id = None
 
-# Generate with the model
-try:
-    outputs = model.generate(
-        input_ids,
-        attention_mask=attention_mask,
-        generation_config=generation_config,
-    )
-except Exception as e:
-    print(f"Generation with full config failed: {e}")
-    print("Trying simplest generation...")
-    # Fallback: use model's default generation config
+
+# [FIX] CREATE MESH AND ENTER CONTEXT
+# We must define the physical mesh layout for the model to know 
+# where 'fsdp', 'tp', and 'sp' axes map to.
+print("Creating JAX Mesh context...")
+device_mesh = mesh_utils.create_device_mesh((FSDP_SIZE, TP_SIZE, SP_SIZE))
+mesh = Mesh(device_mesh, axis_names=('fsdp', 'tp', 'sp'))
+
+# [FIX] Wrap all generation logic inside the mesh context
+with mesh:
+    # Generate with the model
     try:
         outputs = model.generate(
             input_ids,
-            max_new_tokens=MAX_NEW_TOKENS,
+            attention_mask=attention_mask,
+            generation_config=generation_config,
         )
-    except Exception as e2:
-        print(f"Simple generation also failed: {e2}")
-        print("Trying manual decoding loop...")
-        # Last resort: manual generation
-        current_ids = input_ids
-        for _ in range(MAX_NEW_TOKENS):
-            logits = model(current_ids).logits
-            next_token = jnp.argmax(logits[:, -1, :], axis=-1, keepdims=True)
-            current_ids = jnp.concatenate([current_ids, next_token], axis=1)
-            if next_token[0] == tokenizer.eos_token_id:
-                break
-        outputs = type('obj', (object,), {'sequences': current_ids})()
+    except Exception as e:
+        print(f"Generation with full config failed: {e}")
+        print("Trying simplest generation...")
+        # Fallback: use model's default generation config
+        try:
+            outputs = model.generate(
+                input_ids,
+                max_new_tokens=MAX_NEW_TOKENS,
+            )
+        except Exception as e2:
+            print(f"Simple generation also failed: {e2}")
+            print("Trying manual decoding loop...")
+            
+            # Last resort: manual generation
+            # Note: This loop is slow on TPUs without jax.jit, 
+            # but we keep it simple here as a last resort.
+            current_ids = input_ids
+            for _ in range(MAX_NEW_TOKENS):
+                # We need to run model() inside the mesh context as well
+                logits = model(current_ids).logits
+                next_token = jnp.argmax(logits[:, -1, :], axis=-1, keepdims=True)
+                current_ids = jnp.concatenate([current_ids, next_token], axis=1)
+                if next_token[0] == tokenizer.eos_token_id:
+                    break
+            outputs = type('obj', (object,), {'sequences': current_ids})()
 
 # Extract generated sequences
 if hasattr(outputs, 'sequences'):
