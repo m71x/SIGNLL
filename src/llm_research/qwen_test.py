@@ -1,142 +1,178 @@
-import os
-import re
+# ============================================================
+# Qwen-2.5-Coder-32B EasyDeL TPU Script
+# ============================================================
 
-# Ensure TPU is used
+import os
 os.environ["PJRT_DEVICE"] = "TPU"
 
 import jax
 import jax.numpy as jnp
-import numpy as np
-from transformers import AutoTokenizer, AutoConfig, FlaxLlamaForCausalLM
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh
 from jax.experimental import mesh_utils
-from flax.traverse_util import flatten_dict, unflatten_dict
 
-# ----------------------------------------------------------------------
-# 1. CONFIGURATION
-# ----------------------------------------------------------------------
+from transformers import AutoTokenizer
+
+from easydel import (
+    AutoEasyDelConfig,
+    AutoEasyDelModelForCausalLM,
+    EasyDelTrainingArguments,
+    EasyDelTrainer
+)
+
+# ============================================================
+# 1. CONFIG
+# ============================================================
+
 MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
-MAX_NEW_TOKENS = 30
+DTYPE = jnp.bfloat16
 
-# TPU MESH CONFIGURATION (Targeting 32 Chips / 64 TensorCores)
-# We use 8-way Tensor Parallelism (TP) to shard the 64GB weights.
-# 4-way Data Parallelism (DP) replicates that across the remaining chips.
-TP_SIZE = 8
-DP_SIZE = 4 
+TP_SIZE = 8      # tensor parallel
+DP_SIZE = 4      # data parallel
+TOTAL_DEVICES = TP_SIZE * DP_SIZE
 
-# ----------------------------------------------------------------------
-# 2. SETUP DEVICE MESH
-# ----------------------------------------------------------------------
+MAX_SEQ_LEN = 4096
+MAX_NEW_TOKENS = 64
+
+# ============================================================
+# 2. TPU MESH
+# ============================================================
+
 devices = jax.devices()
-if len(devices) != TP_SIZE * DP_SIZE:
-    print(f"Warning: Found {len(devices)} devices, but configured for {TP_SIZE * DP_SIZE}.")
+assert len(devices) == TOTAL_DEVICES, (
+    f"Expected {TOTAL_DEVICES} TPU devices, got {len(devices)}"
+)
 
-# Mapping DP and TP to physical chips
-device_mesh = mesh_utils.create_device_mesh((DP_SIZE, TP_SIZE))
-mesh = Mesh(device_mesh, axis_names=('data', 'model'))
+mesh = Mesh(
+    mesh_utils.create_device_mesh((DP_SIZE, TP_SIZE)),
+    axis_names=("data", "model")
+)
 
-print(f"Constructed Mesh for 32 Chips: {mesh}")
+print(f"✅ TPU Mesh initialized: {mesh}")
 
-# ----------------------------------------------------------------------
-# 3. LOAD MODEL & TOKENIZER (WITH WEIGHT CONVERSION)
-# ----------------------------------------------------------------------
-print("Loading Tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+# ============================================================
+# 3. TOKENIZER
+# ============================================================
 
-print("Loading Configuration (Spoofing Llama)...")
-config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-config.model_type = "llama" # Architecturally compatible
-
-print("Loading and Converting Weights (PyTorch -> Flax)...")
-# FIX: Added from_pt=True to handle the absence of flax_model.msgpack
-model = FlaxLlamaForCausalLM.from_pretrained(
+tokenizer = AutoTokenizer.from_pretrained(
     MODEL_ID,
-    config=config,
-    dtype=jnp.bfloat16,
-    from_pt=True,           # <--- CRITICAL FIX
+    trust_remote_code=True
+)
+
+tokenizer.pad_token = tokenizer.eos_token
+
+# ============================================================
+# 4. LOAD QWEN 2.5 MODEL (JAX / TPU)
+# ============================================================
+
+config = AutoEasyDelConfig.from_pretrained(
+    MODEL_ID,
+    dtype=DTYPE,
     trust_remote_code=True,
-    _do_init=False          # Skip random init to save memory
+    max_position_embeddings=MAX_SEQ_LEN
 )
 
-# ----------------------------------------------------------------------
-# 4. SHARDING RULES
-# ----------------------------------------------------------------------
-def get_sharding_rules(params):
-    flat_params = flatten_dict(params)
-    flat_sharding = {}
-    
-    for key, value in flat_params.items():
-        name = key[-1]
-        path = "/".join(key)
-        
-        # Default: Replicate
-        spec = P(None)
-        
-        # Vocab sharding
-        if "embed_tokens" in path:
-            spec = P(None, "model")
-        # Attention sharding (Heads)
-        elif "self_attn" in path and "kernel" in name:
-            if any(x in path for x in ["q_proj", "k_proj", "v_proj"]):
-                spec = P(None, "model")
-            elif "o_proj" in path:
-                spec = P("model", None)
-        # MLP sharding
-        elif "mlp" in path and "kernel" in name:
-            if "gate_proj" in path or "up_proj" in path:
-                spec = P(None, "model")
-            elif "down_proj" in path:
-                spec = P("model", None)
-        # Output sharding
-        elif "lm_head" in path and "kernel" in name:
-            spec = P("model", None)
+with mesh:
+    model = AutoEasyDelModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        config=config,
+        shard_parameters=True,      # <<< CRITICAL
+        trust_remote_code=True
+    )
 
-        flat_sharding[key] = NamedSharding(mesh, spec)
-        
-    return unflatten_dict(flat_sharding)
+print("✅ Qwen-2.5-Coder-32B loaded & sharded")
 
-print("Distributing 32B parameters across 32 TPU chips...")
-sharding_specs = get_sharding_rules(model.params)
-model_params = jax.device_put(model.params, sharding_specs)
-model.params = None # Clear CPU shadow copy
-
-# ----------------------------------------------------------------------
-# 5. INFERENCE
-# ----------------------------------------------------------------------
-prompt = "Write a high-performance C++ implementation of a thread pool."
-inputs = tokenizer(prompt, return_tensors="np")
-
-# Shard input across Data Parallel axis
-input_sharding = NamedSharding(mesh, P('data', None))
-input_ids = jax.device_put(jnp.array(inputs["input_ids"]), input_sharding)
+# ============================================================
+# 5. LOGIT-ACCESS FORWARD (RESEARCH SAFE)
+# ============================================================
 
 @jax.jit
-def prefill(params, input_ids):
-    outputs = model(input_ids=input_ids, params=params, use_cache=True)
-    next_token = jnp.argmax(outputs.logits[:, -1], axis=-1)
-    return outputs.past_key_values, next_token
+def forward_with_logits(params, input_ids, attention_mask):
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        params=params,
+        deterministic=True,
+        output_hidden_states=True
+    )
+    return outputs.logits, outputs.hidden_states
 
-@jax.jit
-def decode_step(carry, _):
-    params, past_kv, token = carry
-    outputs = model(input_ids=token[:, None], params=params, past_key_values=past_kv, use_cache=True)
-    next_token = jnp.argmax(outputs.logits[:, -1], axis=-1)
-    return (params, outputs.past_key_values, next_token), next_token
+# ============================================================
+# 6. INFERENCE DEMO
+# ============================================================
 
-print("Running Inference...")
-past_kv, next_token = prefill(model_params, input_ids)
+prompt = "Write a high-performance C++ thread pool."
 
-_, generated = jax.lax.scan(
-    decode_step,
-    (model_params, past_kv, next_token),
-    xs=None,
-    length=MAX_NEW_TOKENS - 1
+inputs = tokenizer(
+    prompt,
+    return_tensors="np",
+    padding="max_length",
+    max_length=512,
+    truncation=True
 )
 
-# ----------------------------------------------------------------------
-# 6. OUTPUT
-# ----------------------------------------------------------------------
-all_tokens = jnp.concatenate([input_ids, next_token[:, None], generated.T], axis=1)
-print("-" * 40)
-print(tokenizer.decode(np.array(all_tokens[0]), skip_special_tokens=True))
-print("-" * 40)
+input_ids = jnp.array(inputs["input_ids"])
+attention_mask = jnp.array(inputs["attention_mask"])
+
+logits, hidden_states = forward_with_logits(
+    model.params,
+    input_ids,
+    attention_mask
+)
+
+next_token = jnp.argmax(logits[:, -1], axis=-1)
+decoded = tokenizer.decode(next_token.tolist())
+
+print("\n--- Inference Test ---")
+print(decoded)
+print("----------------------")
+
+# ============================================================
+# 7. FINE-TUNING SETUP (LoRA or Full FT)
+# ============================================================
+
+training_args = EasyDelTrainingArguments(
+    output_dir="./qwen25_32b_ckpts",
+    num_train_epochs=1,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=16,
+    learning_rate=2e-5,
+    bf16=True,
+    logging_steps=10,
+    save_steps=500,
+    max_steps=1000,
+    mesh=mesh,
+    optimizer="adamw",
+    gradient_checkpointing=True,
+    max_sequence_length=MAX_SEQ_LEN,
+)
+
+# Example dataset placeholder
+# Must return dict with input_ids, attention_mask, labels
+train_dataset = None  # <-- plug your dataset here
+
+trainer = EasyDelTrainer(
+    model=model,
+    args=training_args,
+    tokenizer=tokenizer,
+    train_dataset=train_dataset,
+)
+
+# trainer.train()   # <-- uncomment to train
+
+# ============================================================
+# 8. CUSTOM LOGIT MODIFICATION EXAMPLE
+# ============================================================
+
+def apply_logit_penalty(logits):
+    penalty = jnp.where(logits < -10.0, -5.0, 0.0)
+    return logits + penalty
+
+@jax.jit
+def forward_with_custom_logits(params, input_ids, attention_mask):
+    logits, hidden_states = forward_with_logits(
+        params, input_ids, attention_mask
+    )
+    logits = apply_logit_penalty(logits)
+    return logits, hidden_states
+
+print("✅ Ready for fine-tuning & research")

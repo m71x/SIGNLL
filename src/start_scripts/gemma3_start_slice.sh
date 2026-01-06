@@ -114,6 +114,12 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --project=${PROJECT_ID} \
   --worker=all \
   --command="pip install flax"
+
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="pip install easydel"
 #kill on all workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
