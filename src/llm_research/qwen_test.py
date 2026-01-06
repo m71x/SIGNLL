@@ -130,33 +130,18 @@ print("GENERATING RESPONSE...")
 print("="*80)
 
 # Generate with the model
-if params is not None:
-    # Use params separately if available
-    outputs = model.generate(
-        input_ids,
-        attention_mask=attention_mask,
-        params=params,
-        max_new_tokens=MAX_NEW_TOKENS,
-        temperature=0.7,
-        top_p=0.9,
-        top_k=50,
-        do_sample=True,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-    )
-else:
-    # Params are already in the model
-    outputs = model.generate(
-        input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=MAX_NEW_TOKENS,
-        temperature=0.7,
-        top_p=0.9,
-        top_k=50,
-        do_sample=True,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-    )
+# EasyDeL models have params embedded, don't pass them separately
+outputs = model.generate(
+    input_ids,
+    attention_mask=attention_mask,
+    max_new_tokens=MAX_NEW_TOKENS,
+    temperature=0.7,
+    top_p=0.9,
+    top_k=50,
+    do_sample=True,
+    eos_token_id=tokenizer.eos_token_id,
+    pad_token_id=tokenizer.pad_token_id,
+)
 
 # Extract generated sequences
 if hasattr(outputs, 'sequences'):
