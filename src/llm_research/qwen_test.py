@@ -160,6 +160,10 @@ generation_config = GenerationConfig(
     pad_token_id=tokenizer.pad_token_id,
 )
 
+if not hasattr(generation_config, "forced_decoder_ids"):
+    generation_config.forced_decoder_ids = None
+
+
 print("Starting generation...")
 with mesh:
     outputs = model.generate(
