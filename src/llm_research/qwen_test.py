@@ -30,7 +30,7 @@ from easydel import (
     AutoEasyDeLModelForCausalLM,
     PartitionAxis,
 )
-from transformers import AutoTokenizer, GenerationConfig, AutoConfig
+from transformers import AutoTokenizer, GenerationConfig, AutoConfig # [FIX] Added AutoConfig
 
 # ----------------------------------------------------------------------
 # 1. CONFIGURATION
@@ -38,19 +38,14 @@ from transformers import AutoTokenizer, GenerationConfig, AutoConfig
 MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 MAX_NEW_TOKENS = 50
 
-# [CRITICAL] LIMIT CONTEXT WINDOW
-# We restrict the model to 2048 tokens to prevent OOM errors.
-# This saves memory by shrinking the Attention Mask from ~1GB to ~4MB.
-MAX_CONTEXT_LENGTH = 2048 
-
 # TPU MESH CONFIGURATION (32 Chips)
 DP_SIZE = 1     
 FSDP_SIZE = 1   
-TP_SIZE = 8     # Tensor Parallel
+TP_SIZE = 8     # Tensor Parallel (Matches Qwen Heads)
 SP_SIZE = 4     # Sequence Parallel
 
 # ----------------------------------------------------------------------
-# 2. LOAD TOKENIZER & CONFIGURE MODEL
+# 2. LOAD TOKENIZER & CONFIG
 # ----------------------------------------------------------------------
 print("Loading Tokenizer and Config...")
 tokenizer = AutoTokenizer.from_pretrained(
@@ -58,15 +53,16 @@ tokenizer = AutoTokenizer.from_pretrained(
     trust_remote_code=True,
     cache_dir=CACHE_DIR
 )
+
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
 # [CRITICAL FIX] MANUALLY REDUCE CONTEXT WINDOW
-# The default is 128k, which causes OOM. We cap it to MAX_CONTEXT_LENGTH.
+# The default is 128k (131072), which causes OOM on allocation.
+# We cap it to 4096 for this test to save memory.
 config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True, cache_dir=CACHE_DIR)
-config.max_position_embeddings = MAX_CONTEXT_LENGTH
-config.sliding_window = None # Disable sliding window to simplify memory usage
-print(f"✓ Forced max_position_embeddings to: {config.max_position_embeddings}")
+config.max_position_embeddings = 2048 
+print(f"✓ Capped max_position_embeddings to: {config.max_position_embeddings}")
 
 # ----------------------------------------------------------------------
 # 3. LOAD MODEL WITH EASYDEL
@@ -74,11 +70,10 @@ print(f"✓ Forced max_position_embeddings to: {config.max_position_embeddings}"
 print(f"\nLoading Model with EasyDeL...")
 print(f"Mesh Configuration: DP={DP_SIZE}, FSDP={FSDP_SIZE}, TP={TP_SIZE}, SP={SP_SIZE}")
 
-# [FIX] Removed 'input_shape' argument which caused the TypeError.
-# The 'config' object passed below is sufficient to control the memory allocation.
+# Load model with corrected sharding axes AND modified config
 result = AutoEasyDeLModelForCausalLM.from_pretrained(
     MODEL_ID,
-    config=config,  # This tells EasyDeL to use our smaller context window
+    config=config,  # [FIX] Pass the modified config here
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
     precision=jax.lax.Precision.DEFAULT,
@@ -103,7 +98,7 @@ else:
 print("✓ Model loaded and sharded successfully!")
 
 # ----------------------------------------------------------------------
-# 4. PREPARE INPUT
+# 4. PREPARE INPUT (With Padding Fix)
 # ----------------------------------------------------------------------
 prompt = "Write a high-performance C++ implementation of a thread pool."
 
@@ -127,13 +122,14 @@ inputs = tokenizer(
 input_ids = inputs["input_ids"]
 attention_mask = inputs.get("attention_mask", jnp.ones_like(input_ids))
 
-# Pad input for SP compatibility
+# Pad based on TOTAL predicted length for SP compatibility
 current_len = input_ids.shape[1]
-remainder = current_len % SP_SIZE
+predicted_total_len = current_len + MAX_NEW_TOKENS
+remainder = predicted_total_len % SP_SIZE
 
 if remainder != 0:
     pad_amt = SP_SIZE - remainder
-    print(f"Padding input (len {current_len}) by {pad_amt} tokens for SP compatibility.")
+    print(f"Padding input (len {current_len}) by {pad_amt} tokens.")
     
     pad_ids = jnp.full((input_ids.shape[0], pad_amt), tokenizer.pad_token_id, dtype=input_ids.dtype)
     pad_mask = jnp.zeros((attention_mask.shape[0], pad_amt), dtype=attention_mask.dtype)
