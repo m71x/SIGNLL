@@ -1,83 +1,31 @@
-import os
-os.environ["PJRT_DEVICE"] = "TPU"
-
 import jax
-import jax.numpy as jnp
 import numpy as np
-from transformers import AutoTokenizer, FlaxAutoModelForCausalLM
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.experimental import mesh_utils
 
-# ----------------------------------------------------------------------
-# CONFIG
-# ----------------------------------------------------------------------
-MODEL_ID = "google/gemma-7b"
-MAX_NEW_TOKENS = 30
+# 1. Detect your 32 chips (v4-64 has 32 chips / 64 TensorCores)
+devices = jax.devices()
+num_devices = len(devices) # Should be 32
 
-# ----------------------------------------------------------------------
-# LOAD TOKENIZER + MODEL
-# ----------------------------------------------------------------------
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+# 2. Define a 2D Logical Mesh
+# We use 4-way Data Parallelism and 8-way Model (Tensor) Parallelism
+# This matches the 32 physical chips (4 * 8 = 32)
+data_parallelism = 4
+model_parallelism = 8
 
-model = FlaxAutoModelForCausalLM.from_pretrained(
-    MODEL_ID,
-    dtype=jnp.bfloat16,
-    trust_remote_code=True,
-)
+device_mesh = mesh_utils.create_device_mesh((data_parallelism, model_parallelism))
+mesh = Mesh(device_mesh, axis_names=('data', 'model'))
 
-# ----------------------------------------------------------------------
-# INPUT
-# ----------------------------------------------------------------------
-prompt = "Write a high-performance C++ implementation of a thread pool."
+# 3. Define Sharding Rules
+# For model parameters: Shard the 'hidden' or 'output' dimension by 'model'
+# For inputs/activations: Shard the 'batch' dimension by 'data'
+param_sharding = NamedSharding(mesh, P(None, 'model'))
+data_sharding = NamedSharding(mesh, P('data', None))
 
-inputs = tokenizer(prompt, return_tensors="np")
-input_ids = jnp.array(inputs["input_ids"])
+# 4. Apply sharding to your Qwen model (using your earlier Flax setup)
+# This constraint ensures the model is distributed properly before execution
+def apply_sharding(model_state):
+    return jax.lax.with_sharding_constraint(model_state, param_sharding)
 
-# ----------------------------------------------------------------------
-# PREFILL
-# ----------------------------------------------------------------------
-def prefill(input_ids):
-    outputs = model(
-        input_ids=input_ids,
-        use_cache=True,
-        deterministic=True,
-    )
-    next_token = jnp.argmax(outputs.logits[:, -1], axis=-1)
-    return outputs.past_key_values, next_token
-
-past_kv, next_token = prefill(input_ids)
-
-# ----------------------------------------------------------------------
-# DECODE STEP (STATIC)
-# ----------------------------------------------------------------------
-def decode_step(carry, _):
-    past_kv, token = carry
-
-    outputs = model(
-        input_ids=token[:, None],
-        past_key_values=past_kv,
-        use_cache=True,
-        deterministic=True,
-    )
-
-    next_token = jnp.argmax(outputs.logits[:, -1], axis=-1)
-
-    return (outputs.past_key_values, next_token), next_token
-
-# ----------------------------------------------------------------------
-# COMPILED DECODE LOOP
-# ----------------------------------------------------------------------
-(past_kv, last_token), generated = jax.lax.scan(
-    decode_step,
-    (past_kv, next_token),
-    xs=None,
-    length=MAX_NEW_TOKENS - 1,
-)
-
-# ----------------------------------------------------------------------
-# OUTPUT
-# ----------------------------------------------------------------------
-all_tokens = jnp.concatenate(
-    [input_ids, next_token[:, None], generated.T],
-    axis=1,
-)
-
-print(tokenizer.decode(np.array(all_tokens[0]), skip_special_tokens=True))
+print(f"Mesh created: {mesh}")
+print(f"Sharding model 32B across {num_devices} chips...")
