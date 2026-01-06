@@ -33,12 +33,23 @@ from transformers import AutoTokenizer, GenerationConfig, AutoConfig
 # ============================================================================
 MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 MAX_NEW_TOKENS = 1900
-CONTEXT_LENGTH = 2048
+CONTEXT_LENGTH = 4096  # Increased to handle prompt + output safely
 
 DP_SIZE = 1
 FSDP_SIZE = 1
 TP_SIZE = 8
 SP_SIZE = 4
+
+# ============================================================================
+# 1. MESH & SHARDING (MOVED TO TOP)
+# ============================================================================
+# CRITICAL FIX: The mesh must be defined BEFORE loading the model so JAX
+# knows how to distribute the weights across the TPUs immediately.
+device_mesh = mesh_utils.create_device_mesh(
+    (DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE)
+)
+
+mesh = Mesh(device_mesh, axis_names=("dp", "fsdp", "tp", "sp"))
 
 # ============================================================================
 # TOKENIZER & CONFIG
@@ -61,26 +72,31 @@ config = AutoConfig.from_pretrained(
 config.max_position_embeddings = CONTEXT_LENGTH
 
 # ============================================================================
-# LOAD MODEL
+# 2. LOAD MODEL (WRAPPED IN MESH)
 # ============================================================================
-model = AutoEasyDeLModelForCausalLM.from_pretrained(
-    MODEL_ID,
-    config=config,
-    config_kwargs={
-        "max_position_embeddings": CONTEXT_LENGTH,
-        "max_sequence_length": CONTEXT_LENGTH,
-        "use_scan_mlp": False,
-    },
-    dtype=jnp.bfloat16,
-    param_dtype=jnp.bfloat16,
-    precision=jax.lax.Precision.DEFAULT,
-    sharding_axis_dims=(DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE),
-    sharding_axis_names=("dp", "fsdp", "tp", "sp"),
-    partition_axis=PartitionAxis(),
-    shard_attention_computation=True,
-    trust_remote_code=True,
-    cache_dir=CACHE_DIR,
-)
+print("Loading model...")
+# CRITICAL FIX: Wrap loading in 'with mesh:' to enable immediate sharding
+with mesh:
+    model = AutoEasyDeLModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        config=config,
+        config_kwargs={
+            "max_position_embeddings": CONTEXT_LENGTH,
+            "max_sequence_length": CONTEXT_LENGTH,
+            "use_scan_mlp": False,
+        },
+        dtype=jnp.bfloat16,
+        param_dtype=jnp.bfloat16,
+        precision=jax.lax.Precision.DEFAULT,
+        # Map model dimensions to the mesh axes defined above
+        sharding_axis_dims=(DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE),
+        sharding_axis_names=("dp", "fsdp", "tp", "sp"),
+        partition_axis=PartitionAxis(),
+        shard_attention_computation=True,
+        trust_remote_code=True,
+        cache_dir=CACHE_DIR,
+    )
+print("Model loaded and sharded successfully.")
 
 # ============================================================================
 # INPUT PREPARATION
@@ -103,9 +119,10 @@ inputs = tokenizer(
 input_ids = inputs["input_ids"]
 attention_mask = inputs.get("attention_mask", jnp.ones_like(input_ids))
 
-# Pad so total sequence length is divisible by SP_SIZE
-total_len = input_ids.shape[1] + MAX_NEW_TOKENS
-pad = (SP_SIZE - total_len % SP_SIZE) % SP_SIZE
+# Calculate padding so input length is divisible by SP_SIZE
+# (This ensures the input tensor can be evenly sharded across devices)
+current_len = input_ids.shape[1]
+pad = (SP_SIZE - current_len % SP_SIZE) % SP_SIZE
 
 if pad > 0:
     pad_ids = jnp.full(
@@ -121,15 +138,11 @@ if pad > 0:
     attention_mask = jnp.concatenate([pad_mask, attention_mask], axis=1)
 
 # ============================================================================
-# MESH & SHARDING  🔥 THIS IS THE CRITICAL FIX 🔥
+# SHARD INPUTS
 # ============================================================================
-device_mesh = mesh_utils.create_device_mesh(
-    (DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE)
-)
-
-mesh = Mesh(device_mesh, axis_names=("dp", "fsdp", "tp", "sp"))
-
-# Batch dimension replicated, SEQUENCE dimension sharded
+# Define how inputs should be split:
+# Batch dimension -> None (Replicated)
+# Sequence dimension -> "sp" (Sharded across 4 devices)
 input_sharding = NamedSharding(mesh, P(None, "sp"))
 
 input_ids = jax.device_put(input_ids, input_sharding)
@@ -147,6 +160,7 @@ generation_config = GenerationConfig(
     pad_token_id=tokenizer.pad_token_id,
 )
 
+print("Starting generation...")
 with mesh:
     outputs = model.generate(
         input_ids,
@@ -157,4 +171,5 @@ with mesh:
 output_ids = outputs.sequences if hasattr(outputs, "sequences") else outputs
 generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
+print("\n=== GENERATED TEXT ===\n")
 print(generated_text)
