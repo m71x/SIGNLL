@@ -89,6 +89,7 @@ with mesh:
             "max_position_embeddings": CONTEXT_LENGTH,
             "max_sequence_length": CONTEXT_LENGTH,
             "use_scan_mlp": False,
+            "torch_dtype": "bfloat16",  # Add this
         },
         dtype=jnp.bfloat16,
         param_dtype=jnp.bfloat16,
@@ -96,13 +97,38 @@ with mesh:
         # Map model dimensions to the mesh axes defined above
         sharding_axis_dims=(DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE),
         sharding_axis_names=("dp", "fsdp", "tp", "sp"),
-        partition_axis=PartitionAxis(),
+
+        partition_axis=PartitionAxis(batch_axis=("dp", "fsdp"),
+            query_sequence_axis="sp",
+            key_value_sequence_axis="sp", 
+            hidden_state_axis="tp",
+            head_axis="tp",
+            attention_head_axis="tp",
+            mlp_axis="tp",),
+
         shard_attention_computation=True,
         trust_remote_code=True,
         cache_dir=CACHE_DIR,
     )
 print("Model loaded and sharded successfully.")
 
+print("\n=== SHARDING VERIFICATION ===")
+for name, param in model.params.items():
+    if hasattr(param, 'sharding'):
+        print(f"{name}: {param.sharding}")
+    print(f"{name} shape: {param.shape if hasattr(param, 'shape') else 'N/A'}")
+
+print(f"\nPer-device memory estimate: {jax.local_device_count()} devices")
+
+print(f"\nJAX devices: {jax.device_count()}")
+print(f"Local devices: {jax.local_device_count()}")
+print(f"Memory per device: {jax.devices()[0].memory_stats()}")
+
+# Check actual parameter memory
+total_params = sum(p.size for p in jax.tree_util.tree_leaves(model.params))
+print(f"Total parameters: {total_params:,}")
+print(f"Expected memory (bf16): {total_params * 2 / 1e9:.2f} GB")
+print(f"Per device (TP=8): {total_params * 2 / 1e9 / 8:.2f} GB")
 # ============================================================================
 # INPUT PREPARATION
 # ============================================================================
@@ -163,6 +189,8 @@ generation_config = GenerationConfig(
     do_sample=True,
     eos_token_id=tokenizer.eos_token_id,
     pad_token_id=tokenizer.pad_token_id,
+    use_cache=True,  # Make sure KV cache is efficient
+    num_beams=1,  # Ensure greedy/sampling, not beam search
 )
 
 if not hasattr(generation_config, "forced_decoder_ids"):
