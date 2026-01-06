@@ -100,7 +100,7 @@ with mesh:
 
         partition_axis=PartitionAxis(batch_axis=("dp", "fsdp"),
             query_sequence_axis="sp",
-            key_value_sequence_axis="sp", 
+            
             hidden_state_axis="tp",
             head_axis="tp",
             attention_head_axis="tp",
