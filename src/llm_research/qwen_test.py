@@ -103,7 +103,7 @@ with mesh:
             
             hidden_state_axis="tp",
             head_axis="tp",
-            attention_head_axis="tp",
+            
             mlp_axis="tp",),
 
         shard_attention_computation=True,
