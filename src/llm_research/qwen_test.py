@@ -30,7 +30,7 @@ from easydel import (
     AutoEasyDeLModelForCausalLM,
     PartitionAxis,
 )
-from transformers import AutoTokenizer, GenerationConfig
+from transformers import AutoTokenizer, GenerationConfig, AutoConfig # [FIX] Added AutoConfig
 
 # ----------------------------------------------------------------------
 # 1. CONFIGURATION
@@ -39,16 +39,15 @@ MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 MAX_NEW_TOKENS = 50
 
 # TPU MESH CONFIGURATION (32 Chips)
-# Using Model/Sequence Parallelism for single-batch inference
 DP_SIZE = 1     
 FSDP_SIZE = 1   
 TP_SIZE = 8     # Tensor Parallel (Matches Qwen Heads)
-SP_SIZE = 4     # Sequence Parallel (Must divide Total Sequence Length)
+SP_SIZE = 4     # Sequence Parallel
 
 # ----------------------------------------------------------------------
-# 2. LOAD TOKENIZER
+# 2. LOAD TOKENIZER & CONFIG
 # ----------------------------------------------------------------------
-print("Loading Tokenizer...")
+print("Loading Tokenizer and Config...")
 tokenizer = AutoTokenizer.from_pretrained(
     MODEL_ID, 
     trust_remote_code=True,
@@ -58,19 +57,26 @@ tokenizer = AutoTokenizer.from_pretrained(
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
+# [CRITICAL FIX] MANUALLY REDUCE CONTEXT WINDOW
+# The default is 128k (131072), which causes OOM on allocation.
+# We cap it to 4096 for this test to save memory.
+config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True, cache_dir=CACHE_DIR)
+config.max_position_embeddings = 4096 
+print(f"✓ Capped max_position_embeddings to: {config.max_position_embeddings}")
+
 # ----------------------------------------------------------------------
 # 3. LOAD MODEL WITH EASYDEL
 # ----------------------------------------------------------------------
 print(f"\nLoading Model with EasyDeL...")
 print(f"Mesh Configuration: DP={DP_SIZE}, FSDP={FSDP_SIZE}, TP={TP_SIZE}, SP={SP_SIZE}")
 
-# Load model with corrected sharding axes
+# Load model with corrected sharding axes AND modified config
 result = AutoEasyDeLModelForCausalLM.from_pretrained(
     MODEL_ID,
+    config=config,  # [FIX] Pass the modified config here
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
     precision=jax.lax.Precision.DEFAULT,
-    # Mapping axes to our new mesh config
     sharding_axis_dims=(DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE),
     sharding_axis_names=('dp', 'fsdp', 'tp', 'sp'), 
     partition_axis=PartitionAxis(),
@@ -92,7 +98,7 @@ else:
 print("✓ Model loaded and sharded successfully!")
 
 # ----------------------------------------------------------------------
-# 4. PREPARE INPUT (FIXED PADDING LOGIC)
+# 4. PREPARE INPUT (With Padding Fix)
 # ----------------------------------------------------------------------
 prompt = "Write a high-performance C++ implementation of a thread pool."
 
@@ -116,10 +122,7 @@ inputs = tokenizer(
 input_ids = inputs["input_ids"]
 attention_mask = inputs.get("attention_mask", jnp.ones_like(input_ids))
 
-# [CRITICAL FIX] PAD BASED ON TOTAL LENGTH (Input + Output)
-# The Cache (KV memory) is allocated for Input + Max_New_Tokens.
-# This TOTAL length must be divisible by SP_SIZE (4).
-
+# Pad based on TOTAL predicted length for SP compatibility
 current_len = input_ids.shape[1]
 predicted_total_len = current_len + MAX_NEW_TOKENS
 remainder = predicted_total_len % SP_SIZE
@@ -127,14 +130,10 @@ remainder = predicted_total_len % SP_SIZE
 if remainder != 0:
     pad_amt = SP_SIZE - remainder
     print(f"Padding input (len {current_len}) by {pad_amt} tokens.")
-    print(f"  -> Old Total: {predicted_total_len}")
-    print(f"  -> New Total: {predicted_total_len + pad_amt} (Divisible by {SP_SIZE})")
     
-    # Create padding
     pad_ids = jnp.full((input_ids.shape[0], pad_amt), tokenizer.pad_token_id, dtype=input_ids.dtype)
     pad_mask = jnp.zeros((attention_mask.shape[0], pad_amt), dtype=attention_mask.dtype)
     
-    # Left padding is standard for generation
     input_ids = jnp.concatenate([pad_ids, input_ids], axis=1)
     attention_mask = jnp.concatenate([pad_mask, attention_mask], axis=1)
 
@@ -157,11 +156,9 @@ generation_config = GenerationConfig(
     bos_token_id=tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else None,
 )
 
-# Compatibility patch for transformers/EasyDeL
 if not hasattr(generation_config, 'forced_decoder_ids'):
     generation_config.forced_decoder_ids = None
 
-# Create Mesh Context
 print("Creating JAX Mesh context...")
 device_mesh = mesh_utils.create_device_mesh((DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE))
 mesh = Mesh(device_mesh, axis_names=('dp', 'fsdp', 'tp', 'sp'))
