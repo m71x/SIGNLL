@@ -98,13 +98,12 @@ with mesh:
         sharding_axis_dims=(DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE),
         sharding_axis_names=("dp", "fsdp", "tp", "sp"),
 
-        partition_axis=PartitionAxis(batch_axis=("dp", "fsdp"),
-            query_sequence_axis="sp",
-            
-            hidden_state_axis="tp",
-            head_axis="tp",
-            
-            mlp_axis="tp",),
+        partition_axis = PartitionAxis(
+            data_parallel_axis="dp",
+            fully_sharded_data_parallel_axis="fsdp", 
+            tensor_parallel_axis="tp",
+            sequence_parallel_axis="sp",
+        ),
 
         shard_attention_computation=True,
         trust_remote_code=True,
