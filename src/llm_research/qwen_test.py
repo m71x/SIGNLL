@@ -129,11 +129,10 @@ print("\n" + "="*80)
 print("GENERATING RESPONSE...")
 print("="*80)
 
-# Generate with the model
-# EasyDeL models have params embedded, don't pass them separately
-outputs = model.generate(
-    input_ids,
-    attention_mask=attention_mask,
+# Create a proper generation config
+from transformers import GenerationConfig
+
+generation_config = GenerationConfig(
     max_new_tokens=MAX_NEW_TOKENS,
     temperature=0.7,
     top_p=0.9,
@@ -141,7 +140,24 @@ outputs = model.generate(
     do_sample=True,
     eos_token_id=tokenizer.eos_token_id,
     pad_token_id=tokenizer.pad_token_id,
+    bos_token_id=tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else None,
 )
+
+# Generate with the model
+try:
+    outputs = model.generate(
+        input_ids,
+        attention_mask=attention_mask,
+        generation_config=generation_config,
+    )
+except Exception as e:
+    print(f"Generation with config failed: {e}")
+    print("Trying simpler generation...")
+    # Fallback to manual generation
+    outputs = model.generate(
+        input_ids,
+        max_new_tokens=MAX_NEW_TOKENS,
+    )
 
 # Extract generated sequences
 if hasattr(outputs, 'sequences'):
