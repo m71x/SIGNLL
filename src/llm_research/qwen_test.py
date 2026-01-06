@@ -37,9 +37,9 @@ MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 MAX_NEW_TOKENS = 30
 
 # TPU MESH CONFIGURATION (32 Chips)
-# Using 8-way Tensor Parallelism and 4-way FSDP
-FSDP_SIZE = 4  # Fully Sharded Data Parallel
-TP_SIZE = 8    # Tensor Parallelism
+# Adjusting for better memory distribution: more FSDP, less TP
+FSDP_SIZE = 8  # Fully Sharded Data Parallel (increased)
+TP_SIZE = 4    # Tensor Parallelism (decreased)
 SP_SIZE = 1    # Sequence Parallelism
 
 # ----------------------------------------------------------------------
@@ -74,7 +74,6 @@ result = AutoEasyDeLModelForCausalLM.from_pretrained(
     shard_attention_computation=True,
     trust_remote_code=True,
     cache_dir=CACHE_DIR,
-    auto_shard_params=True,  # Ensure automatic parameter sharding
     config_kwargs={
         "gradient_checkpointing": "",
         "use_scan_mlp": False,
