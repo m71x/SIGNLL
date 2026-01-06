@@ -24,13 +24,13 @@ os.environ["PJRT_DEVICE"] = "TPU"
 # ============================================================================
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # [FIX] Added Sharding imports
 from jax.experimental import mesh_utils
 from easydel import (
     AutoEasyDeLModelForCausalLM,
     PartitionAxis,
 )
-from transformers import AutoTokenizer, GenerationConfig, AutoConfig # [FIX] Added AutoConfig
+from transformers import AutoTokenizer, GenerationConfig, AutoConfig
 
 # ----------------------------------------------------------------------
 # 1. CONFIGURATION
@@ -39,10 +39,10 @@ MODEL_ID = "Qwen/Qwen2.5-Coder-7B-Instruct"
 MAX_NEW_TOKENS = 50
 
 # TPU MESH CONFIGURATION (32 Chips)
-DP_SIZE = 1     # Data Parallel: 4 independent replicas
-FSDP_SIZE = 1   # Fully Sharded DP: Not needed here
-TP_SIZE = 32     # Tensor Parallel: Split model across 8 chips
-SP_SIZE = 1     # Sequence Parallel: DISABLED (Set to 1)
+DP_SIZE = 1     # Data Parallel
+FSDP_SIZE = 1   # Fully Sharded DP
+TP_SIZE = 32    # Tensor Parallel
+SP_SIZE = 1     # Sequence Parallel
 
 # ----------------------------------------------------------------------
 # 2. LOAD TOKENIZER & CONFIG
@@ -58,10 +58,11 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
 # [CRITICAL FIX] MANUALLY REDUCE CONTEXT WINDOW
-# The default is 128k (131072), which causes OOM on allocation.
-# We cap it to 4096 for this test to save memory.
+# Syncing this to 2048 everywhere to avoid inconsistencies
+CONTEXT_LENGTH = 2048
+
 config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True, cache_dir=CACHE_DIR)
-config.max_position_embeddings = 2048 
+config.max_position_embeddings = CONTEXT_LENGTH
 print(f"✓ Capped max_position_embeddings to: {config.max_position_embeddings}")
 
 # ----------------------------------------------------------------------
@@ -74,12 +75,12 @@ print(f"Mesh Configuration: DP={DP_SIZE}, FSDP={FSDP_SIZE}, TP={TP_SIZE}, SP={SP
 result = AutoEasyDeLModelForCausalLM.from_pretrained(
     MODEL_ID,
     config_kwargs={
-        "max_position_embeddings": 1024,
-        "max_sequence_length": 1024,  # EasyDeL often looks for this key specifically
+        "max_position_embeddings": CONTEXT_LENGTH,
+        "max_sequence_length": CONTEXT_LENGTH, 
         "gradient_checkpointing": "",
         "use_scan_mlp": False,
     },
-    config=config,  # [FIX] Pass the modified config here
+    config=config,
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
     precision=jax.lax.Precision.DEFAULT,
@@ -89,7 +90,6 @@ result = AutoEasyDeLModelForCausalLM.from_pretrained(
     shard_attention_computation=True,
     trust_remote_code=True,
     cache_dir=CACHE_DIR,
-    
 )
 
 if isinstance(result, tuple):
@@ -101,7 +101,7 @@ else:
 print("✓ Model loaded and sharded successfully!")
 
 # ----------------------------------------------------------------------
-# 4. PREPARE INPUT (With Padding Fix)
+# 4. PREPARE INPUT
 # ----------------------------------------------------------------------
 prompt = "Write a high-performance C++ implementation of a thread pool."
 
@@ -165,6 +165,17 @@ if not hasattr(generation_config, 'forced_decoder_ids'):
 print("Creating JAX Mesh context...")
 device_mesh = mesh_utils.create_device_mesh((DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE))
 mesh = Mesh(device_mesh, axis_names=('dp', 'fsdp', 'tp', 'sp'))
+
+# [CRITICAL FIX START] -------------------------------------------------
+# We must physically move the inputs to the Mesh before running generation.
+# P() with empty arguments means "Replicate across all mesh axes".
+# This ensures that every one of the 32 TPUs has a copy of the input.
+print("Sharding inputs to Mesh...")
+input_sharding = NamedSharding(mesh, P()) 
+
+input_ids = jax.device_put(input_ids, input_sharding)
+attention_mask = jax.device_put(attention_mask, input_sharding)
+# [CRITICAL FIX END] ---------------------------------------------------
 
 print("Starting generation loop inside Mesh context...")
 
