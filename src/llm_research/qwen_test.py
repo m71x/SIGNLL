@@ -24,11 +24,10 @@ os.environ["PJRT_DEVICE"] = "TPU"
 # ============================================================================
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh           # [FIX] Essential for manual mesh context
-from jax.experimental import mesh_utils # [FIX] Essential for creating device mesh
+from jax.sharding import Mesh
+from jax.experimental import mesh_utils
 from easydel import (
     AutoEasyDeLModelForCausalLM,
-    EasyDeLState,
     PartitionAxis,
 )
 from transformers import AutoTokenizer, GenerationConfig
@@ -37,15 +36,15 @@ from transformers import AutoTokenizer, GenerationConfig
 # 1. CONFIGURATION
 # ----------------------------------------------------------------------
 MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
-MAX_NEW_TOKENS = 30
+MAX_NEW_TOKENS = 50
 
 # [FIX] TPU MESH CONFIGURATION (32 Chips)
-# We use a 4D mesh to satisfy the model's requirement for a 'dp' axis.
-# Total devices must equal product: 1 * 8 * 4 * 1 = 32
-DP_SIZE = 1    # Data Parallel (Added to fix "axis 'dp' not found")
-FSDP_SIZE = 8  # Fully Sharded Data Parallel
-TP_SIZE = 4    # Tensor Parallelism
-SP_SIZE = 1    # Sequence Parallelism
+# Since Batch Size is 1, we CANNOT use FSDP/DP (Data Parallelism).
+# We shift to Model/Sequence Parallelism to use the chips.
+DP_SIZE = 1     # Must be 1 for single-batch inference
+FSDP_SIZE = 1   # Must be 1 for single-batch inference
+TP_SIZE = 8     # Tensor Parallel: 8 matches Qwen's 8 KV heads nicely
+SP_SIZE = 4     # Sequence Parallel: 4 fills the remaining chips (1*1*8*4=32)
 
 # ----------------------------------------------------------------------
 # 2. LOAD TOKENIZER
@@ -73,7 +72,7 @@ result = AutoEasyDeLModelForCausalLM.from_pretrained(
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
     precision=jax.lax.Precision.DEFAULT,
-    # [FIX] Update axis dims and names to include 'dp'
+    # [FIX] Mapping axes to our new mesh config
     sharding_axis_dims=(DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE),
     sharding_axis_names=('dp', 'fsdp', 'tp', 'sp'), 
     partition_axis=PartitionAxis(),
@@ -86,7 +85,6 @@ result = AutoEasyDeLModelForCausalLM.from_pretrained(
     }
 )
 
-# Handle different return types
 if isinstance(result, tuple):
     model, params = result
 else:
@@ -96,7 +94,7 @@ else:
 print("✓ Model loaded and sharded successfully!")
 
 # ----------------------------------------------------------------------
-# 4. PREPARE INPUT
+# 4. PREPARE INPUT (With Padding Fix)
 # ----------------------------------------------------------------------
 prompt = "Write a high-performance C++ implementation of a thread pool."
 
@@ -120,7 +118,22 @@ inputs = tokenizer(
 input_ids = inputs["input_ids"]
 attention_mask = inputs.get("attention_mask", jnp.ones_like(input_ids))
 
-print(f"Input shape: {input_ids.shape}")
+# [FIX] PAD INPUTS TO MULTIPLE OF SP_SIZE
+# When using Sequence Parallelism (SP > 1), the input length must be divisible by SP_SIZE.
+seq_len = input_ids.shape[1]
+remainder = seq_len % SP_SIZE
+
+if remainder != 0:
+    pad_amt = SP_SIZE - remainder
+    print(f"Padding input length {seq_len} by {pad_amt} tokens to satisfy SP={SP_SIZE}...")
+    
+    pad_ids = jnp.full((input_ids.shape[0], pad_amt), tokenizer.pad_token_id, dtype=input_ids.dtype)
+    pad_mask = jnp.zeros((attention_mask.shape[0], pad_amt), dtype=attention_mask.dtype)
+    
+    input_ids = jnp.concatenate([pad_ids, input_ids], axis=1) # Pad left usually better for generation
+    attention_mask = jnp.concatenate([pad_mask, attention_mask], axis=1)
+
+print(f"Final Input shape: {input_ids.shape}")
 
 # ----------------------------------------------------------------------
 # 5. GENERATION
@@ -129,7 +142,6 @@ print("\n" + "="*80)
 print("GENERATING RESPONSE...")
 print("="*80)
 
-# [FIX] Configure Generation properly
 generation_config = GenerationConfig(
     max_new_tokens=MAX_NEW_TOKENS,
     temperature=0.7,
@@ -140,17 +152,11 @@ generation_config = GenerationConfig(
     bos_token_id=tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else None,
 )
 
-# [FIX] Patch for transformers/EasyDeL compatibility
-# Newer transformers removed these attributes, but EasyDeL might still check them
+# Compatibility patch
 if not hasattr(generation_config, 'forced_decoder_ids'):
     generation_config.forced_decoder_ids = None
-if not hasattr(generation_config, 'forced_bos_token_id'):
-    generation_config.forced_bos_token_id = None
-if not hasattr(generation_config, 'forced_eos_token_id'):
-    generation_config.forced_eos_token_id = None
 
-# [FIX] CREATE MESH AND ENTER CONTEXT
-# We explicitly create the mesh matching the sharding_axis_names defined above
+# [FIX] CREATE MESH
 print("Creating JAX Mesh context...")
 device_mesh = mesh_utils.create_device_mesh((DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE))
 mesh = Mesh(device_mesh, axis_names=('dp', 'fsdp', 'tp', 'sp'))
@@ -158,14 +164,13 @@ mesh = Mesh(device_mesh, axis_names=('dp', 'fsdp', 'tp', 'sp'))
 print("Starting generation loop inside Mesh context...")
 
 with mesh:
-    # We use the high-level generate function which handles the loop
+    # Compile and run generation
     outputs = model.generate(
         input_ids,
         attention_mask=attention_mask,
         generation_config=generation_config,
     )
 
-# Extract generated sequences
 if hasattr(outputs, 'sequences'):
     output_ids = outputs.sequences
 else:
