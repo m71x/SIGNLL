@@ -22,6 +22,11 @@ os.environ["PJRT_DEVICE"] = "TPU"
 # IMPORTS
 # ============================================================================
 import jax
+
+try:
+    jax.distributed.initialize()
+except Exception:
+    print("JAX distributed already initialized or not needed.")
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental import mesh_utils
@@ -36,9 +41,9 @@ MAX_NEW_TOKENS = 1900
 CONTEXT_LENGTH = 4096  # Increased to handle prompt + output safely
 
 DP_SIZE = 1
-FSDP_SIZE = 1
+FSDP_SIZE = 4
 TP_SIZE = 8
-SP_SIZE = 4
+SP_SIZE = 1
 
 # ============================================================================
 # 1. MESH & SHARDING (MOVED TO TOP)
