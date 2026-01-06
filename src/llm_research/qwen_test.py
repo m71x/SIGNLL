@@ -2,12 +2,11 @@ import os
 import jax
 import jax.numpy as jnp
 from easydel import (
-    AutoShardAndGatherFunctions,
-    EasyDeLFlaxPretrainedModel,
+    AutoEasyDeLModelForCausalLM,
+    EasyDeLState,
+    PartitionAxis,
 )
-from fjformer import GenerateRNG
-from transformers import AutoTokenizer, AutoConfig
-import flax
+from transformers import AutoTokenizer
 
 # Ensure TPU is used
 os.environ["PJRT_DEVICE"] = "TPU"
@@ -19,7 +18,8 @@ MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 MAX_NEW_TOKENS = 30
 
 # TPU MESH CONFIGURATION (32 Chips)
-FSDP_SIZE = 4  # Data Parallelism
+# Using 8-way Tensor Parallelism and 4-way FSDP
+FSDP_SIZE = 4  # Fully Sharded Data Parallel
 TP_SIZE = 8    # Tensor Parallelism
 SP_SIZE = 1    # Sequence Parallelism
 
@@ -36,169 +36,103 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
 # ----------------------------------------------------------------------
-# 3. SETUP MESH AND SHARDING
+# 3. LOAD MODEL WITH EASYDEL
 # ----------------------------------------------------------------------
-print(f"Setting up mesh with DP={FSDP_SIZE}, TP={TP_SIZE}, SP={SP_SIZE}")
+print(f"\nLoading Model with EasyDeL...")
+print(f"Mesh Configuration: FSDP={FSDP_SIZE}, TP={TP_SIZE}, SP={SP_SIZE}")
+print(f"Available devices: {len(jax.devices())}")
 
-from jax.sharding import Mesh, PartitionSpec
-from jax.experimental import mesh_utils
-
-# Create device mesh
-devices = jax.devices()
-print(f"Available devices: {len(devices)}")
-
-device_mesh = mesh_utils.create_device_mesh((FSDP_SIZE, TP_SIZE, SP_SIZE))
-mesh = Mesh(device_mesh, axis_names=('dp', 'fsdp', 'tp'))
-
-print(f"Mesh created: {mesh}")
-
-# ----------------------------------------------------------------------
-# 4. LOAD MODEL WITH EASYDEL
-# ----------------------------------------------------------------------
-print(f"\nLoading Model...")
-
-# Load config
-config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-
-# EasyDeL 0.2.0.2 uses this method
-model = EasyDeLFlaxPretrainedModel.from_pretrained(
-    pretrained_model_name_or_path=MODEL_ID,
+# Load model and parameters with automatic sharding
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+    MODEL_ID,
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
     precision=jax.lax.Precision.DEFAULT,
-    auto_shard_model=True,
     sharding_axis_dims=(FSDP_SIZE, TP_SIZE, SP_SIZE),
-    sharding_axis_names=('dp', 'fsdp', 'tp'),
-    mesh=mesh,
+    sharding_axis_names=('fsdp', 'tp', 'sp'),
+    partition_axis=PartitionAxis(),
+    shard_attention_computation=True,
+    input_shape=(1, 1),
+    device=jax.devices()[0],
+    trust_remote_code=True,
     config_kwargs={
         "gradient_checkpointing": "",
         "use_scan_mlp": False,
-        "scan_mlp_chunk_size": 1024,
-    },
-    trust_remote_code=True,
-    from_pt=True,
+    }
 )
 
-print("Model loaded successfully!")
-
-# Get the shard functions for this model
-shard_fns = AutoShardAndGatherFunctions.from_pretrained(
-    pretrained_model_name_or_path=MODEL_ID,
-    sharding_axis_dims=(FSDP_SIZE, TP_SIZE, SP_SIZE),
-    sharding_axis_names=('dp', 'fsdp', 'tp'),
-    mesh=mesh,
-    trust_remote_code=True,
-)
-
-# Shard the parameters
-params = model.params
-if hasattr(shard_fns, 'shard_params'):
-    print("Sharding parameters across TPUs...")
-    params = shard_fns.shard_params(params)
+print("✓ Model loaded and sharded successfully!")
 
 # ----------------------------------------------------------------------
-# 5. PREPARE INPUT
+# 4. PREPARE INPUT
 # ----------------------------------------------------------------------
 prompt = "Write a high-performance C++ implementation of a thread pool."
 
 # Apply chat template if available
 if hasattr(tokenizer, "apply_chat_template"):
     messages = [{"role": "user", "content": prompt}]
-    prompt = tokenizer.apply_chat_template(
+    formatted_prompt = tokenizer.apply_chat_template(
         messages, 
         tokenize=False, 
         add_generation_prompt=True
     )
+    print(f"\nFormatted prompt:\n{formatted_prompt}\n")
+else:
+    formatted_prompt = prompt
 
+# Tokenize
 inputs = tokenizer(
-    prompt, 
-    return_tensors="np",
+    formatted_prompt, 
+    return_tensors="jax",
     padding=False,
     truncation=True,
 )
 
-input_ids = jnp.array(inputs["input_ids"])
-attention_mask = jnp.array(inputs.get("attention_mask", jnp.ones_like(input_ids)))
+input_ids = inputs["input_ids"]
+attention_mask = inputs.get("attention_mask", jnp.ones_like(input_ids))
 
-print(f"\nPrompt: {prompt}")
 print(f"Input shape: {input_ids.shape}")
+print(f"Input tokens: {input_ids.shape[1]}")
 
 # ----------------------------------------------------------------------
-# 6. GENERATION LOOP
+# 5. GENERATION
 # ----------------------------------------------------------------------
-print("\nGenerating response...")
+print("\n" + "="*80)
+print("GENERATING RESPONSE...")
+print("="*80)
 
-# Initialize RNG
-rng = GenerateRNG(seed=42)
+# Generate with the model
+outputs = model.generate(
+    input_ids,
+    attention_mask=attention_mask,
+    params=params,
+    max_new_tokens=MAX_NEW_TOKENS,
+    temperature=0.7,
+    top_p=0.9,
+    top_k=50,
+    do_sample=True,
+    eos_token_id=tokenizer.eos_token_id,
+    pad_token_id=tokenizer.pad_token_id,
+)
 
-# Prepare generation config
-generation_config = {
-    "max_new_tokens": MAX_NEW_TOKENS,
-    "temperature": 0.7,
-    "top_p": 0.9,
-    "top_k": 50,
-    "do_sample": True,
-    "eos_token_id": tokenizer.eos_token_id,
-    "pad_token_id": tokenizer.pad_token_id,
-}
-
-# Use model's generate method if available
-if hasattr(model, 'generate'):
-    output_ids = model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        params=params,
-        generation_config=generation_config,
-        rng=rng.rng,
-    ).sequences
+# Extract generated sequences
+if hasattr(outputs, 'sequences'):
+    output_ids = outputs.sequences
 else:
-    # Fallback: manual generation loop
-    print("Using manual generation loop...")
-    
-    current_ids = input_ids
-    
-    for step in range(MAX_NEW_TOKENS):
-        # Forward pass
-        outputs = model(
-            input_ids=current_ids,
-            attention_mask=attention_mask,
-            params=params,
-            train=False,
-        )
-        
-        # Get logits for next token
-        next_token_logits = outputs.logits[:, -1, :]
-        
-        # Apply temperature
-        next_token_logits = next_token_logits / generation_config["temperature"]
-        
-        # Sample next token
-        next_token = jax.random.categorical(
-            rng.rng, 
-            next_token_logits, 
-            axis=-1
-        )
-        rng = GenerateRNG(rng=jax.random.split(rng.rng)[0])
-        
-        # Append to sequence
-        current_ids = jnp.concatenate([current_ids, next_token[:, None]], axis=1)
-        attention_mask = jnp.ones_like(current_ids)
-        
-        # Check for EOS
-        if next_token[0] == tokenizer.eos_token_id:
-            break
-    
-    output_ids = current_ids
+    output_ids = outputs
 
 # ----------------------------------------------------------------------
-# 7. DECODE AND PRINT OUTPUT
+# 6. DECODE AND DISPLAY OUTPUT
 # ----------------------------------------------------------------------
 generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
-print("-" * 80)
+print("\n" + "="*80)
 print("GENERATED OUTPUT:")
-print("-" * 80)
+print("="*80)
 print(generated_text)
-print("-" * 80)
+print("="*80)
 
-print(f"\nGeneration complete. Generated {len(output_ids[0]) - len(input_ids[0])} tokens.")
+# Statistics
+num_new_tokens = len(output_ids[0]) - len(input_ids[0])
+print(f"\n✓ Generated {num_new_tokens} new tokens")
+print(f"✓ Total tokens: {len(output_ids[0])}")
