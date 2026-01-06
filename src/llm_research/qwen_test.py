@@ -72,7 +72,6 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
     sharding_axis_names=('fsdp', 'tp', 'sp'),
     partition_axis=PartitionAxis(),
     shard_attention_computation=True,
-    device=jax.devices()[0],
     trust_remote_code=True,
     cache_dir=CACHE_DIR,
     config_kwargs={
