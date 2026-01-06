@@ -41,9 +41,9 @@ MAX_NEW_TOKENS = 1900
 CONTEXT_LENGTH = 4096  # Increased to handle prompt + output safely
 
 DP_SIZE = 1
-FSDP_SIZE = 4
+FSDP_SIZE = 1
 TP_SIZE = 8
-SP_SIZE = 1
+SP_SIZE = 4
 
 # ============================================================================
 # 1. MESH & SHARDING (MOVED TO TOP)
