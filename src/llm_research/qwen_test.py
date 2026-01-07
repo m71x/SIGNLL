@@ -23,7 +23,6 @@ os.environ["PJRT_DEVICE"] = "TPU"
 # ============================================================================
 import jax
 
-# This MUST come before importing easydel or calling any JAX operations
 jax.distributed.initialize()
 
 print(f"JAX distributed initialized:")
@@ -57,15 +56,13 @@ MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 MAX_NEW_TOKENS = 30
 
 # TPU MESH CONFIGURATION (32 Chips)
-FSDP_SIZE = 8  # Fully Sharded Data Parallel
-TP_SIZE = 4    # Tensor Parallelism
-SP_SIZE = 1    # Sequence Parallelism
+FSDP_SIZE = 8
+TP_SIZE = 4
+SP_SIZE = 1
 
 # ----------------------------------------------------------------------
-# 2. DEFINITIONS (FIX FOR MISSING IMPORTS)
+# 2. DEFINITIONS
 # ----------------------------------------------------------------------
-
-# We define PartitionRule locally to avoid ImportError hell
 @dataclass
 class PartitionRule:
     primary: Optional[str]
@@ -77,15 +74,14 @@ class PartitionRule:
 if jax.process_index() == 0:
     print("Loading Tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_ID, 
+        MODEL_ID,
         trust_remote_code=True,
         cache_dir=CACHE_DIR
     )
 else:
-    # Wait for process 0 to download
     time.sleep(10)
     tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_ID, 
+        MODEL_ID,
         trust_remote_code=True,
         cache_dir=CACHE_DIR
     )
@@ -101,8 +97,33 @@ if jax.process_index() == 0:
     print("DEVICE AND MESH SETUP")
     print("="*80)
 
+# =========================
+# 🔧 FIXED MULTI-HOST MESH
+# =========================
 devices = jax.devices()
-device_array = mesh_utils.create_device_mesh((FSDP_SIZE, TP_SIZE, SP_SIZE), devices=devices)
+
+process_count = jax.process_count()
+local_device_count = jax.local_device_count()
+
+if FSDP_SIZE % process_count != 0:
+    raise RuntimeError(
+        f"FSDP_SIZE ({FSDP_SIZE}) must be divisible by process_count ({process_count})"
+    )
+
+per_host_fsdp = FSDP_SIZE // process_count
+
+expected_local_devices = per_host_fsdp * TP_SIZE * SP_SIZE
+if expected_local_devices != local_device_count:
+    raise RuntimeError(
+        f"Per-host mesh mismatch: {per_host_fsdp} * {TP_SIZE} * {SP_SIZE} "
+        f"= {expected_local_devices}, but local_device_count = {local_device_count}"
+    )
+
+device_array = mesh_utils.create_device_mesh(
+    (per_host_fsdp, TP_SIZE, SP_SIZE),
+    devices=devices,
+)
+
 mesh = Mesh(device_array, axis_names=('fsdp', 'tp', 'sp'))
 
 partition_axis = PartitionAxis(
@@ -113,48 +134,31 @@ partition_axis = PartitionAxis(
 
 # ======================================================================
 # MANUALLY DEFINE SHARDING RULES
-# Using our local PartitionRule class
 # ======================================================================
 partition_rules = (
-    # Embeddings
     (re.compile(".*embed_tokens.*"), PartitionRule(None, ("fsdp", "tp"))),
-    
-    # Attention Q, K, V
     (re.compile(".*q_proj.*"),      PartitionRule(None, ("fsdp", "tp"))),
     (re.compile(".*k_proj.*"),      PartitionRule(None, ("fsdp", "tp"))),
     (re.compile(".*v_proj.*"),      PartitionRule(None, ("fsdp", "tp"))),
-    
-    # Attention Output
     (re.compile(".*o_proj.*"),      PartitionRule(None, ("tp", "fsdp"))),
-    
-    # MLP
     (re.compile(".*gate_proj.*"),   PartitionRule(None, ("fsdp", "tp"))),
     (re.compile(".*up_proj.*"),     PartitionRule(None, ("fsdp", "tp"))),
     (re.compile(".*down_proj.*"),   PartitionRule(None, ("tp", "fsdp"))),
-    
-    # Output Head
     (re.compile(".*lm_head.*"),     PartitionRule(None, ("fsdp", "tp"))),
-    
-    # Layer Norms
     (re.compile(".*norm.*"),        PartitionRule(None, ("fsdp",))),
-    
-    # Catch-all
     (re.compile(".*"),              PartitionRule(None, ("fsdp", "tp"))),
 )
 
 if jax.process_index() == 0:
     print(f"\n✅ Manual Partition Rules Applied (Locally Defined).")
 
-# Load model using the manual rules
 with mesh:
     result = AutoEasyDeLModelForCausalLM.from_pretrained(
         MODEL_ID,
         dtype=jnp.bfloat16,
         param_dtype=jnp.bfloat16,
         precision=jax.lax.Precision.DEFAULT,
-        # PASS THE MANUAL RULES
         partition_rules=partition_rules,
-        #auto_shard_params=True,
         sharding_axis_dims=(FSDP_SIZE, TP_SIZE, SP_SIZE),
         sharding_axis_names=('fsdp', 'tp', 'sp'),
         partition_axis=partition_axis,
@@ -183,32 +187,21 @@ if jax.process_index() == 0 and params is not None:
     print("\n" + "="*80)
     print("PARAMETER SHARDING ANALYSIS")
     print("="*80)
-    
-    try:
-        import jax.tree_util as tree_util
-        leaves_with_paths, _ = tree_util.tree_flatten_with_path(params)
-        
-        # Check specific weights to ensure they are NOT SingleDeviceSharding
-        print(f"\n🔍 CHECKING CRITICAL WEIGHTS:")
-        for path, val in leaves_with_paths:
-            path_str = tree_util.keystr(path)
-            # Check an MLP layer (previously crashing)
-            if "layers" in path_str and "down_proj" in path_str and "kernel" in path_str:
-                print(f"\n  Weight: {path_str}")
-                print(f"    Shape: {val.shape}")
-                if hasattr(val, 'sharding'):
-                    sharding_type = type(val.sharding).__name__
-                    print(f"    Sharding Type: {sharding_type}")
-                    if hasattr(val.sharding, 'spec'):
-                        print(f"    Spec: {val.sharding.spec}")
-                    
-                    if 'SingleDevice' in sharding_type:
-                        print("    🚨 STILL FAILING TO SHARD!")
-                    elif 'NamedSharding' in sharding_type:
-                        print("    ✅ SUCCESS: NamedSharding active")
-                break
-    except Exception as e:
-        print(f"Inspection error: {e}")
+
+    import jax.tree_util as tree_util
+    leaves_with_paths, _ = tree_util.tree_flatten_with_path(params)
+
+    print(f"\n🔍 CHECKING CRITICAL WEIGHTS:")
+    for path, val in leaves_with_paths:
+        path_str = tree_util.keystr(path)
+        if "layers" in path_str and "down_proj" in path_str and "kernel" in path_str:
+            print(f"\n  Weight: {path_str}")
+            print(f"    Shape: {val.shape}")
+            sharding_type = type(val.sharding).__name__
+            print(f"    Sharding Type: {sharding_type}")
+            if hasattr(val.sharding, "spec"):
+                print(f"    Spec: {val.sharding.spec}")
+            break
 
 # ----------------------------------------------------------------------
 # 6. GENERATION
@@ -218,47 +211,29 @@ prompt = "Write a high-performance C++ implementation of a thread pool."
 if hasattr(tokenizer, "apply_chat_template"):
     messages = [{"role": "user", "content": prompt}]
     formatted_prompt = tokenizer.apply_chat_template(
-        messages, 
-        tokenize=False, 
-        add_generation_prompt=True
+        messages, tokenize=False, add_generation_prompt=True
     )
 else:
     formatted_prompt = prompt
 
-inputs = tokenizer(
-    formatted_prompt, 
-    return_tensors="jax",
-    padding=False,
-    truncation=True,
-)
-
+inputs = tokenizer(formatted_prompt, return_tensors="jax")
 input_ids = inputs["input_ids"]
-
-if jax.process_index() == 0:
-    print("\n" + "="*80)
-    print("GENERATING RESPONSE...")
-    print("="*80)
 
 with mesh:
     current_ids = input_ids
-    for step in range(MAX_NEW_TOKENS):
-        if jax.process_index() == 0 and step % 5 == 0:
-            print(f"Generating token {step}/{MAX_NEW_TOKENS}...")
-        
+    for _ in range(MAX_NEW_TOKENS):
         outputs = model(current_ids)
         next_token = jnp.argmax(outputs.logits[:, -1, :], axis=-1, keepdims=True)
         current_ids = jnp.concatenate([current_ids, next_token], axis=1)
-        
         if next_token[0] == tokenizer.eos_token_id:
             break
-    
-    output_ids = current_ids
 
+output_ids = current_ids
 generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
 if jax.process_index() == 0:
     print("\n" + "="*80)
-    print("GENERATED OUTPUT:")
+    print("GENERATED OUTPUT")
     print("="*80)
     print(generated_text)
     print("="*80)
