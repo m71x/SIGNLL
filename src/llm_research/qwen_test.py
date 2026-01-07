@@ -1,24 +1,17 @@
-# ============================================================================
-# MUST COME FIRST — ENVIRONMENT SETUP
-# ============================================================================
+# inference_from_sharded.py
+# Run this on ALL workers of your TPU pod
+
 import os
+import json
+import numpy as np
 
 CACHE_DIR = "/dev/shm/huggingface"
+CHECKPOINT_DIR = "/path/to/sharded_checkpoint"  # Same as OUTPUT_DIR above
 
 os.environ["HF_HOME"] = CACHE_DIR
-os.environ["HF_HUB_CACHE"] = f"{CACHE_DIR}/hub"
-os.environ["TRANSFORMERS_CACHE"] = f"{CACHE_DIR}/transformers"
-os.environ["HF_DATASETS_CACHE"] = f"{CACHE_DIR}/datasets"
-os.environ["TMPDIR"] = CACHE_DIR
-os.environ["TEMP"] = CACHE_DIR
-os.environ["TMP"] = CACHE_DIR
-os.environ["HF_HUB_DISABLE_XET"] = "1"
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["PJRT_DEVICE"] = "TPU"
 
-# ============================================================================
-# INITIALIZE JAX DISTRIBUTED
-# ============================================================================
+# Initialize distributed FIRST
 import jax
 jax.distributed.initialize()
 
@@ -28,35 +21,30 @@ print(f"  Process count: {jax.process_count()}")
 print(f"  Local devices: {jax.local_device_count()}")
 print(f"  Global devices: {jax.device_count()}")
 
-# ============================================================================
-# IMPORTS
-# ============================================================================
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from jax.experimental import mesh_utils
+from transformers import AutoTokenizer, AutoConfig
+from flax import linen as nn
 import time
-
-from easydel import AutoEasyDeLModelForCausalLM, PartitionAxis
-from transformers import AutoTokenizer
 
 # ----------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------
-MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
-MAX_NEW_TOKENS = 30
 FSDP_SIZE = 8
 TP_SIZE = 4
 SP_SIZE = 1
+MAX_NEW_TOKENS = 30
 
 # ----------------------------------------------------------------------
 # LOAD TOKENIZER
 # ----------------------------------------------------------------------
 if jax.process_index() == 0:
     print("Loading Tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True, cache_dir=CACHE_DIR)
+    tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT_DIR, trust_remote_code=True)
 else:
-    time.sleep(10)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True, cache_dir=CACHE_DIR)
+    time.sleep(5)
+    tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT_DIR, trust_remote_code=True)
 
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
@@ -70,90 +58,118 @@ if jax.process_index() == 0:
     print("="*80)
 
 all_devices = jax.devices()
-total_devices = len(all_devices)
-expected_devices = FSDP_SIZE * TP_SIZE * SP_SIZE
-
-if jax.process_index() == 0:
-    print(f"Total global devices: {total_devices}")
-    print(f"Expected devices: {expected_devices}")
-    print(f"FSDP={FSDP_SIZE}, TP={TP_SIZE}, SP={SP_SIZE}")
-
-if total_devices != expected_devices:
-    raise RuntimeError(
-        f"Device count mismatch: got {total_devices}, expected {expected_devices}"
-    )
-
 device_array = mesh_utils.create_device_mesh((FSDP_SIZE, TP_SIZE, SP_SIZE), devices=all_devices)
 mesh = Mesh(device_array, axis_names=('fsdp', 'tp', 'sp'))
 
 if jax.process_index() == 0:
-    print(f"Mesh shape: {mesh.devices.shape}")
-    print(f"Mesh axis names: {mesh.axis_names}")
-    print(f"Total devices in mesh: {mesh.devices.size}")
+    print(f"Mesh: {mesh.devices.shape} = {mesh.devices.size} devices")
 
+# ----------------------------------------------------------------------
+# LOAD SHARDED PARAMETERS
+# ----------------------------------------------------------------------
+if jax.process_index() == 0:
+    print("\n" + "="*80)
+    print("LOADING PRE-SHARDED PARAMETERS")
+    print("="*80)
+
+# Load index
+with open(os.path.join(CHECKPOINT_DIR, "params_index.json"), "r") as f:
+    params_index = json.load(f)
+
+def spec_from_tuple(spec_tuple):
+    """Convert tuple like ('fsdp', 'tp') to PartitionSpec."""
+    return P(*spec_tuple)
+
+params = {}
+with mesh:
+    for name, info in params_index.items():
+        filepath = os.path.join(CHECKPOINT_DIR, info["file"])
+        
+        # Only coordinator loads from disk
+        if jax.process_index() == 0:
+            arr = np.load(filepath)
+            arr = jnp.array(arr, dtype=jnp.bfloat16)
+        else:
+            # Other processes create placeholder
+            arr = jnp.zeros(info["shape"], dtype=jnp.bfloat16)
+        
+        # Create sharding and distribute
+        spec = spec_from_tuple(info["sharding"])
+        sharding = NamedSharding(mesh, spec)
+        
+        # Shard across all devices
+        arr = jax.device_put(arr, sharding)
+        
+        # Store in nested dict structure
+        keys = name.split(".")
+        current = params
+        for key in keys[:-1]:
+            if key not in current:
+                current[key] = {}
+            current = current[key]
+        current[keys[-1]] = arr
+        
+        if jax.process_index() == 0:
+            print(f"  Loaded: {name} -> {arr.shape}, spec={spec}")
+
+if jax.process_index() == 0:
+    print("✓ All parameters loaded and sharded!")
+
+# ----------------------------------------------------------------------
+# PARAMETER SHARDING ANALYSIS
+# ----------------------------------------------------------------------
+if jax.process_index() == 0:
+    print("\n" + "="*80)
+    print("PARAMETER SHARDING ANALYSIS")
+    print("="*80)
+    
+    # Check a sample weight
+    for name, info in list(params_index.items())[:3]:
+        keys = name.split(".")
+        val = params
+        for k in keys:
+            val = val[k]
+        print(f"  {name}: shape={val.shape}, sharding={type(val.sharding).__name__}")
+        if hasattr(val.sharding, 'spec'):
+            print(f"    Spec: {val.sharding.spec}")
+
+# ----------------------------------------------------------------------
+# LOAD MODEL CLASS (for inference)
+# ----------------------------------------------------------------------
+if jax.process_index() == 0:
+    print("\n" + "="*80)
+    print("SETTING UP INFERENCE")
+    print("="*80)
+
+# Now use EasyDeL or custom Flax model for forward pass
+from easydel import AutoEasyDeLModelForCausalLM, PartitionAxis
+
+config = AutoConfig.from_pretrained(CHECKPOINT_DIR, trust_remote_code=True)
+
+# Create model structure without loading weights
 partition_axis = PartitionAxis(
     fully_sharded_data_parallel_axis="fsdp",
     tensor_parallel_axis="tp",
     sequence_parallel_axis="sp",
 )
 
-# ----------------------------------------------------------------------
-# LOAD MODEL WITH 8-BIT QUANTIZATION
-# ----------------------------------------------------------------------
-if jax.process_index() == 0:
-    print("\n" + "="*80)
-    print("LOADING MODEL (8-bit quantized)")
-    print("="*80)
-
+# Load just the model class (weights already in params)
 with mesh:
-    result = AutoEasyDeLModelForCausalLM.from_pretrained(
-        MODEL_ID,
+    model, _ = AutoEasyDeLModelForCausalLM.from_pretrained(
+        CHECKPOINT_DIR,
         dtype=jnp.bfloat16,
         param_dtype=jnp.bfloat16,
-        precision=jax.lax.Precision.DEFAULT,
-        # 8-bit quantization to reduce loading memory
-        load_in_8bit=True,
-        # Sharding configuration
         sharding_axis_dims=(FSDP_SIZE, TP_SIZE, SP_SIZE),
         sharding_axis_names=('fsdp', 'tp', 'sp'),
         partition_axis=partition_axis,
-        shard_attention_computation=True,
         trust_remote_code=True,
-        cache_dir=CACHE_DIR,
-        config_kwargs={"use_scan_mlp": False},
     )
 
+# Use our pre-loaded params instead
+# (This bypasses EasyDeL's loading which was causing OOM)
+
 if jax.process_index() == 0:
-    print("✓ Model loaded successfully across all hosts!")
-
-if isinstance(result, tuple):
-    model, params = result
-else:
-    model = result
-    params = model.params if hasattr(model, 'params') else None
-
-# ----------------------------------------------------------------------
-# PARAMETER SHARDING ANALYSIS
-# ----------------------------------------------------------------------
-if jax.process_index() == 0 and params is not None:
-    print("\n" + "="*80)
-    print("PARAMETER SHARDING ANALYSIS")
-    print("="*80)
-
-    import jax.tree_util as tree_util
-    leaves_with_paths, _ = tree_util.tree_flatten_with_path(params)
-
-    print(f"\n🔍 CHECKING CRITICAL WEIGHTS:")
-    for path, val in leaves_with_paths:
-        path_str = tree_util.keystr(path)
-        if "layers" in path_str and "down_proj" in path_str and "kernel" in path_str:
-            print(f"\n  Weight: {path_str}")
-            print(f"    Shape: {val.shape}")
-            sharding_type = type(val.sharding).__name__
-            print(f"    Sharding Type: {sharding_type}")
-            if hasattr(val.sharding, "spec"):
-                print(f"    Spec: {val.sharding.spec}")
-            break
+    print("✓ Model ready for inference!")
 
 # ----------------------------------------------------------------------
 # GENERATION

@@ -164,9 +164,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/llm_research/qwen_test.py"  
-
-
+  --command="cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/llm_research/qwen_shard.py"
 #clone xla onto all workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \

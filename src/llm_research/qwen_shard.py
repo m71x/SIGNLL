@@ -12,7 +12,7 @@ import numpy as np
 os.environ["PJRT_DEVICE"] = "TPU"
 
 CACHE_DIR = "/dev/shm/huggingface"
-OUTPUT_DIR = "/path/to/sharded_checkpoint"  # Change this!
+OUTPUT_DIR = "/home/mikexi/sharded_qwen32b"  # Change this!
 MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 
 # Sharding config (must match your TPU pod setup)
