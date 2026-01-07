@@ -100,7 +100,7 @@ if jax.process_index() == 0:
 # =========================
 # 🔧 FIXED MULTI-HOST MESH
 # =========================
-devices = jax.devices()
+devices = jax.local_devices()
 
 process_count = jax.process_count()
 local_device_count = jax.local_device_count()
