@@ -164,7 +164,7 @@ with mesh:
         partition_rules=partition_rules,
         # Memory optimization
         shard_attention_computation=True,
-        input_shape=(1, 1),  # Minimal during loading
+        #iput_shape=(1, 1),  # Minimal during loading
         # Model config
         trust_remote_code=True,
         cache_dir=CACHE_DIR,
