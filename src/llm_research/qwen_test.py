@@ -81,13 +81,22 @@ if tokenizer.pad_token is None:
 # ----------------------------------------------------------------------
 # 3. LOAD MODEL WITH EASYDEL
 # ----------------------------------------------------------------------
+from jax.sharding import Mesh
+from jax.experimental import mesh_utils
+
 print(f"\nLoading Model with EasyDeL...")
 print(f"Mesh Configuration: FSDP={FSDP_SIZE}, TP={TP_SIZE}, SP={SP_SIZE}")
 print(f"Total devices needed: {FSDP_SIZE * TP_SIZE * SP_SIZE}")
 
-# Create PartitionAxis with proper parameters matching the mesh
+# Create the device mesh
+devices = jax.devices()
+device_array = mesh_utils.create_device_mesh((FSDP_SIZE, TP_SIZE, SP_SIZE), devices=devices)
+mesh = Mesh(device_array, axis_names=('fsdp', 'tp', 'sp'))
+
+print(f"Created mesh: {mesh}")
+
+# Create PartitionAxis WITHOUT 'dp' axis (only use axes in mesh)
 partition_axis = PartitionAxis(
-    data_parallel_axis="dp",
     fully_sharded_data_parallel_axis="fsdp", 
     tensor_parallel_axis="tp",
     sequence_parallel_axis="sp",
@@ -98,22 +107,23 @@ if jax.process_index() == 0:
     print("Process 0: Loading model from disk...")
 
 # Load model with automatic sharding across all hosts
-result = AutoEasyDeLModelForCausalLM.from_pretrained(
-    MODEL_ID,
-    dtype=jnp.bfloat16,
-    param_dtype=jnp.bfloat16,
-    precision=jax.lax.Precision.DEFAULT,
-    sharding_axis_dims=(FSDP_SIZE, TP_SIZE, SP_SIZE),
-    sharding_axis_names=('fsdp', 'tp', 'sp'),
-    partition_axis=partition_axis,
-    shard_attention_computation=True,
-    trust_remote_code=True,
-    cache_dir=CACHE_DIR,
-    config_kwargs={
-        "gradient_checkpointing": "",
-        "use_scan_mlp": False,
-    }
-)
+with mesh:
+    result = AutoEasyDeLModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        dtype=jnp.bfloat16,
+        param_dtype=jnp.bfloat16,
+        precision=jax.lax.Precision.DEFAULT,
+        sharding_axis_dims=(FSDP_SIZE, TP_SIZE, SP_SIZE),
+        sharding_axis_names=('fsdp', 'tp', 'sp'),
+        partition_axis=partition_axis,
+        shard_attention_computation=True,
+        trust_remote_code=True,
+        cache_dir=CACHE_DIR,
+        config_kwargs={
+            "gradient_checkpointing": "",
+            "use_scan_mlp": False,
+        }
+    )
 
 if jax.process_index() == 0:
     print("✓ Model loaded successfully across all hosts!")
@@ -168,62 +178,32 @@ print("\n" + "="*80)
 print("GENERATING RESPONSE...")
 print("="*80)
 
-# Create a proper generation config with all needed attributes
-from transformers import GenerationConfig
-
-generation_config = GenerationConfig(
-    max_new_tokens=MAX_NEW_TOKENS,
-    temperature=0.7,
-    top_p=0.9,
-    top_k=50,
-    do_sample=True,
-    eos_token_id=tokenizer.eos_token_id,
-    pad_token_id=tokenizer.pad_token_id,
-    bos_token_id=tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else None,
-)
-
-# Add missing attributes that EasyDeL expects
-if not hasattr(generation_config, 'forced_decoder_ids'):
-    generation_config.forced_decoder_ids = None
-if not hasattr(generation_config, 'forced_bos_token_id'):
-    generation_config.forced_bos_token_id = None
-if not hasattr(generation_config, 'forced_eos_token_id'):
-    generation_config.forced_eos_token_id = None
-
-# Generate with the model
-try:
-    outputs = model.generate(
-        input_ids,
-        attention_mask=attention_mask,
-        generation_config=generation_config,
-    )
-except Exception as e:
-    print(f"Generation with full config failed: {e}")
-    print("Trying simplest generation...")
-    # Fallback: use model's default generation config
-    try:
-        outputs = model.generate(
-            input_ids,
-            max_new_tokens=MAX_NEW_TOKENS,
-        )
-    except Exception as e2:
-        print(f"Simple generation also failed: {e2}")
-        print("Trying manual decoding loop...")
-        # Last resort: manual generation
-        current_ids = input_ids
-        for _ in range(MAX_NEW_TOKENS):
-            logits = model(current_ids).logits
-            next_token = jnp.argmax(logits[:, -1, :], axis=-1, keepdims=True)
-            current_ids = jnp.concatenate([current_ids, next_token], axis=1)
-            if next_token[0] == tokenizer.eos_token_id:
-                break
-        outputs = type('obj', (object,), {'sequences': current_ids})()
-
-# Extract generated sequences
-if hasattr(outputs, 'sequences'):
-    output_ids = outputs.sequences
-else:
-    output_ids = outputs
+# Generate within the mesh context
+with mesh:
+    # Manual generation loop (most reliable for EasyDeL)
+    current_ids = input_ids
+    
+    for step in range(MAX_NEW_TOKENS):
+        if jax.process_index() == 0 and step % 10 == 0:
+            print(f"Generating token {step}/{MAX_NEW_TOKENS}...")
+        
+        # Forward pass
+        outputs = model(current_ids)
+        logits = outputs.logits
+        
+        # Get next token (greedy decoding for simplicity)
+        next_token = jnp.argmax(logits[:, -1, :], axis=-1, keepdims=True)
+        
+        # Append to sequence
+        current_ids = jnp.concatenate([current_ids, next_token], axis=1)
+        
+        # Check for EOS
+        if next_token[0] == tokenizer.eos_token_id:
+            if jax.process_index() == 0:
+                print("EOS token generated, stopping...")
+            break
+    
+    output_ids = current_ids
 
 # ----------------------------------------------------------------------
 # 6. DECODE AND DISPLAY OUTPUT
