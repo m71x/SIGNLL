@@ -41,7 +41,14 @@ from easydel import (
     EasyDeLState,
     PartitionAxis,
 )
+# --- CRITICAL FIX: IMPORT PARTITION RULES ---
+from easydel.modules.qwen2 import qwen2_flax_partition_rules
+# --------------------------------------------
 from transformers import AutoTokenizer
+from jax.sharding import Mesh
+from jax.experimental import mesh_utils
+import json
+import time
 
 # ----------------------------------------------------------------------
 # 1. CONFIGURATION
@@ -50,9 +57,8 @@ MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 MAX_NEW_TOKENS = 30
 
 # TPU MESH CONFIGURATION (32 Chips)
-# Adjusting for better memory distribution: more FSDP, less TP
-FSDP_SIZE = 8  # Fully Sharded Data Parallel (increased)
-TP_SIZE = 4    # Tensor Parallelism (decreased)
+FSDP_SIZE = 8  # Fully Sharded Data Parallel
+TP_SIZE = 4    # Tensor Parallelism
 SP_SIZE = 1    # Sequence Parallelism
 
 # ----------------------------------------------------------------------
@@ -67,7 +73,6 @@ if jax.process_index() == 0:
     )
 else:
     # Wait for process 0 to download
-    import time
     time.sleep(10)
     tokenizer = AutoTokenizer.from_pretrained(
         MODEL_ID, 
@@ -81,10 +86,6 @@ if tokenizer.pad_token is None:
 # ----------------------------------------------------------------------
 # 3. LOAD MODEL WITH EASYDEL
 # ----------------------------------------------------------------------
-from jax.sharding import Mesh
-from jax.experimental import mesh_utils
-import json
-
 if jax.process_index() == 0:
     print("\n" + "="*80)
     print("DEVICE AND MESH SETUP")
@@ -135,6 +136,15 @@ if jax.process_index() == 0:
     print(f"  TP axis: tp (size={TP_SIZE})")
     print(f"  SP axis: sp (size={SP_SIZE})")
 
+# --- CRITICAL FIX: GENERATE PARTITION RULES ---
+partition_rules = qwen2_flax_partition_rules(
+    partition_axis=partition_axis,
+    fully_sharded_data_parallel=True
+)
+if jax.process_index() == 0:
+    print(f"✅ Qwen2 Partition Rules Generated")
+# ----------------------------------------------
+
 # Only load from disk on process 0
 if jax.process_index() == 0:
     print("\n" + "="*80)
@@ -149,6 +159,10 @@ with mesh:
         dtype=jnp.bfloat16,
         param_dtype=jnp.bfloat16,
         precision=jax.lax.Precision.DEFAULT,
+        # --- FIX: INJECT RULES HERE ---
+        partition_rules=partition_rules,
+        auto_shard_params=True,
+        # ------------------------------
         sharding_axis_dims=(FSDP_SIZE, TP_SIZE, SP_SIZE),
         sharding_axis_names=('fsdp', 'tp', 'sp'),
         partition_axis=partition_axis,
