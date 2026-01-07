@@ -154,7 +154,7 @@ with mesh:
         precision=jax.lax.Precision.DEFAULT,
         # PASS THE MANUAL RULES
         partition_rules=partition_rules,
-        auto_shard_params=True,
+        #auto_shard_params=True,
         sharding_axis_dims=(FSDP_SIZE, TP_SIZE, SP_SIZE),
         sharding_axis_names=('fsdp', 'tp', 'sp'),
         partition_axis=partition_axis,
