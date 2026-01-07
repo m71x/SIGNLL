@@ -179,113 +179,105 @@ if jax.process_index() == 0:
     print(f"✓ Params available: {params is not None}")
     print(f"✓ Params type: {type(params)}")
     
+    # Try multiple methods to inspect parameters
     if params is not None:
-        # Handle different param types
+        print("\n🔍 INSPECTING PARAMETER STRUCTURE...")
+        
+        # Method 1: Check if it's a PyTree
         try:
-            # Try to convert to dict-like structure
-            if hasattr(params, 'unfreeze'):
-                # FrozenDict
-                params_dict = params.unfreeze()
-            elif hasattr(params, 'to_pure_dict'):
-                # NNX State
-                params_dict = params.to_pure_dict()
-            elif hasattr(params, '__dict__'):
-                params_dict = params.__dict__
-            else:
-                params_dict = dict(params)
+            import jax.tree_util as tree_util
+            leaves = tree_util.tree_leaves(params)
+            print(f"  Found {len(leaves)} parameter tensors via tree_leaves")
             
-            from flax.traverse_util import flatten_dict
-            flat_params = flatten_dict(params_dict, sep='.')
-        except Exception as e:
-            print(f"  Warning: Could not flatten params: {e}")
-            print(f"  Attempting alternative inspection...")
-            # Alternative: iterate directly
-            flat_params = {}
+            total_params = 0
+            total_bytes = 0
             
-            def collect_params(prefix, obj):
-                if hasattr(obj, 'shape'):
-                    flat_params[prefix] = obj
-                elif isinstance(obj, dict):
-                    for k, v in obj.items():
-                        collect_params(f"{prefix}.{k}" if prefix else k, v)
-                elif hasattr(obj, '__dict__'):
-                    for k, v in obj.__dict__.items():
-                        collect_params(f"{prefix}.{k}" if prefix else k, v)
+            for i, leaf in enumerate(leaves):
+                if hasattr(leaf, 'shape'):
+                    param_count = int(jnp.prod(jnp.array(leaf.shape)))
+                    param_bytes = param_count * 2
+                    total_params += param_count
+                    total_bytes += param_bytes
             
-            collect_params('', params)
-        
-        print(f"\n📊 PARAMETER STATISTICS:")
-        total_params = 0
-        total_bytes = 0
-        param_count_by_type = {}
-        
-        # Count parameters
-        for key, value in flat_params.items():
-            if hasattr(value, 'shape'):
-                param_count = int(jnp.prod(jnp.array(value.shape)))
-                param_bytes = param_count * 2  # bfloat16 = 2 bytes
-                total_params += param_count
-                total_bytes += param_bytes
-                
-                # Track by layer type
-                layer_type = key.split('.')[0] if '.' in key else 'other'
-                param_count_by_type[layer_type] = param_count_by_type.get(layer_type, 0) + param_bytes
-        
-        print(f"  Total parameters: {total_params:,}")
-        print(f"  Total size: {total_bytes / (1024**3):.2f} GB (bfloat16)")
-        print(f"  Per-device (ideal): {total_bytes / (1024**3) / 32:.2f} GB")
-        print(f"  Number of param tensors: {len(flat_params)}")
-        
-        print(f"\n📈 SIZE BY COMPONENT:")
-        for comp, size in sorted(param_count_by_type.items(), key=lambda x: x[1], reverse=True)[:10]:
-            print(f"  {comp}: {size / (1024**3):.2f} GB")
-        
-        print(f"\n🔍 SHARDING DETAILS (Sample of parameters):")
-        # Show first few, middle, and last few parameters
-        keys = list(flat_params.keys())
-        sample_keys = keys[:10] + keys[len(keys)//2:len(keys)//2+5] + keys[-10:]
-        
-        for key in sample_keys:
-            value = flat_params[key]
-            if hasattr(value, 'shape'):
-                param_size_mb = (jnp.prod(jnp.array(value.shape)) * 2) / (1024**2)
-                print(f"\n  {key}:")
-                print(f"    Shape: {value.shape}")
-                print(f"    Size: {param_size_mb:.2f} MB")
-                
-                if hasattr(value, 'sharding') and value.sharding is not None:
-                    print(f"    Sharding spec: {value.sharding.spec}")
-                    print(f"    Sharding mesh: {value.sharding.mesh.axis_names}")
+            print(f"\n📊 PARAMETER STATISTICS:")
+            print(f"  Total parameters: {total_params:,}")
+            print(f"  Total size: {total_bytes / (1024**3):.2f} GB (bfloat16)")
+            print(f"  Per-device (ideal): {total_bytes / (1024**3) / 32:.2f} GB")
+            
+            # Get structure with paths
+            paths_and_vals = tree_util.tree_flatten_with_path(params)
+            flat_params_list = [(tree_util.keystr(path), val) for path, val in zip(paths_and_vals[1], paths_and_vals[0])]
+            
+            print(f"\n🔍 FIRST 15 PARAMETERS:")
+            for i, (path, val) in enumerate(flat_params_list[:15]):
+                if hasattr(val, 'shape'):
+                    size_mb = (jnp.prod(jnp.array(val.shape)) * 2) / (1024**2)
+                    print(f"\n  [{i}] {path}")
+                    print(f"      Shape: {val.shape}")
+                    print(f"      Size: {size_mb:.2f} MB")
+                    print(f"      Dtype: {val.dtype}")
                     
-                    # Check which devices this parameter is on
+                    if hasattr(val, 'sharding') and val.sharding is not None:
+                        print(f"      Sharding spec: {val.sharding.spec}")
+                        print(f"      Mesh: {val.sharding.mesh.axis_names}")
+                        try:
+                            device_set = val.sharding.device_set
+                            print(f"      Spread across: {len(device_set)} devices")
+                        except:
+                            pass
+                    else:
+                        print(f"      ⚠️  NO SHARDING INFO")
+            
+            print(f"\n🔍 LAST 15 PARAMETERS:")
+            for i, (path, val) in enumerate(flat_params_list[-15:]):
+                if hasattr(val, 'shape'):
+                    size_mb = (jnp.prod(jnp.array(val.shape)) * 2) / (1024**2)
+                    print(f"\n  [{len(flat_params_list)-15+i}] {path}")
+                    print(f"      Shape: {val.shape}")
+                    print(f"      Size: {size_mb:.2f} MB")
+                    print(f"      Dtype: {val.dtype}")
+                    
+                    if hasattr(val, 'sharding') and val.sharding is not None:
+                        print(f"      Sharding spec: {val.sharding.spec}")
+                        print(f"      Mesh: {val.sharding.mesh.axis_names}")
+                        try:
+                            device_set = val.sharding.device_set
+                            print(f"      Spread across: {len(device_set)} devices")
+                        except:
+                            pass
+                    else:
+                        print(f"      ⚠️  NO SHARDING INFO")
+            
+            # Find largest parameters
+            print(f"\n🚨 15 LARGEST PARAMETERS:")
+            params_with_sizes = [(path, val, jnp.prod(jnp.array(val.shape)) * 2 if hasattr(val, 'shape') else 0)
+                                for path, val in flat_params_list]
+            params_with_sizes.sort(key=lambda x: x[2], reverse=True)
+            
+            for path, val, size_bytes in params_with_sizes[:15]:
+                size_mb = size_bytes / (1024**2)
+                print(f"\n  {path}")
+                print(f"    Shape: {val.shape}")
+                print(f"    Size: {size_mb:.2f} MB")
+                print(f"    Dtype: {val.dtype}")
+                
+                if hasattr(val, 'sharding') and val.sharding is not None:
+                    print(f"    Sharding spec: {val.sharding.spec}")
+                    print(f"    Mesh: {val.sharding.mesh.axis_names}")
                     try:
-                        device_set = value.sharding.device_set
+                        device_set = val.sharding.device_set
                         print(f"    Spread across: {len(device_set)} devices")
-                    except Exception as e:
-                        print(f"    Could not determine device set: {e}")
+                        if len(device_set) < 32:
+                            print(f"    ⚠️  WARNING: Only on {len(device_set)}/32 devices!")
+                    except:
+                        pass
                 else:
-                    print(f"    ⚠️  NO SHARDING INFO - might be replicated!")
-        
-        # Critical check: look for largest parameters
-        print(f"\n🚨 LARGEST PARAMETERS (potential OOM culprits):")
-        param_sizes = [(k, v, jnp.prod(jnp.array(v.shape)) * 2 if hasattr(v, 'shape') else 0) 
-                       for k, v in flat_params.items()]
-        param_sizes.sort(key=lambda x: x[2], reverse=True)
-        
-        for key, value, size_bytes in param_sizes[:15]:
-            size_mb = size_bytes / (1024**2)
-            print(f"\n  {key}:")
-            print(f"    Shape: {value.shape}")
-            print(f"    Size: {size_mb:.2f} MB")
-            if hasattr(value, 'sharding') and value.sharding is not None:
-                print(f"    Sharding: {value.sharding.spec}")
-                try:
-                    device_set = value.sharding.device_set
-                    print(f"    Devices: {len(device_set)}")
-                except:
-                    pass
-            else:
-                print(f"    ⚠️  NO SHARDING - REPLICATED ACROSS ALL DEVICES!")
+                    print(f"    🚨 NO SHARDING - LIKELY REPLICATED ON ALL DEVICES!")
+                    
+        except Exception as e:
+            print(f"❌ Error inspecting params: {e}")
+            import traceback
+            traceback.print_exc()
 
 # ----------------------------------------------------------------------
 # 4. PREPARE INPUT
