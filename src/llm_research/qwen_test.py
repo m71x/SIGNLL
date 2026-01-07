@@ -19,9 +19,22 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["PJRT_DEVICE"] = "TPU"
 
 # ============================================================================
-# IMPORTS (AFTER ENV VARS)
+# INITIALIZE JAX DISTRIBUTED BEFORE ANY JAX/EASYDEL IMPORTS
 # ============================================================================
 import jax
+
+# This MUST come before importing easydel or calling any JAX operations
+jax.distributed.initialize()
+
+print(f"JAX distributed initialized:")
+print(f"  Process index: {jax.process_index()}")
+print(f"  Process count: {jax.process_count()}")
+print(f"  Local devices: {jax.local_device_count()}")
+print(f"  Global devices: {jax.device_count()}")
+
+# ============================================================================
+# IMPORTS (AFTER DISTRIBUTED INIT)
+# ============================================================================
 import jax.numpy as jnp
 from easydel import (
     AutoEasyDeLModelForCausalLM,
@@ -29,18 +42,6 @@ from easydel import (
     PartitionAxis,
 )
 from transformers import AutoTokenizer
-
-# ============================================================================
-# INITIALIZE DISTRIBUTED JAX FOR MULTI-HOST TPU
-# ============================================================================
-# This is critical for TPU pods with multiple hosts
-jax.distributed.initialize()
-
-print(f"JAX initialized:")
-print(f"  Process index: {jax.process_index()}")
-print(f"  Process count: {jax.process_count()}")
-print(f"  Local devices: {jax.local_device_count()}")
-print(f"  Global devices: {jax.device_count()}")
 
 # ----------------------------------------------------------------------
 # 1. CONFIGURATION
