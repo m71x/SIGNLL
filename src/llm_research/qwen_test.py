@@ -41,15 +41,14 @@ from easydel import (
     EasyDeLState,
     PartitionAxis,
 )
-# We import PartitionRule to define sharding manually
-from easydel.infra.base_module import PartitionRule
-
 from transformers import AutoTokenizer
 from jax.sharding import Mesh
 from jax.experimental import mesh_utils
 import json
 import time
 import re
+from dataclasses import dataclass
+from typing import Optional, Union, Tuple
 
 # ----------------------------------------------------------------------
 # 1. CONFIGURATION
@@ -63,7 +62,17 @@ TP_SIZE = 4    # Tensor Parallelism
 SP_SIZE = 1    # Sequence Parallelism
 
 # ----------------------------------------------------------------------
-# 2. LOAD TOKENIZER
+# 2. DEFINITIONS (FIX FOR MISSING IMPORTS)
+# ----------------------------------------------------------------------
+
+# We define PartitionRule locally to avoid ImportError hell
+@dataclass
+class PartitionRule:
+    primary: Optional[str]
+    fsdp: Optional[Union[str, Tuple[str, ...]]]
+
+# ----------------------------------------------------------------------
+# 3. LOAD TOKENIZER
 # ----------------------------------------------------------------------
 if jax.process_index() == 0:
     print("Loading Tokenizer...")
@@ -85,7 +94,7 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
 # ----------------------------------------------------------------------
-# 3. LOAD MODEL WITH MANUAL PARTITION RULES
+# 4. LOAD MODEL WITH MANUAL PARTITION RULES
 # ----------------------------------------------------------------------
 if jax.process_index() == 0:
     print("\n" + "="*80)
@@ -103,22 +112,22 @@ partition_axis = PartitionAxis(
 )
 
 # ======================================================================
-# CRITICAL FIX: MANUALLY DEFINE SHARDING RULES
-# This explicitly maps Qwen parameter names to mesh axes.
+# MANUALLY DEFINE SHARDING RULES
+# Using our local PartitionRule class
 # ======================================================================
 partition_rules = (
     # Embeddings
     (re.compile(".*embed_tokens.*"), PartitionRule(None, ("fsdp", "tp"))),
     
-    # Attention Q, K, V (Shard across FSDP and TP)
+    # Attention Q, K, V
     (re.compile(".*q_proj.*"),      PartitionRule(None, ("fsdp", "tp"))),
     (re.compile(".*k_proj.*"),      PartitionRule(None, ("fsdp", "tp"))),
     (re.compile(".*v_proj.*"),      PartitionRule(None, ("fsdp", "tp"))),
     
-    # Attention Output (Often needs reverse sharding or same)
+    # Attention Output
     (re.compile(".*o_proj.*"),      PartitionRule(None, ("tp", "fsdp"))),
     
-    # MLP (Gate and Up shard one way, Down shards the other)
+    # MLP
     (re.compile(".*gate_proj.*"),   PartitionRule(None, ("fsdp", "tp"))),
     (re.compile(".*up_proj.*"),     PartitionRule(None, ("fsdp", "tp"))),
     (re.compile(".*down_proj.*"),   PartitionRule(None, ("tp", "fsdp"))),
@@ -126,7 +135,7 @@ partition_rules = (
     # Output Head
     (re.compile(".*lm_head.*"),     PartitionRule(None, ("fsdp", "tp"))),
     
-    # Layer Norms (Bias/Scale usually small, replicated or FSDP)
+    # Layer Norms
     (re.compile(".*norm.*"),        PartitionRule(None, ("fsdp",))),
     
     # Catch-all
@@ -134,7 +143,7 @@ partition_rules = (
 )
 
 if jax.process_index() == 0:
-    print(f"\n✅ Manual Partition Rules Applied.")
+    print(f"\n✅ Manual Partition Rules Applied (Locally Defined).")
 
 # Load model using the manual rules
 with mesh:
@@ -168,7 +177,7 @@ else:
     params = model.params if hasattr(model, 'params') else None
 
 # ----------------------------------------------------------------------
-# 4. INSPECTION (WITH YOUR ORIGINAL DEBUG LOGS)
+# 5. INSPECTION
 # ----------------------------------------------------------------------
 if jax.process_index() == 0 and params is not None:
     print("\n" + "="*80)
@@ -202,7 +211,7 @@ if jax.process_index() == 0 and params is not None:
         print(f"Inspection error: {e}")
 
 # ----------------------------------------------------------------------
-# 5. GENERATION
+# 6. GENERATION
 # ----------------------------------------------------------------------
 prompt = "Write a high-performance C++ implementation of a thread pool."
 
