@@ -125,6 +125,18 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
+  --command="pip install 'accelerate>=0.26.0'"
+
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="pip install -U bitsandbytes"
+
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
   --command="pip install --upgrade pip && pip install tensorflow tensorflow-datasets && pip install --upgrade easydel" 
 
 #kill on all workers
