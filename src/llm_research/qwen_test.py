@@ -83,17 +83,44 @@ if tokenizer.pad_token is None:
 # ----------------------------------------------------------------------
 from jax.sharding import Mesh
 from jax.experimental import mesh_utils
+import json
+
+if jax.process_index() == 0:
+    print("\n" + "="*80)
+    print("DEVICE AND MESH SETUP")
+    print("="*80)
+
+# Get all devices
+devices = jax.devices()
+
+if jax.process_index() == 0:
+    print(f"\n📊 DEVICE INFORMATION:")
+    print(f"  Total global devices: {jax.device_count()}")
+    print(f"  Local devices: {jax.local_device_count()}")
+    print(f"  Process index: {jax.process_index()}")
+    print(f"  Process count: {jax.process_count()}")
+    
+    print(f"\n📋 DEVICE LIST:")
+    for i, device in enumerate(devices):
+        print(f"  Device {i}: {device}")
+        print(f"    - Platform: {device.platform}")
+        print(f"    - ID: {device.id}")
+        print(f"    - Process index: {device.process_index}")
 
 print(f"\nLoading Model with EasyDeL...")
 print(f"Mesh Configuration: FSDP={FSDP_SIZE}, TP={TP_SIZE}, SP={SP_SIZE}")
 print(f"Total devices needed: {FSDP_SIZE * TP_SIZE * SP_SIZE}")
 
 # Create the device mesh
-devices = jax.devices()
 device_array = mesh_utils.create_device_mesh((FSDP_SIZE, TP_SIZE, SP_SIZE), devices=devices)
 mesh = Mesh(device_array, axis_names=('fsdp', 'tp', 'sp'))
 
-print(f"Created mesh: {mesh}")
+if jax.process_index() == 0:
+    print(f"\n🔷 MESH CREATED:")
+    print(f"  Mesh shape: {mesh.shape}")
+    print(f"  Axis names: {mesh.axis_names}")
+    print(f"  Device mesh shape: {device_array.shape}")
+    print(f"  Mesh:\n{mesh}")
 
 # Create PartitionAxis WITHOUT 'dp' axis (only use axes in mesh)
 partition_axis = PartitionAxis(
@@ -102,8 +129,17 @@ partition_axis = PartitionAxis(
     sequence_parallel_axis="sp",
 )
 
+if jax.process_index() == 0:
+    print(f"\n✅ PartitionAxis configured")
+    print(f"  FSDP axis: fsdp (size={FSDP_SIZE})")
+    print(f"  TP axis: tp (size={TP_SIZE})")
+    print(f"  SP axis: sp (size={SP_SIZE})")
+
 # Only load from disk on process 0
 if jax.process_index() == 0:
+    print("\n" + "="*80)
+    print("MODEL LOADING")
+    print("="*80)
     print("Process 0: Loading model from disk...")
 
 # Load model with automatic sharding across all hosts
@@ -136,9 +172,87 @@ else:
     params = model.params if hasattr(model, 'params') else None
 
 if jax.process_index() == 0:
-    print("✓ Model loaded and sharded successfully!")
+    print("\n" + "="*80)
+    print("PARAMETER SHARDING ANALYSIS")
+    print("="*80)
     print(f"✓ Model type: {type(model)}")
     print(f"✓ Params available: {params is not None}")
+    
+    if params is not None:
+        from flax.traverse_util import flatten_dict
+        
+        flat_params = flatten_dict(params, sep='.')
+        
+        print(f"\n📊 PARAMETER STATISTICS:")
+        total_params = 0
+        total_bytes = 0
+        
+        # Count parameters
+        for key, value in flat_params.items():
+            if hasattr(value, 'shape'):
+                param_count = jnp.prod(jnp.array(value.shape))
+                param_bytes = param_count * 2  # bfloat16 = 2 bytes
+                total_params += param_count
+                total_bytes += param_bytes
+        
+        print(f"  Total parameters: {total_params:,}")
+        print(f"  Total size: {total_bytes / (1024**3):.2f} GB (bfloat16)")
+        print(f"  Per-device (ideal): {total_bytes / (1024**3) / 32:.2f} GB")
+        
+        print(f"\n🔍 SHARDING DETAILS (First 20 layers):")
+        count = 0
+        for key, value in flat_params.items():
+            if count >= 20:
+                break
+            if hasattr(value, 'shape') and hasattr(value, 'sharding'):
+                param_size_mb = (jnp.prod(jnp.array(value.shape)) * 2) / (1024**2)
+                print(f"\n  {key}:")
+                print(f"    Shape: {value.shape}")
+                print(f"    Size: {param_size_mb:.2f} MB")
+                print(f"    Sharding spec: {value.sharding.spec}")
+                print(f"    Sharding mesh: {value.sharding.mesh}")
+                
+                # Check which devices this parameter is on
+                try:
+                    device_set = value.sharding.device_set
+                    print(f"    Devices: {len(device_set)} devices")
+                except:
+                    pass
+                
+                count += 1
+        
+        print(f"\n🔍 CRITICAL LAYERS (lm_head, embeddings):")
+        for key, value in flat_params.items():
+            if 'lm_head' in key or 'embed' in key:
+                if hasattr(value, 'shape'):
+                    param_size_mb = (jnp.prod(jnp.array(value.shape)) * 2) / (1024**2)
+                    print(f"\n  {key}:")
+                    print(f"    Shape: {value.shape}")
+                    print(f"    Size: {param_size_mb:.2f} MB")
+                    if hasattr(value, 'sharding'):
+                        print(f"    Sharding spec: {value.sharding.spec}")
+                        try:
+                            device_set = value.sharding.device_set
+                            print(f"    Devices: {len(device_set)} devices")
+                        except:
+                            pass
+        
+        print(f"\n🔍 LAST LAYER DETAILS:")
+        last_layers = [k for k in flat_params.keys() if 'layers.63' in k or 'layers.62' in k]
+        for key in last_layers[:10]:
+            value = flat_params[key]
+            if hasattr(value, 'shape'):
+                param_size_mb = (jnp.prod(jnp.array(value.shape)) * 2) / (1024**2)
+                print(f"\n  {key}:")
+                print(f"    Shape: {value.shape}")
+                print(f"    Size: {param_size_mb:.2f} MB")
+                if hasattr(value, 'sharding'):
+                    print(f"    Sharding spec: {value.sharding.spec}")
+                    try:
+                        device_set = value.sharding.device_set
+                        print(f"    Devices: {len(device_set)} devices")
+                    except:
+                        pass
 
 # ----------------------------------------------------------------------
 # 4. PREPARE INPUT
