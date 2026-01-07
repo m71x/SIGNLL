@@ -210,7 +210,7 @@ if jax.process_index() == 0:
             
             print(f"\n🔍 FIRST 15 PARAMETERS:")
             for i, (path, val) in enumerate(leaves_with_paths[:15]):
-                if hasattr(val, 'shape'):
+                if hasattr(val, 'shape') and len(val.shape) > 0:  # Skip scalars
                     size_mb = (jnp.prod(jnp.array(val.shape)) * 2) / (1024**2)
                     path_str = tree_util.keystr(path)
                     print(f"\n  [{i}] {path_str}")
@@ -219,44 +219,69 @@ if jax.process_index() == 0:
                     print(f"      Dtype: {val.dtype}")
                     
                     if hasattr(val, 'sharding') and val.sharding is not None:
-                        print(f"      Sharding spec: {val.sharding.spec}")
-                        print(f"      Mesh: {val.sharding.mesh.axis_names}")
+                        sharding_type = type(val.sharding).__name__
+                        print(f"      Sharding type: {sharding_type}")
+                        
+                        if hasattr(val.sharding, 'spec'):
+                            print(f"      Sharding spec: {val.sharding.spec}")
+                            print(f"      Mesh: {val.sharding.mesh.axis_names}")
+                        elif 'SingleDevice' in sharding_type:
+                            print(f"      🚨 SINGLE DEVICE SHARDING - NOT DISTRIBUTED!")
+                        else:
+                            print(f"      Unknown sharding: {val.sharding}")
+                        
                         try:
                             device_set = val.sharding.device_set
-                            print(f"      Spread across: {len(device_set)} devices")
+                            print(f"      Device count: {len(device_set)}")
+                            if len(device_set) == 1:
+                                print(f"      🚨 ON ONLY 1 DEVICE!")
                         except:
                             pass
                     else:
                         print(f"      ⚠️  NO SHARDING INFO")
             
-            print(f"\n🔍 LAST 15 PARAMETERS:")
-            for i, (path, val) in enumerate(leaves_with_paths[-15:]):
-                if hasattr(val, 'shape'):
-                    size_mb = (jnp.prod(jnp.array(val.shape)) * 2) / (1024**2)
-                    path_str = tree_util.keystr(path)
-                    print(f"\n  [{len(leaves_with_paths)-15+i}] {path_str}")
-                    print(f"      Shape: {val.shape}")
-                    print(f"      Size: {size_mb:.2f} MB")
-                    print(f"      Dtype: {val.dtype}")
+            print(f"\n🔍 LAST 15 WEIGHT PARAMETERS (skipping RNG states):")
+            weight_params = [(path, val) for path, val in leaves_with_paths 
+                           if hasattr(val, 'shape') and len(val.shape) > 0 and 'weight' in tree_util.keystr(path).lower()]
+            
+            for i, (path, val) in enumerate(weight_params[-15:]):
+                size_mb = (jnp.prod(jnp.array(val.shape)) * 2) / (1024**2)
+                path_str = tree_util.keystr(path)
+                print(f"\n  [{len(weight_params)-15+i}] {path_str}")
+                print(f"      Shape: {val.shape}")
+                print(f"      Size: {size_mb:.2f} MB")
+                print(f"      Dtype: {val.dtype}")
+                
+                if hasattr(val, 'sharding') and val.sharding is not None:
+                    sharding_type = type(val.sharding).__name__
+                    print(f"      Sharding type: {sharding_type}")
                     
-                    if hasattr(val, 'sharding') and val.sharding is not None:
+                    if hasattr(val.sharding, 'spec'):
                         print(f"      Sharding spec: {val.sharding.spec}")
                         print(f"      Mesh: {val.sharding.mesh.axis_names}")
-                        try:
-                            device_set = val.sharding.device_set
-                            print(f"      Spread across: {len(device_set)} devices")
-                        except:
-                            pass
-                    else:
-                        print(f"      ⚠️  NO SHARDING INFO")
+                    elif 'SingleDevice' in sharding_type:
+                        print(f"      🚨 SINGLE DEVICE SHARDING - NOT DISTRIBUTED!")
+                    
+                    try:
+                        device_set = val.sharding.device_set
+                        print(f"      Device count: {len(device_set)}")
+                        if len(device_set) < 32:
+                            print(f"      ⚠️  Only on {len(device_set)}/32 devices!")
+                    except:
+                        pass
+                else:
+                    print(f"      ⚠️  NO SHARDING INFO")
             
             # Find largest parameters
-            print(f"\n🚨 15 LARGEST PARAMETERS:")
-            params_with_sizes = [(tree_util.keystr(path), val, jnp.prod(jnp.array(val.shape)) * 2 if hasattr(val, 'shape') else 0)
-                                for path, val in leaves_with_paths]
+            print(f"\n🚨 20 LARGEST PARAMETERS:")
+            params_with_sizes = [
+                (tree_util.keystr(path), val, jnp.prod(jnp.array(val.shape)) * 2)
+                for path, val in leaves_with_paths 
+                if hasattr(val, 'shape') and len(val.shape) > 0
+            ]
             params_with_sizes.sort(key=lambda x: x[2], reverse=True)
             
-            for path_str, val, size_bytes in params_with_sizes[:15]:
+            for path_str, val, size_bytes in params_with_sizes[:20]:
                 size_mb = size_bytes / (1024**2)
                 print(f"\n  {path_str}")
                 print(f"    Shape: {val.shape}")
@@ -264,17 +289,25 @@ if jax.process_index() == 0:
                 print(f"    Dtype: {val.dtype}")
                 
                 if hasattr(val, 'sharding') and val.sharding is not None:
-                    print(f"    Sharding spec: {val.sharding.spec}")
-                    print(f"    Mesh: {val.sharding.mesh.axis_names}")
+                    sharding_type = type(val.sharding).__name__
+                    print(f"    Sharding type: {sharding_type}")
+                    
+                    if hasattr(val.sharding, 'spec'):
+                        print(f"    Sharding spec: {val.sharding.spec}")
+                        print(f"    Mesh: {val.sharding.mesh.axis_names}")
+                    elif 'SingleDevice' in sharding_type:
+                        print(f"    🚨 SINGLE DEVICE SHARDING!")
+                    
                     try:
                         device_set = val.sharding.device_set
-                        print(f"    Spread across: {len(device_set)} devices")
-                        if len(device_set) < 32:
-                            print(f"    ⚠️  WARNING: Only on {len(device_set)}/32 devices!")
+                        num_devices = len(device_set)
+                        print(f"    Device count: {num_devices}/32")
+                        if num_devices < 32:
+                            print(f"    🚨🚨🚨 PROBLEM: Only on {num_devices} devices, not all 32!")
                     except:
                         pass
                 else:
-                    print(f"    🚨 NO SHARDING - LIKELY REPLICATED ON ALL DEVICES!")
+                    print(f"    🚨 NO SHARDING - REPLICATED ON ALL DEVICES!")
                     
         except Exception as e:
             print(f"❌ Error inspecting params: {e}")
