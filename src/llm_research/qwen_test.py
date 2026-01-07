@@ -183,16 +183,17 @@ if jax.process_index() == 0:
     if params is not None:
         print("\n🔍 INSPECTING PARAMETER STRUCTURE...")
         
-        # Method 1: Check if it's a PyTree
         try:
             import jax.tree_util as tree_util
+            
+            # Get all parameter leaves
             leaves = tree_util.tree_leaves(params)
             print(f"  Found {len(leaves)} parameter tensors via tree_leaves")
             
             total_params = 0
             total_bytes = 0
             
-            for i, leaf in enumerate(leaves):
+            for leaf in leaves:
                 if hasattr(leaf, 'shape'):
                     param_count = int(jnp.prod(jnp.array(leaf.shape)))
                     param_bytes = param_count * 2
@@ -204,15 +205,15 @@ if jax.process_index() == 0:
             print(f"  Total size: {total_bytes / (1024**3):.2f} GB (bfloat16)")
             print(f"  Per-device (ideal): {total_bytes / (1024**3) / 32:.2f} GB")
             
-            # Get structure with paths
-            paths_and_vals = tree_util.tree_flatten_with_path(params)
-            flat_params_list = [(tree_util.keystr(path), val) for path, val in zip(paths_and_vals[1], paths_and_vals[0])]
+            # Get structure with paths - FIXED
+            leaves_with_paths, treedef = tree_util.tree_flatten_with_path(params)
             
             print(f"\n🔍 FIRST 15 PARAMETERS:")
-            for i, (path, val) in enumerate(flat_params_list[:15]):
+            for i, (path, val) in enumerate(leaves_with_paths[:15]):
                 if hasattr(val, 'shape'):
                     size_mb = (jnp.prod(jnp.array(val.shape)) * 2) / (1024**2)
-                    print(f"\n  [{i}] {path}")
+                    path_str = tree_util.keystr(path)
+                    print(f"\n  [{i}] {path_str}")
                     print(f"      Shape: {val.shape}")
                     print(f"      Size: {size_mb:.2f} MB")
                     print(f"      Dtype: {val.dtype}")
@@ -229,10 +230,11 @@ if jax.process_index() == 0:
                         print(f"      ⚠️  NO SHARDING INFO")
             
             print(f"\n🔍 LAST 15 PARAMETERS:")
-            for i, (path, val) in enumerate(flat_params_list[-15:]):
+            for i, (path, val) in enumerate(leaves_with_paths[-15:]):
                 if hasattr(val, 'shape'):
                     size_mb = (jnp.prod(jnp.array(val.shape)) * 2) / (1024**2)
-                    print(f"\n  [{len(flat_params_list)-15+i}] {path}")
+                    path_str = tree_util.keystr(path)
+                    print(f"\n  [{len(leaves_with_paths)-15+i}] {path_str}")
                     print(f"      Shape: {val.shape}")
                     print(f"      Size: {size_mb:.2f} MB")
                     print(f"      Dtype: {val.dtype}")
@@ -250,13 +252,13 @@ if jax.process_index() == 0:
             
             # Find largest parameters
             print(f"\n🚨 15 LARGEST PARAMETERS:")
-            params_with_sizes = [(path, val, jnp.prod(jnp.array(val.shape)) * 2 if hasattr(val, 'shape') else 0)
-                                for path, val in flat_params_list]
+            params_with_sizes = [(tree_util.keystr(path), val, jnp.prod(jnp.array(val.shape)) * 2 if hasattr(val, 'shape') else 0)
+                                for path, val in leaves_with_paths]
             params_with_sizes.sort(key=lambda x: x[2], reverse=True)
             
-            for path, val, size_bytes in params_with_sizes[:15]:
+            for path_str, val, size_bytes in params_with_sizes[:15]:
                 size_mb = size_bytes / (1024**2)
-                print(f"\n  {path}")
+                print(f"\n  {path_str}")
                 print(f"    Shape: {val.shape}")
                 print(f"    Size: {size_mb:.2f} MB")
                 print(f"    Dtype: {val.dtype}")
