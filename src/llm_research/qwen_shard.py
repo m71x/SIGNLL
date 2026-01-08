@@ -35,13 +35,13 @@ from transformers import AutoTokenizer, GenerationConfig, AutoConfig
 # ----------------------------------------------------------------------
 # 1. CONFIGURATION
 # ----------------------------------------------------------------------
-MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
+MODEL_ID = "Qwen/Qwen2.5-Coder-14B-Instruct"
 MAX_NEW_TOKENS = 1900
 
 # TPU MESH CONFIGURATION (32 Chips)
 DP_SIZE = 1     # Data Parallel
-FSDP_SIZE = 4   # Fully Sharded DP
-TP_SIZE = 8    # Tensor Parallel
+FSDP_SIZE = 1   # Fully Sharded DP
+TP_SIZE = 32    # Tensor Parallel
 SP_SIZE = 1     # Sequence Parallel
 
 # ----------------------------------------------------------------------
