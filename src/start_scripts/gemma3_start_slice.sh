@@ -83,6 +83,11 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --worker=all \
   --command="sudo mount -o remount,size=150G /dev/shm"
+
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --worker=all \
+  --command="rm -rf /home/mikexi/sharded_qwen32b"
 #run non-tmux job
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \

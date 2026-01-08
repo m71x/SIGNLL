@@ -1,5 +1,29 @@
 # convert_and_shard.py
+# ============================================================================
+# MUST COME FIRST — ENVIRONMENT SETUP
+# ============================================================================
 import os
+
+CACHE_DIR = "/dev/shm/huggingface"
+
+# Force all Hugging Face caches to /dev/shm
+os.environ["HF_HOME"] = CACHE_DIR
+os.environ["HF_HUB_CACHE"] = f"{CACHE_DIR}/hub"
+os.environ["TRANSFORMERS_CACHE"] = f"{CACHE_DIR}/transformers"
+os.environ["HF_DATASETS_CACHE"] = f"{CACHE_DIR}/datasets"
+
+os.environ["TMPDIR"] = CACHE_DIR
+os.environ["TEMP"] = CACHE_DIR
+os.environ["TMP"] = CACHE_DIR
+
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+# Don't initialize distributed - we're running on single worker
+os.environ["PJRT_DEVICE"] = "TPU"
+
+# ============================================================================
+# IMPORTS
+# ============================================================================
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -8,20 +32,15 @@ import json
 import ml_dtypes  # Required for bfloat16 support in numpy
 from transformers import AutoModelForCausalLM, AutoConfig
 
-# Don't initialize distributed - we're running on single worker
-os.environ["PJRT_DEVICE"] = "TPU"
-
-CACHE_DIR = "/dev/shm/huggingface"
+# ============================================================================
+# CONFIG
+# ============================================================================
 OUTPUT_DIR = "/home/mikexi/sharded_qwen32b" 
 MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 
-# Sharding config (intended for the multi-host loader)
-FSDP_SIZE = 8
-TP_SIZE = 4
-SP_SIZE = 1
-
 print("="*80)
-print("STEP 1: Loading PyTorch model into CPU memory")
+print(f"STEP 1: Loading PyTorch model into CPU memory")
+print(f"Cache location: {os.environ['HF_HOME']}")
 print("="*80)
 
 # Load config
