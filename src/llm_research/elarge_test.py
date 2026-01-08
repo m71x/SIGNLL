@@ -3,9 +3,9 @@ import sys
 import os
 
 # 1. CRITICAL: Initialize distributed system BEFORE importing EasyDeL
-# This configures the backend to expect 8 workers instead of 1.
 jax.distributed.initialize() 
 from jax.experimental import multihost_utils
+
 # 2. NOW it is safe to import EasyDeL
 import easydel as ed
 
@@ -13,11 +13,10 @@ import easydel as ed
 is_master = jax.process_index() == 0
 
 if is_master:
-    print(f"Total devices: {jax.device_count()}")       # Should show 32
-    print(f"Local devices: {jax.local_device_count()}") # Should show 4
+    print(f"Total devices: {jax.device_count()}")
+    print(f"Local devices: {jax.local_device_count()}")
     print("Starting model initialization...")
 
-# ... (The rest of your code remains the same)
 elm = (
     ed.eLargeModel.from_pretrained("Qwen/Qwen2.5-Coder-14B-Instruct")
     .set_dtype("bf16")
@@ -30,29 +29,52 @@ elm = (
 
 esurge = elm.build_esurge()
 
-for output in esurge.chat(
-    [{"role": "user", "content": "Write a recursive fibonacci sequence implementation in python using memoization"}],
-    sampling_params=ed.SamplingParams(max_tokens=512),
-    stream=True,
-):
-    if is_master:
-        print(output.delta_text, end="", flush=True)
-
-if is_master:
-    print(f"\nTokens/s: {output.tokens_per_second:.2f}")
+# ---------------------------------------------------------
+# #### NEW: Define your list of independent prompts ####
+# ---------------------------------------------------------
+prompts = [
+    "Write a recursive fibonacci sequence implementation in python using memoization",
+    "Explain the difference between TCP and UDP in one paragraph.",
+    "Write a haiku about a TPU pod."
+]
 
 # ---------------------------------------------------------
-# #### NEW: Graceful Exit Block ####
+# #### NEW: Loop through prompts ####
+# ---------------------------------------------------------
+for i, user_prompt in enumerate(prompts):
+    
+    # Master prints a separator to keep logs clean
+    if is_master:
+        print(f"\n\n{'='*40}")
+        print(f"PROMPT {i+1}: {user_prompt}")
+        print(f"{'='*40}\nResponse: ", end="", flush=True)
+
+    # We create a FRESH conversation list for every loop iteration.
+    # This ensures no history (and no KV cache) is carried over from the previous run.
+    conversation = [{"role": "user", "content": user_prompt}]
+
+    # Run the chat generation
+    for output in esurge.chat(
+        conversation,
+        sampling_params=ed.SamplingParams(max_tokens=512),
+        stream=True,
+    ):
+        if is_master:
+            print(output.delta_text, end="", flush=True)
+
+    if is_master:
+        print(f"\n\n[Stats] Tokens/s: {output.tokens_per_second:.2f}")
+
+# ---------------------------------------------------------
+# Graceful Exit Block
 # ---------------------------------------------------------
 if is_master:
     print("\nWaiting for all workers to finish...")
 
-# This creates a barrier. No worker can pass this line until 
-# ALL 8 workers have reached it.
+# Barrier: All workers wait here until everyone is done with the loop
 multihost_utils.sync_global_devices("shutting_down")
 
 if is_master:
     print("All workers synced. Exiting safely.")
 
-# Optional: Explicitly shutdown the distributed backend (good hygiene)
 jax.distributed.shutdown()
