@@ -1,8 +1,13 @@
 import jax
-import easydel as ed
+import sys
+import os
 
-# Initialize the cluster across all 8 VMs
+# 1. CRITICAL: Initialize distributed system BEFORE importing EasyDeL
+# This configures the backend to expect 8 workers instead of 1.
 jax.distributed.initialize() 
+
+# 2. NOW it is safe to import EasyDeL
+import easydel as ed
 
 # Determine if this specific VM is the primary worker
 is_master = jax.process_index() == 0
@@ -12,6 +17,7 @@ if is_master:
     print(f"Local devices: {jax.local_device_count()}") # Should show 4
     print("Starting model initialization...")
 
+# ... (The rest of your code remains the same)
 elm = (
     ed.eLargeModel.from_pretrained("Qwen/Qwen2.5-Coder-14B-Instruct")
     .set_dtype("bf16")
@@ -22,10 +28,8 @@ elm = (
     .set_esurge(max_model_len=4096, max_num_seqs=32)
 )
 
-# Every worker runs build_esurge to initialize their local TPUs
 esurge = elm.build_esurge()
 
-# Every worker enters the chat loop, but only master prints
 for output in esurge.chat(
     [{"role": "user", "content": "Write a recursive fibonacci sequence implementation in python using memoization"}],
     sampling_params=ed.SamplingParams(max_tokens=512),
