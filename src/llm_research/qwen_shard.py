@@ -2,6 +2,7 @@
 # MUST COME FIRST — ENVIRONMENT SETUP
 # ============================================================================
 import os
+import easydel as ed
 
 CACHE_DIR = "/dev/shm/huggingface"
 
@@ -35,7 +36,7 @@ MAX_NEW_TOKENS = 1900
 # TPU MESH CONFIGURATION (32 Chips)
 DP_SIZE = 1     
 FSDP_SIZE = 1   
-TP_SIZE = 4    # All 32 chips working together
+TP_SIZE =32    # All 32 chips working together
 SP_SIZE = 1     
 
 # ----------------------------------------------------------------------
