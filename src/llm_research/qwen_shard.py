@@ -67,13 +67,12 @@ params_index = {}
 # Use torch.no_grad to ensure no graph overhead during conversion
 with torch.no_grad():
     for name, param in model.named_parameters():
-        # Move to CPU and convert to bfloat16
-        # We use .view(torch.int16) or ml_dtypes to bridge the gap
-        # The most reliable way for JAX/NumPy is to cast via ml_dtypes
         cpu_tensor = param.detach().cpu()
         
-        # Convert to numpy via ml_dtypes bfloat16
-        arr = cpu_tensor.numpy().astype(ml_dtypes.bfloat16)
+        # FIX: Cast to float32 first, then numpy, then ml_dtypes.bfloat16
+        # PyTorch bfloat16 -> numpy fails. 
+        # PyTorch bfloat16 -> PyTorch float32 -> numpy -> ml_dtypes.bfloat16 works.
+        arr = cpu_tensor.float().numpy().astype(ml_dtypes.bfloat16)
         
         # Save to file
         safe_name = name.replace(".", "_")
