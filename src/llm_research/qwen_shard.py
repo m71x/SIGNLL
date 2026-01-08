@@ -4,9 +4,10 @@
 # ============================================================================
 import os
 
+# Define the cache directory in shared memory (tmpfs)
 CACHE_DIR = "/dev/shm/huggingface"
 
-# Force all Hugging Face caches to /dev/shm
+# Set these BEFORE importing transformers/torch/jax
 os.environ["HF_HOME"] = CACHE_DIR
 os.environ["HF_HUB_CACHE"] = f"{CACHE_DIR}/hub"
 os.environ["TRANSFORMERS_CACHE"] = f"{CACHE_DIR}/transformers"
@@ -18,11 +19,10 @@ os.environ["TMP"] = CACHE_DIR
 
 os.environ["HF_HUB_DISABLE_XET"] = "1"
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-# Don't initialize distributed - we're running on single worker
 os.environ["PJRT_DEVICE"] = "TPU"
 
 # ============================================================================
-# IMPORTS
+# IMPORTS (Must be AFTER environment setup)
 # ============================================================================
 import jax
 import jax.numpy as jnp
@@ -33,14 +33,14 @@ import ml_dtypes  # Required for bfloat16 support in numpy
 from transformers import AutoModelForCausalLM, AutoConfig
 
 # ============================================================================
-# CONFIG
+# CONFIG & MODEL LOADING
 # ============================================================================
 OUTPUT_DIR = "/home/mikexi/sharded_qwen32b" 
 MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 
 print("="*80)
-print(f"STEP 1: Loading PyTorch model into CPU memory")
-print(f"Cache location: {os.environ['HF_HOME']}")
+print("STEP 1: Loading PyTorch model into CPU memory")
+print(f"Cache location: {os.environ.get('HF_HOME', 'Not Set')}")
 print("="*80)
 
 # Load config
