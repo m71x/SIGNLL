@@ -1,7 +1,7 @@
 import easydel as ed
 
 elm = (
-    ed.eLargeModel.from_pretrained("Qwen/Qwen2.5-Coder-34B-Instruct")
+    ed.eLargeModel.from_pretrained("Qwen/Qwen2.5-Coder-14B-Instruct")
     .set_dtype("bf16")
     .set_sharding(axis_dims=(1, 1, 1, -1, 1))
     .set_esurge(max_model_len=4096, max_num_seqs=32)

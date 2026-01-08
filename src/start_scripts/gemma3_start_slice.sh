@@ -107,18 +107,32 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
     --worker=0
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="source edel_env/bin/activate && pip install torch"
 
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html"
+  --command="sudo apt-get update && sudo apt-get install -y python3.11 python3.11-venv" && \
+            python3.11 -m venv edel_env && \
+            pip install --upgrade pip && \
+            pip install easydel==0.2.0.2 \"
 
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="pip install flax"
+  --command="source edel_env/bin/activate && pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html"
+
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="pip uninstall -y torch"
 
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
@@ -136,7 +150,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="pip install -U bitsandbytes"
+  --command="source edel_env/bin/activate && pip install -U bitsandbytes"
 
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
@@ -156,7 +170,13 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="pip install ml_dtypes"
+  --command="source edel_env/bin/activat pip install ml_dtypes"
+
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="pip install --upgrade easydel==0.2.0.2"
 
 #run tmux training only
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -176,7 +196,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/llm_research/qwen_shard.py"
+  --command="cd ~/SIGNLL && source ~/edel_env/bin/activate && PJRT_DEVICE=TPU python3 src/llm_research/elarge_test.py"
 #clone xla onto all workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
@@ -194,7 +214,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="python3 -m pip install --upgrade pip && python3 -m pip install --user transformers"
+  --command="source edel_env/bin/activate && pip install transformers"
 
 #install huggingface datasets library on all workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -224,7 +244,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="pip install fasttext"
+  --command="pip uninstall -y fasttext"
 
 #install requests on all tpu workers
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
