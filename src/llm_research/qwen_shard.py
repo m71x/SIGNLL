@@ -74,8 +74,6 @@ try:
         repo_id=MODEL_ID,
         cache_dir=CACHE_DIR,
         local_dir=f"{CACHE_DIR}/models/{MODEL_ID.replace('/', '--')}",
-        local_dir_use_symlinks=False,  # Don't use symlinks, copy files directly
-        resume_download=True,
     )
     print(f"✓ Model downloaded to: {local_model_path}")
 except Exception as e:
