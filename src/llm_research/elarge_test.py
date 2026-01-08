@@ -78,3 +78,6 @@ if is_master:
     print("All workers synced. Exiting safely.")
 
 jax.distributed.shutdown()
+
+print("Forcing process termination...")
+os._exit(0)

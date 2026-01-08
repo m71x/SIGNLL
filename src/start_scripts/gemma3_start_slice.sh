@@ -276,3 +276,14 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
 gsutil cp ~/SIGNLL/final_model_stage2_gated.pt gs://encoder-models-2/result-models/
 
 ls -laR /home/mikexi/siebert_model | less
+
+#check top 20 largest directories
+sudo du -ahx / | sort -rh | head -n 20
+
+
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
+  --command="sudo truncate -s 0 /var/log/syslog && sudo truncate -s 0 /var/log/kern.log"
+# Run this on the worker(s) with full disks
