@@ -5,47 +5,51 @@
 import os
 import shutil
 
-# Define the cache directory in shared memory (tmpfs)
+# 1. Define the RAM disk location
+# /dev/shm is a standard Linux directory mapped to shared memory (RAM)
 CACHE_DIR = "/dev/shm/huggingface"
 
-# Create the directory first
+# 2. Cleanup old cache first to ensure space
+if os.path.exists(CACHE_DIR):
+    try:
+        shutil.rmtree(CACHE_DIR)
+        print(f"Cleaned up old cache at {CACHE_DIR}")
+    except Exception as e:
+        print(f"Warning: Could not clean old cache: {e}")
+
+# 3. Create the directory
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Check available space
+# 4. Check available space in RAM
 stats = shutil.disk_usage("/dev/shm")
 available_gb = stats.free / (1024**3)
 print(f"Available space in /dev/shm: {available_gb:.2f} GB")
 
-stats_root = shutil.disk_usage("/")
-root_gb = stats_root.free / (1024**3)
-print(f"Available space in /: {root_gb:.2f} GB")
+if available_gb < 70:  # 32B model needs ~65GB+ for raw weights + overhead
+    print("WARNING: You might not have enough RAM (/dev/shm) for a 32B model.")
+    print("Ensure you have at least 70GB+ of system RAM available.")
 
-if root_gb < 10:
-    print(f"ERROR: Root filesystem is nearly full ({root_gb:.2f} GB free)")
-    print(f"Will use /dev/shm exclusively for all operations")
-
-# Set these BEFORE importing transformers/torch/jax
+# 5. Set Environment Variables BEFORE importing transformers
+# This overrides the default ~/.cache/huggingface location
 os.environ["HF_HOME"] = CACHE_DIR
 os.environ["HF_HUB_CACHE"] = f"{CACHE_DIR}/hub"
 os.environ["TRANSFORMERS_CACHE"] = f"{CACHE_DIR}/transformers"
 os.environ["HF_DATASETS_CACHE"] = f"{CACHE_DIR}/datasets"
 
-# Control temporary/staging download locations
+# Redirect temporary files to RAM as well
 os.environ["TMPDIR"] = CACHE_DIR
 os.environ["TEMP"] = CACHE_DIR
 os.environ["TMP"] = CACHE_DIR
 os.environ["XDG_CACHE_HOME"] = CACHE_DIR
 
-# HuggingFace settings
+# HuggingFace optimization settings
 os.environ["HF_HUB_DISABLE_XET"] = "1"
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "3600"
-
-# JAX/TPU settings
 os.environ["PJRT_DEVICE"] = "TPU"
 
 # ============================================================================
-# IMPORTS (Must be AFTER environment setup)
+# IMPORTS
 # ============================================================================
 import jax
 import jax.numpy as jnp
@@ -63,44 +67,39 @@ OUTPUT_DIR = "/home/mikexi/sharded_qwen32b"
 MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 
 print("="*80)
-print("STEP 1: Downloading model to /dev/shm first")
-print(f"Cache location: {CACHE_DIR}")
+print("STEP 1: Downloading model explicitly to /dev/shm")
+print(f"Target Location: {CACHE_DIR}")
 print("="*80)
 
-# CRITICAL FIX: Download model files explicitly to /dev/shm FIRST
-# This bypasses the default download-to-root behavior
+# Explicitly download to /dev/shm using snapshot_download
+# local_dir_use_symlinks=False ensures real files are written to /dev/shm, not symlinks to ~/.cache
 try:
     local_model_path = snapshot_download(
         repo_id=MODEL_ID,
-        cache_dir=CACHE_DIR,
         local_dir=f"{CACHE_DIR}/models/{MODEL_ID.replace('/', '--')}",
+        local_dir_use_symlinks=False,  # CRITICAL: Force actual files in RAM
+        cache_dir=CACHE_DIR,
     )
-    print(f"✓ Model downloaded to: {local_model_path}")
+    print(f"✓ Model successfully downloaded to RAM: {local_model_path}")
 except Exception as e:
-    print(f"Download failed: {e}")
-    print("Trying alternative method...")
-    local_model_path = None
+    print(f"CRITICAL ERROR: Download failed: {e}")
+    exit(1)
 
 print("\n" + "="*80)
-print("STEP 2: Loading PyTorch model into CPU memory")
+print("STEP 2: Loading PyTorch model from RAM")
 print("="*80)
 
-# Load config
-if local_model_path:
-    config = AutoConfig.from_pretrained(local_model_path, trust_remote_code=True)
-else:
-    config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True, cache_dir=CACHE_DIR)
+# Load config from the local path in RAM
+config = AutoConfig.from_pretrained(local_model_path, trust_remote_code=True)
 
-# Load model - use local path if available, otherwise use cache_dir
-model_source = local_model_path if local_model_path else MODEL_ID
-
+# Load model using the local path
+# local_files_only=True ensures we don't accidentally touch the network/root cache
 model = AutoModelForCausalLM.from_pretrained(
-    model_source,
+    local_model_path,
     torch_dtype=torch.bfloat16,
     low_cpu_mem_usage=True,
     trust_remote_code=True,
-    cache_dir=CACHE_DIR,
-    local_files_only=bool(local_model_path),  # Don't re-download if we have local files
+    local_files_only=True, 
 )
 print(f"✓ Model loaded. Parameter count: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -131,7 +130,6 @@ print(f"✓ Config saved to {OUTPUT_DIR}")
 
 params_index = {}
 
-# Use torch.no_grad to ensure no graph overhead during conversion
 with torch.no_grad():
     for name, param in model.named_parameters():
         cpu_tensor = param.detach().cpu()
@@ -160,10 +158,16 @@ with open(os.path.join(OUTPUT_DIR, "params_index.json"), "w") as f:
 print(f"\n✓ All parameters saved to {OUTPUT_DIR}")
 print(f"✓ Index saved to {OUTPUT_DIR}/params_index.json")
 
-# Cleanup to free memory immediately
+# Cleanup
 del model
 import gc
 gc.collect()
+# Optional: Free up the RAM immediately after use
+try:
+    shutil.rmtree(CACHE_DIR)
+    print(f"✓ Cleared RAM cache at {CACHE_DIR}")
+except:
+    pass
 
 print("\n" + "="*80)
 print("CONVERSION COMPLETE")
