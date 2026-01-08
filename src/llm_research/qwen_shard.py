@@ -33,11 +33,11 @@ MODEL_ID = "Qwen/Qwen2.5-Coder-14B-Instruct"
 MAX_NEW_TOKENS = 1900
 
 # TPU MESH CONFIGURATION (32 Chips)
-# You can change these, but they MUST multiply to 32 (e.g., 1*4*8*1 = 32)
-DP_SIZE = 1     # Data Parallel
-FSDP_SIZE = 4   # Fully Sharded DP
-TP_SIZE = 8     # Tensor Parallel
-SP_SIZE = 1     # Sequence Parallel
+# [CRITICAL] For a single prompt (Batch=1), FSDP/DP MUST be 1.
+DP_SIZE = 1     
+FSDP_SIZE = 1   
+TP_SIZE = 32    # All 32 chips working together on the single prompt
+SP_SIZE = 1     
 
 # ----------------------------------------------------------------------
 # 1.5 [CRITICAL] INITIALIZE MESH BEFORE LOADING
@@ -91,7 +91,7 @@ result = AutoEasyDeLModelForCausalLM.from_pretrained(
     param_dtype=jnp.bfloat16,
     precision=jax.lax.Precision.DEFAULT,
     # [CRITICAL] Pass the mesh explicitly here
-    #mesh=mesh,  
+    mesh=mesh,  
     sharding_axis_dims=(DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE),
     sharding_axis_names=('dp', 'fsdp', 'tp', 'sp'), 
     partition_axis=PartitionAxis(),
