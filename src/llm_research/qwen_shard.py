@@ -40,8 +40,8 @@ MAX_NEW_TOKENS = 1900
 
 # TPU MESH CONFIGURATION (32 Chips)
 DP_SIZE = 1     # Data Parallel
-FSDP_SIZE = 1   # Fully Sharded DP
-TP_SIZE = 32    # Tensor Parallel
+FSDP_SIZE = 4   # Fully Sharded DP
+TP_SIZE = 8    # Tensor Parallel
 SP_SIZE = 1     # Sequence Parallel
 
 # ----------------------------------------------------------------------
