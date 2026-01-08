@@ -24,7 +24,7 @@ os.environ["PJRT_DEVICE"] = "TPU"
 # ============================================================================
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # [FIX] Added Sharding imports
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental import mesh_utils
 from easydel import (
     AutoEasyDeLModelForCausalLM,
@@ -45,9 +45,26 @@ TP_SIZE = 32    # Tensor Parallel
 SP_SIZE = 1     # Sequence Parallel
 
 # ----------------------------------------------------------------------
+# VERIFICATION: CHECK DEVICE VISIBILITY
+# ----------------------------------------------------------------------
+print("\n" + "="*80)
+print("VERIFYING JAX DEVICES")
+print("="*80)
+total_devices = jax.device_count()
+local_devices = jax.local_device_count()
+print(f"Total JAX Devices Visible: {total_devices}")
+print(f"Local JAX Devices: {local_devices}")
+
+if total_devices != 32:
+    print(f"⚠️ WARNING: You configured TP_SIZE=32 but JAX sees {total_devices} devices.")
+else:
+    print("✓ JAX successfully detects 32 devices.")
+
+
+# ----------------------------------------------------------------------
 # 2. LOAD TOKENIZER & CONFIG
 # ----------------------------------------------------------------------
-print("Loading Tokenizer and Config...")
+print("\nLoading Tokenizer and Config...")
 tokenizer = AutoTokenizer.from_pretrained(
     MODEL_ID, 
     trust_remote_code=True,
@@ -58,7 +75,6 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
 # [CRITICAL FIX] MANUALLY REDUCE CONTEXT WINDOW
-# Syncing this to 2048 everywhere to avoid inconsistencies
 CONTEXT_LENGTH = 2048
 
 config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True, cache_dir=CACHE_DIR)
@@ -99,6 +115,45 @@ else:
     params = model.params if hasattr(model, 'params') else None
 
 print("✓ Model loaded and sharded successfully!")
+
+# ----------------------------------------------------------------------
+# VERIFICATION: INSPECT MODEL SHARDING
+# ----------------------------------------------------------------------
+print("\n" + "="*80)
+print("INSPECTING MODEL WEIGHT SHARDING")
+print("="*80)
+
+# We define the mesh here early just for printing verification (it is usually defined at generation)
+device_mesh_verify = mesh_utils.create_device_mesh((DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE))
+mesh_verify = Mesh(device_mesh_verify, axis_names=('dp', 'fsdp', 'tp', 'sp'))
+
+# Helper to find a large weight (e.g. an attention kernel) to verify it isn't replicated
+flat_params = jax.tree_util.tree_leaves(params)
+sample_param = None
+for p in flat_params:
+    # Look for a tensor with dim > 1000 to ensure it's a weight matrix, not a bias/norm
+    if len(p.shape) > 1 and p.shape[0] > 1000:
+        sample_param = p
+        break
+
+if sample_param is not None:
+    print(f"Sample Weight Shape: {sample_param.shape}")
+    print(f"Sample Weight Sharding Spec: {sample_param.sharding}")
+    
+    # Check if 'tp' is involved in the sharding spec
+    # A fully sharded weight usually looks like PartitionSpec('tp', 'fsdp') or similar
+    try:
+        spec = sample_param.sharding.spec
+        print(f"PartitionSpec: {spec}")
+        if 'tp' in str(spec):
+            print("✓ SUCCESS: Tensor Parallel ('tp') axis detected in weight sharding.")
+        else:
+            print("⚠️ NOTE: 'tp' axis not seen in this specific weight. (This might be normal for LayerNorm/Embeddings).")
+    except Exception as e:
+        print(f"Could not parse sharding spec details: {e}")
+else:
+    print("Could not find a large weight parameter to inspect.")
+
 
 # ----------------------------------------------------------------------
 # 4. PREPARE INPUT
@@ -175,6 +230,10 @@ input_sharding = NamedSharding(mesh, P())
 
 input_ids = jax.device_put(input_ids, input_sharding)
 attention_mask = jax.device_put(attention_mask, input_sharding)
+
+# VERIFICATION: CHECK INPUT LOCATION
+print(f"Input stored on device? {input_ids.device_buffer.device() if hasattr(input_ids, 'device_buffer') else 'Sharded Array'}")
+print(f"Input Sharding: {input_ids.sharding}")
 # [CRITICAL FIX END] ---------------------------------------------------
 
 print("Starting generation loop inside Mesh context...")
