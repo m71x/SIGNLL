@@ -91,7 +91,7 @@ result = AutoEasyDeLModelForCausalLM.from_pretrained(
     param_dtype=jnp.bfloat16,
     precision=jax.lax.Precision.DEFAULT,
     # [CRITICAL] Pass the mesh explicitly here
-    mesh=mesh,  
+    #mesh=mesh,  
     sharding_axis_dims=(DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE),
     sharding_axis_names=('dp', 'fsdp', 'tp', 'sp'), 
     partition_axis=PartitionAxis(),
