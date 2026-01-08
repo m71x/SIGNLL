@@ -33,14 +33,13 @@ MODEL_ID = "Qwen/Qwen2.5-Coder-14B-Instruct"
 MAX_NEW_TOKENS = 1900
 
 # TPU MESH CONFIGURATION (32 Chips)
-# [CRITICAL] For a single prompt (Batch=1), FSDP/DP MUST be 1.
 DP_SIZE = 1     
 FSDP_SIZE = 1   
-TP_SIZE = 32    # All 32 chips working together on the single prompt
+TP_SIZE = 32    # All 32 chips working together
 SP_SIZE = 1     
 
 # ----------------------------------------------------------------------
-# 1.5 [CRITICAL] INITIALIZE MESH BEFORE LOADING
+# 1.5 INITIALIZE MESH BEFORE LOADING
 # ----------------------------------------------------------------------
 print("\n" + "="*80)
 print("INITIALIZING JAX MESH")
@@ -73,7 +72,7 @@ config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True, cache_dir=
 config.max_position_embeddings = CONTEXT_LENGTH
 
 # ----------------------------------------------------------------------
-# 3. LOAD MODEL WITH EASYDEL (PASSING MESH)
+# 3. LOAD MODEL WITH EASYDEL
 # ----------------------------------------------------------------------
 print(f"\nLoading Model with EasyDeL...")
 
@@ -90,8 +89,8 @@ result = AutoEasyDeLModelForCausalLM.from_pretrained(
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
     precision=jax.lax.Precision.DEFAULT,
-    # [CRITICAL] Pass the mesh explicitly here
-    #mesh=mesh,  
+    # [CRITICAL] I've uncommented this to ensure explicit sharding
+    mesh=mesh,  
     sharding_axis_dims=(DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE),
     sharding_axis_names=('dp', 'fsdp', 'tp', 'sp'), 
     partition_axis=PartitionAxis(),
@@ -165,7 +164,6 @@ if not hasattr(generation_config, 'forced_decoder_ids'):
 print("Sharding inputs to Mesh...")
 input_sharding = NamedSharding(mesh, P()) 
 
-# Device put using the mesh created in Step 1.5
 input_ids = jax.device_put(input_ids, input_sharding)
 attention_mask = jax.device_put(attention_mask, input_sharding)
 
@@ -184,5 +182,53 @@ else:
 
 generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 print("\n" + "="*80)
+print("GENERATED OUTPUT:")
+print("="*80)
 print(generated_text)
+
+# ----------------------------------------------------------------------
+# 7. DIAGNOSTICS & MEMORY LOGS (NEW SECTION)
+# ----------------------------------------------------------------------
+print("\n" + "="*80)
+print("FINAL SYSTEM DIAGNOSTICS")
+print("="*80)
+
+# A. Calculate Parameter Distribution
+total_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
+# bfloat16 is 2 bytes
+total_model_gb = (total_params * 2) / 1e9 
+
+print(f"Total Parameters:    {total_params / 1e9:.2f} Billion")
+print(f"Total Model Size:    {total_model_gb:.2f} GB (bfloat16)")
+print(f"Target per Chip:     {total_model_gb / 32:.2f} GB (Total / 32)")
+
+# B. Check Actual Memory Usage on Local Devices
+print("\nActual TPU Memory Usage (Local Devices):")
+print("-" * 60)
+
+local_devices = jax.local_devices()
+# Limit print to first 4 devices to avoid spamming 32 lines
+devices_to_show = local_devices[:4]
+
+for i, device in enumerate(devices_to_show):
+    try:
+        # memory_stats returns dict with 'bytes_in_use'
+        stats = device.memory_stats()
+        used_gb = stats.get('bytes_in_use', 0) / 1e9
+        limit_gb = stats.get('bytes_limit', 0) / 1e9
+        
+        # Calculate utilization %
+        util_pct = (used_gb / limit_gb * 100) if limit_gb > 0 else 0.0
+        
+        print(f"Device {device.id} (Process {device.process_index}): "
+              f"{used_gb:.2f} GB / {limit_gb:.2f} GB used ({util_pct:.1f}%)")
+    except Exception as e:
+        print(f"Device {device.id}: Could not fetch stats ({e})")
+
+if len(local_devices) > 4:
+    print(f"... (Stats hidden for remaining {len(local_devices)-4} devices)")
+
+print("-" * 60)
+print("NOTE: If 'Actual' is close to 'Target', sharding is working correctly.")
+print("      Extra usage is due to KV Cache, JAX overhead, and buffers.")
 print("="*80)
