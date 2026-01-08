@@ -1,3 +1,10 @@
+import jax
+# This must be called on all 8 VMs simultaneously
+jax.distributed.initialize() 
+
+print(f"Total devices: {jax.device_count()}")       # Should show 32
+print(f"Local devices: {jax.local_device_count()}") # Should show 4
+
 import easydel as ed
 
 elm = (
