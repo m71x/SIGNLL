@@ -5,7 +5,7 @@ import os
 # 1. CRITICAL: Initialize distributed system BEFORE importing EasyDeL
 # This configures the backend to expect 8 workers instead of 1.
 jax.distributed.initialize() 
-
+from jax.experimental import multihost_utils
 # 2. NOW it is safe to import EasyDeL
 import easydel as ed
 
@@ -40,3 +40,19 @@ for output in esurge.chat(
 
 if is_master:
     print(f"\nTokens/s: {output.tokens_per_second:.2f}")
+
+# ---------------------------------------------------------
+# #### NEW: Graceful Exit Block ####
+# ---------------------------------------------------------
+if is_master:
+    print("\nWaiting for all workers to finish...")
+
+# This creates a barrier. No worker can pass this line until 
+# ALL 8 workers have reached it.
+multihost_utils.sync_global_devices("shutting_down")
+
+if is_master:
+    print("All workers synced. Exiting safely.")
+
+# Optional: Explicitly shutdown the distributed backend (good hygiene)
+jax.distributed.shutdown()
