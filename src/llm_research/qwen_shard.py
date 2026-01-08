@@ -15,8 +15,14 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 stats = shutil.disk_usage("/dev/shm")
 available_gb = stats.free / (1024**3)
 print(f"Available space in /dev/shm: {available_gb:.2f} GB")
-if available_gb < 80:
-    print(f"WARNING: Less than 80GB available. Model download may fail.")
+
+stats_root = shutil.disk_usage("/")
+root_gb = stats_root.free / (1024**3)
+print(f"Available space in /: {root_gb:.2f} GB")
+
+if root_gb < 10:
+    print(f"ERROR: Root filesystem is nearly full ({root_gb:.2f} GB free)")
+    print(f"Will use /dev/shm exclusively for all operations")
 
 # Set these BEFORE importing transformers/torch/jax
 os.environ["HF_HOME"] = CACHE_DIR
@@ -28,7 +34,7 @@ os.environ["HF_DATASETS_CACHE"] = f"{CACHE_DIR}/datasets"
 os.environ["TMPDIR"] = CACHE_DIR
 os.environ["TEMP"] = CACHE_DIR
 os.environ["TMP"] = CACHE_DIR
-os.environ["XDG_CACHE_HOME"] = CACHE_DIR  # Critical for Python's tempfile module
+os.environ["XDG_CACHE_HOME"] = CACHE_DIR
 
 # HuggingFace settings
 os.environ["HF_HUB_DISABLE_XET"] = "1"
@@ -46,8 +52,9 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 import json
-import ml_dtypes  # Required for bfloat16 support in numpy
+import ml_dtypes
 from transformers import AutoModelForCausalLM, AutoConfig
+from huggingface_hub import snapshot_download
 
 # ============================================================================
 # CONFIG & MODEL LOADING
@@ -56,27 +63,51 @@ OUTPUT_DIR = "/home/mikexi/sharded_qwen32b"
 MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 
 print("="*80)
-print("STEP 1: Loading PyTorch model into CPU memory")
-print(f"Cache location: {os.environ.get('HF_HOME', 'Not Set')}")
-print(f"Temp directory: {os.environ.get('TMPDIR', 'Not Set')}")
-print(f"XDG_CACHE_HOME: {os.environ.get('XDG_CACHE_HOME', 'Not Set')}")
+print("STEP 1: Downloading model to /dev/shm first")
+print(f"Cache location: {CACHE_DIR}")
+print("="*80)
+
+# CRITICAL FIX: Download model files explicitly to /dev/shm FIRST
+# This bypasses the default download-to-root behavior
+try:
+    local_model_path = snapshot_download(
+        repo_id=MODEL_ID,
+        cache_dir=CACHE_DIR,
+        local_dir=f"{CACHE_DIR}/models/{MODEL_ID.replace('/', '--')}",
+        local_dir_use_symlinks=False,  # Don't use symlinks, copy files directly
+        resume_download=True,
+    )
+    print(f"✓ Model downloaded to: {local_model_path}")
+except Exception as e:
+    print(f"Download failed: {e}")
+    print("Trying alternative method...")
+    local_model_path = None
+
+print("\n" + "="*80)
+print("STEP 2: Loading PyTorch model into CPU memory")
 print("="*80)
 
 # Load config
-config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+if local_model_path:
+    config = AutoConfig.from_pretrained(local_model_path, trust_remote_code=True)
+else:
+    config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True, cache_dir=CACHE_DIR)
 
-# Load model in CPU with streaming to reduce peak memory
+# Load model - use local path if available, otherwise use cache_dir
+model_source = local_model_path if local_model_path else MODEL_ID
+
 model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID,
+    model_source,
     torch_dtype=torch.bfloat16,
     low_cpu_mem_usage=True,
     trust_remote_code=True,
     cache_dir=CACHE_DIR,
+    local_files_only=bool(local_model_path),  # Don't re-download if we have local files
 )
 print(f"✓ Model loaded. Parameter count: {sum(p.numel() for p in model.parameters()):,}")
 
 print("\n" + "="*80)
-print("STEP 2: Converting to JAX-compatible arrays")
+print("STEP 3: Converting to JAX-compatible arrays")
 print("="*80)
 
 def get_sharding_spec(name: str) -> tuple:
@@ -107,9 +138,7 @@ with torch.no_grad():
     for name, param in model.named_parameters():
         cpu_tensor = param.detach().cpu()
         
-        # FIX: Cast to float32 first, then numpy, then ml_dtypes.bfloat16
-        # PyTorch bfloat16 -> numpy fails. 
-        # PyTorch bfloat16 -> PyTorch float32 -> numpy -> ml_dtypes.bfloat16 works.
+        # Cast to float32 first, then numpy, then ml_dtypes.bfloat16
         arr = cpu_tensor.float().numpy().astype(ml_dtypes.bfloat16)
         
         # Save to file
