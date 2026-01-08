@@ -444,7 +444,7 @@ def train_loop(rank, flags):
 
 def _mp_fn(rank, flags):
     train_loop(rank, flags)
-
+# Command to copy the file to GCS
 
 if __name__ == "__main__":
     FLAGS = {

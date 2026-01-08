@@ -87,7 +87,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --worker=all \
-  --command="rm -rf /home/mikexi/sharded_qwen32b"
+  --command="rm -rf /home/mikexi/siebert_model"
 #run non-tmux job
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
@@ -273,3 +273,6 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all \
   --command="pip install fjformer"
 
+gsutil cp ~/SIGNLL/final_model_stage2_gated.pt gs://encoder-models-2/result-models/
+
+ls -laR /home/mikexi/siebert_model | less
