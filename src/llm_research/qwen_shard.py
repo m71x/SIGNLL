@@ -3,9 +3,20 @@
 # MUST COME FIRST — ENVIRONMENT SETUP
 # ============================================================================
 import os
+import shutil
 
 # Define the cache directory in shared memory (tmpfs)
 CACHE_DIR = "/dev/shm/huggingface"
+
+# Create the directory first
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Check available space
+stats = shutil.disk_usage("/dev/shm")
+available_gb = stats.free / (1024**3)
+print(f"Available space in /dev/shm: {available_gb:.2f} GB")
+if available_gb < 80:
+    print(f"WARNING: Less than 80GB available. Model download may fail.")
 
 # Set these BEFORE importing transformers/torch/jax
 os.environ["HF_HOME"] = CACHE_DIR
@@ -13,12 +24,18 @@ os.environ["HF_HUB_CACHE"] = f"{CACHE_DIR}/hub"
 os.environ["TRANSFORMERS_CACHE"] = f"{CACHE_DIR}/transformers"
 os.environ["HF_DATASETS_CACHE"] = f"{CACHE_DIR}/datasets"
 
+# Control temporary/staging download locations
 os.environ["TMPDIR"] = CACHE_DIR
 os.environ["TEMP"] = CACHE_DIR
 os.environ["TMP"] = CACHE_DIR
+os.environ["XDG_CACHE_HOME"] = CACHE_DIR  # Critical for Python's tempfile module
 
+# HuggingFace settings
 os.environ["HF_HUB_DISABLE_XET"] = "1"
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "3600"
+
+# JAX/TPU settings
 os.environ["PJRT_DEVICE"] = "TPU"
 
 # ============================================================================
@@ -41,6 +58,8 @@ MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 print("="*80)
 print("STEP 1: Loading PyTorch model into CPU memory")
 print(f"Cache location: {os.environ.get('HF_HOME', 'Not Set')}")
+print(f"Temp directory: {os.environ.get('TMPDIR', 'Not Set')}")
+print(f"XDG_CACHE_HOME: {os.environ.get('XDG_CACHE_HOME', 'Not Set')}")
 print("="*80)
 
 # Load config
