@@ -75,28 +75,18 @@ for i, user_prompt in enumerate(prompts):
 
 # 1. Clean up the engine explicitly to free device memory
 #    (Helps prevent "Resource Busy" errors on the next run)
-if is_master:
-    print("\n[Cleanup] destroying engine references...")
+print(f"[Worker {jax.process_index()}] Finished chat loop")
+sys.stdout.flush()
+
 del esurge
 del elm
-gc.collect() # Force Python to release the C++ backend objects
+gc.collect()
 
-# 2. GLOBAL BARRIER
-#    We wait here to ensure EVERYONE has finished the loop 
-#    and cleaned up their local objects.
-if is_master:
-    print("Waiting for all workers to sync before termination...")
+print(f"[Worker {jax.process_index()}] Entering barrier")
+sys.stdout.flush()
 
 multihost_utils.sync_global_devices("ready_to_kill")
 
-# 3. THE ATOMIC EXIT
-#    Do NOT call jax.distributed.shutdown(). 
-#    We just verified everyone is ready to die via the barrier above.
-#    Now we pull the plug simultaneously.
-if is_master:
-    print("Sync complete. forcing immediate process termination.")
-    sys.stdout.flush() # Ensure logs appear
-
-# Force kill the process. 
-# This skips Python cleanup and ignores hung non-daemon threads.
+print(f"[Worker {jax.process_index()}] Exiting now")
+sys.stdout.flush()
 os._exit(0)
