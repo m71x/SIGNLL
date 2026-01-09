@@ -191,6 +191,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --project=${PROJECT_ID} \
   --worker=all \
   --command="cd ~/SIGNLL && git fetch origin && git reset --hard origin/main"
+  
 #run eval (no tmux)
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \

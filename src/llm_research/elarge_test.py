@@ -1,6 +1,7 @@
 import jax
 import sys
 import os
+import gc # Added for memory cleanup
 
 # 1. CRITICAL: Initialize distributed system BEFORE importing EasyDeL
 jax.distributed.initialize() 
@@ -68,16 +69,34 @@ for i, user_prompt in enumerate(prompts):
 # ---------------------------------------------------------
 # Graceful Exit Block
 # ---------------------------------------------------------
+# ---------------------------------------------------------
+# Graceful Exit Block
+# ---------------------------------------------------------
+
+# 1. Clean up the engine explicitly to free device memory
+#    (Helps prevent "Resource Busy" errors on the next run)
 if is_master:
-    print("\nWaiting for all workers to finish...")
+    print("\n[Cleanup] destroying engine references...")
+del esurge
+del elm
+gc.collect() # Force Python to release the C++ backend objects
 
-# Barrier: All workers wait here until everyone is done with the loop
-multihost_utils.sync_global_devices("shutting_down")
-
+# 2. GLOBAL BARRIER
+#    We wait here to ensure EVERYONE has finished the loop 
+#    and cleaned up their local objects.
 if is_master:
-    print("All workers synced. Exiting safely.")
+    print("Waiting for all workers to sync before termination...")
 
-jax.distributed.shutdown()
+multihost_utils.sync_global_devices("ready_to_kill")
 
-print("Forcing process termination...")
+# 3. THE ATOMIC EXIT
+#    Do NOT call jax.distributed.shutdown(). 
+#    We just verified everyone is ready to die via the barrier above.
+#    Now we pull the plug simultaneously.
+if is_master:
+    print("Sync complete. forcing immediate process termination.")
+    sys.stdout.flush() # Ensure logs appear
+
+# Force kill the process. 
+# This skips Python cleanup and ignores hung non-daemon threads.
 os._exit(0)
