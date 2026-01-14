@@ -56,10 +56,10 @@ for i in range(0, len(file_paths), BATCH_SIZE_FILES):
     # Push to Hub
     # If it's the first batch, we overwrite. Afterward, we append.
     if i == 0:
-        shard_ds.push_to_hub(HF_REPO_ID, split="train", append=False)
+        shard_ds.push_to_hub(HF_REPO_ID, split="train")
         print("Initial shard uploaded.")
     else:
-        shard_ds.push_to_hub(HF_REPO_ID, split="train", append=True)
+        shard_ds.push_to_hub(HF_REPO_ID, split="train")
         print(f"Shard appended. Total files processed: {i + len(subset)}")
 
     # 3. CRITICAL: Clear Disk Cache
