@@ -3,6 +3,7 @@ import numpy as np
 import os
 import shutil
 from datasets import Dataset, Features, Array2D, ClassLabel, Value
+from huggingface_hub import HfApi # Import the API helper
 
 # --- CONFIGURATION ---
 GCS_PROJECT_ID = 'early-exit-transformer-network'
@@ -10,12 +11,18 @@ BUCKET_PATH = "encoder-models-2/siebert-data/siebert-actual-data/core_0"
 HF_REPO_ID = "mxi71/twitter-100m-siebert-activations"
 BATCH_SIZE_FILES = 5  
 CACHE_DIR = "/tmp/hf_cache"
+PARQUET_DIR = "/tmp/hf_parquet" # Temp folder for parquet files
 # ---------------------
 
 os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(PARQUET_DIR, exist_ok=True)
+
 fs = gcsfs.GCSFileSystem(project=GCS_PROJECT_ID)
 file_paths = sorted(fs.glob(f"{BUCKET_PATH}/*.npz"))
 print(f"Found {len(file_paths)} files. Processing in batches of {BATCH_SIZE_FILES}...")
+
+# Initialize API
+api = HfApi()
 
 features = Features({
     "cls_tokens": Array2D(shape=(25, 1024), dtype="float32"),
@@ -38,36 +45,42 @@ def get_data_generator(files_subset):
                     }
     return gen
 
-# 2. Process in Shards
 shard_counter = 0
 
 for i in range(0, len(file_paths), BATCH_SIZE_FILES):
     subset = file_paths[i : i + BATCH_SIZE_FILES]
     print(f"\n--- Processing batch {shard_counter}: {len(subset)} files ---")
     
-    # Create dataset for this shard
+    # 1. Create dataset object
     shard_ds = Dataset.from_generator(
         get_data_generator(subset), 
         features=features,
         cache_dir=CACHE_DIR
     )
     
-    # --- THE FIX: Unique Filenames ---
-    # We create a unique filename for this shard.
-    # Hugging Face Auto-Discovery will combine all "data/*.parquet" files into one "train" split.
-    filename = f"data/train-{shard_counter:04d}.parquet"
+    # 2. Save as Local Parquet
+    local_parquet_path = os.path.join(PARQUET_DIR, f"train-{shard_counter:04d}.parquet")
+    print(f"Saving locally to {local_parquet_path}...")
+    shard_ds.to_parquet(local_parquet_path)
     
-    print(f"Pushing shard {shard_counter} as {filename}...")
+    # 3. Upload File to Hub (This supports path_in_repo)
+    repo_path = f"data/train-{shard_counter:04d}.parquet"
+    print(f"Uploading to {HF_REPO_ID} as {repo_path}...")
     
-    # We push the SHARD as a specific parquet file.
-    # This prevents overwriting because every batch has a unique name.
-    shard_ds.push_to_hub(HF_REPO_ID, path_in_repo=filename)
+    api.upload_file(
+        path_or_fileobj=local_parquet_path,
+        path_in_repo=repo_path,
+        repo_id=HF_REPO_ID,
+        repo_type="dataset"
+    )
     
     shard_counter += 1
 
-    # 3. Clean up
+    # 4. Cleanup
     shard_ds.cleanup_cache_files()
     shutil.rmtree(CACHE_DIR)
+    shutil.rmtree(PARQUET_DIR) # Clear parquet file to save space
     os.makedirs(CACHE_DIR)
+    os.makedirs(PARQUET_DIR)
 
 print("\nAll shards uploaded successfully!")
