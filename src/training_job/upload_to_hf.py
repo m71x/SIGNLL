@@ -5,9 +5,9 @@ import shutil
 from datasets import Dataset, Features, Array2D, ClassLabel, Value, load_dataset
 
 # --- CONFIGURATION ---
-GCS_PROJECT_ID = 'your-google-cloud-project-id'
-BUCKET_PATH = "your-bucket-name/path/to/npz_files"
-HF_REPO_ID = "your-username/your-dataset-name"
+GCS_PROJECT_ID = 'early-exit-transformer-network'
+BUCKET_PATH = "encoder-models-2/siebert-data/siebert-actual-data/core_0"
+HF_REPO_ID = "mxi71/twitter-100m-siebert-activations"
 BATCH_SIZE_FILES = 5  # Number of NPZ files to process before uploading and clearing disk
 CACHE_DIR = "/tmp/hf_cache"
 # ---------------------
