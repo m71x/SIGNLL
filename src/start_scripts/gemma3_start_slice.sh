@@ -88,6 +88,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --worker=all \
   --command="rm -rf /home/mikexi/siebert_model"
+
 #run non-tmux job
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
@@ -102,11 +103,6 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all \
   --command="cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/training_job/train4.py"
 
-#ssh into worker 2
-gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
-    --zone=${ZONE} \
-    --project=${PROJECT_ID} \
-    --worker=0
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
@@ -164,7 +160,6 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --project=${PROJECT_ID} \
   --worker=all \
   --command="pkill -f -u mikexi python3"
-  
 
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
@@ -288,3 +283,9 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all \
   --command="sudo truncate -s 0 /var/log/syslog && sudo truncate -s 0 /var/log/kern.log"
 # Run this on the worker(s) with full disks
+
+#ssh into worker 2
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+    --zone=${ZONE} \
+    --project=${PROJECT_ID} \
+    --worker=0
