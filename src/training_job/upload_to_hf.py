@@ -4,7 +4,7 @@ from datasets import Dataset, Features, Array2D, ClassLabel, Value
 
 # --- CONFIGURATION ---
 GCS_PROJECT_ID = 'early-exit-transformer-network'
-BUCKET_PATH = "encoder-models-2/siebert-data/siebert-actual-data/core_0" # The folder where inference.py saved the chunks
+BUCKET_PATH = "encoder-models-2/siebert-data/siebert-actual-data/core_0/embeddings_chunk_0.npz" # The folder where inference.py saved the chunks
 HF_REPO_ID = "mxi71/twitter-100m-siebert-activations"
 # ---------------------
 

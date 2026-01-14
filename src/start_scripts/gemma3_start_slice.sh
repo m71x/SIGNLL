@@ -146,6 +146,12 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
+  --command="pip install gcsfs"
+
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=all \
   --command="source edel_env/bin/activate && pip install -U bitsandbytes"
 
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -193,8 +199,15 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --project=${PROJECT_ID} \
   --worker=all \
   --command="cd ~/SIGNLL && source ~/edel_env/bin/activate && PJRT_DEVICE=TPU python3 src/llm_research/elarge_test.py"
-#clone xla onto all workers
+
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --project=${PROJECT_ID} \
+  --worker=0 \
+  --command="cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/training_job/upload_to_hf.py"
+
+#clone xla onto all workers
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} 
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
     --worker=all \
