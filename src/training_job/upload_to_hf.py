@@ -44,7 +44,7 @@ def get_data_generator(files_subset):
     return gen
 
 # --- MAIN LOOP FOR CORES 1 THROUGH 10 ---
-for core_num in range(1, 11):
+for core_num in range(8, 13):
     current_bucket_path = f"{BASE_BUCKET_PATH}/core_{core_num}"
     print(f"\n\n=== STARTING CORE {core_num} ===")
     print(f"Reading from: {current_bucket_path}")
