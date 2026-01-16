@@ -203,7 +203,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
-  --worker=0 \
+  --worker=2 \
   --command="tmux new -d -s hf_upload 'cd ~/SIGNLL && PJRT_DEVICE=TPU python3 src/training_job/upload_to_hf.py'"
 
 #clone xla onto all workers
@@ -301,4 +301,4 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
-    --worker=0
+    --worker=2
