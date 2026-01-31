@@ -1,6 +1,4 @@
-# ============================================================================
-# MUST COME FIRST — ENVIRONMENT SETUP
-# ============================================================================
+#environment setup
 import os
 import easydel as ed
 
@@ -17,9 +15,7 @@ os.environ["HF_HUB_DISABLE_XET"] = "1"
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["PJRT_DEVICE"] = "TPU"
 
-# ============================================================================
-# IMPORTS
-# ============================================================================
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -27,38 +23,32 @@ from jax.experimental import mesh_utils
 from easydel import AutoEasyDeLModelForCausalLM, PartitionAxis
 from transformers import AutoTokenizer, GenerationConfig, AutoConfig
 
-# ----------------------------------------------------------------------
-# 1. CONFIGURATION
-# ----------------------------------------------------------------------
+
 MODEL_ID = "Qwen/Qwen2.5-Coder-14B-Instruct"
 MAX_NEW_TOKENS = 1900
 
-# TPU MESH CONFIGURATION (32 Chips)
+# TPU MESH CONFIGURATION (32 chips)
 DP_SIZE = 1     
 FSDP_SIZE = 1   
-TP_SIZE =32    # All 32 chips working together
+TP_SIZE =32   
 SP_SIZE = 1     
 
-# ----------------------------------------------------------------------
-# 1.5 INITIALIZE MESH BEFORE LOADING
-# ----------------------------------------------------------------------
+
 print("\n" + "="*80)
-print("INITIALIZING JAX MESH")
+print("init JAX mesh")
 print("="*80)
 total_devices = jax.device_count()
 print(f"Total JAX Devices Visible: {total_devices}")
 
 if total_devices != 32:
-    print(f"⚠️ WARNING: TP_SIZE=32 but JAX sees {total_devices} devices.")
+    print(f" Warning: TP_SIZE=32 but JAX sees {total_devices} devices.")
 
 # Create the mesh immediately
 device_mesh = mesh_utils.create_device_mesh((DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE))
 mesh = Mesh(device_mesh, axis_names=('dp', 'fsdp', 'tp', 'sp'))
 print(f"✓ Mesh created: {mesh}")
 
-# ----------------------------------------------------------------------
-# 2. LOAD TOKENIZER & CONFIG
-# ----------------------------------------------------------------------
+
 print("\nLoading Tokenizer and Config...")
 tokenizer = AutoTokenizer.from_pretrained(
     MODEL_ID, 
@@ -72,12 +62,10 @@ CONTEXT_LENGTH = 2048
 config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True, cache_dir=CACHE_DIR)
 config.max_position_embeddings = CONTEXT_LENGTH
 
-# ----------------------------------------------------------------------
-# 3. LOAD MODEL WITH EASYDEL
-# ----------------------------------------------------------------------
+
 print(f"\nLoading Model with EasyDeL...")
 
-# Load model with corrected sharding axes AND the active mesh
+# Load model with corrected sharding axes and the active mesh
 result = AutoEasyDeLModelForCausalLM.from_pretrained(
     MODEL_ID,
     config_kwargs={
@@ -90,8 +78,7 @@ result = AutoEasyDeLModelForCausalLM.from_pretrained(
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
     precision=jax.lax.Precision.DEFAULT,
-    # [CRITICAL] I've uncommented this to ensure explicit sharding
-    #mesh=mesh,  
+    
     sharding_axis_dims=(DP_SIZE, FSDP_SIZE, TP_SIZE, SP_SIZE),
     sharding_axis_names=('dp', 'fsdp', 'tp', 'sp'), 
     partition_axis=PartitionAxis(),
@@ -106,11 +93,9 @@ else:
     model = result
     params = model.params if hasattr(model, 'params') else None
 
-print("✓ Model loaded!")
+print("Model loaded!")
 
-# ----------------------------------------------------------------------
-# 4. PREPARE INPUT
-# ----------------------------------------------------------------------
+
 prompt = "Write a python program that shows an example of the diamond problem in inheritance."
 
 if hasattr(tokenizer, "apply_chat_template"):
@@ -144,9 +129,7 @@ if remainder != 0:
     input_ids = jnp.concatenate([pad_ids, input_ids], axis=1)
     attention_mask = jnp.concatenate([pad_mask, attention_mask], axis=1)
 
-# ----------------------------------------------------------------------
-# 5. GENERATION
-# ----------------------------------------------------------------------
+
 print("\n" + "="*80)
 print("GENERATING RESPONSE...")
 print("="*80)
@@ -187,33 +170,31 @@ print("GENERATED OUTPUT:")
 print("="*80)
 print(generated_text)
 
-# ----------------------------------------------------------------------
-# 7. DIAGNOSTICS & MEMORY LOGS (NEW SECTION)
-# ----------------------------------------------------------------------
+
 print("\n" + "="*80)
 print("FINAL SYSTEM DIAGNOSTICS")
 print("="*80)
 
-# A. Calculate Parameter Distribution
+
 total_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
-# bfloat16 is 2 bytes
+
 total_model_gb = (total_params * 2) / 1e9 
 
 print(f"Total Parameters:    {total_params / 1e9:.2f} Billion")
 print(f"Total Model Size:    {total_model_gb:.2f} GB (bfloat16)")
 print(f"Target per Chip:     {total_model_gb / 32:.2f} GB (Total / 32)")
 
-# B. Check Actual Memory Usage on Local Devices
+
 print("\nActual TPU Memory Usage (Local Devices):")
 print("-" * 60)
 
 local_devices = jax.local_devices()
-# Limit print to first 4 devices to avoid spamming 32 lines
+
 devices_to_show = local_devices[:4]
 
 for i, device in enumerate(devices_to_show):
     try:
-        # memory_stats returns dict with 'bytes_in_use'
+       
         stats = device.memory_stats()
         used_gb = stats.get('bytes_in_use', 0) / 1e9
         limit_gb = stats.get('bytes_limit', 0) / 1e9

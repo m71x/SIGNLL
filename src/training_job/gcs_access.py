@@ -20,12 +20,12 @@ def upload_file_to_gcs(bucket_name, local_path, gcs_blob_path, max_retries=3):
     
     for attempt in range(max_retries):
         try:
-            # CRITICAL: Check if file still exists before retry
+           
             if not os.path.exists(local_path):
                 print(f"❌ Attempt {attempt+1}: Local file no longer exists: {local_path}", flush=True)
                 return False
             
-            # Get local file size for verification
+            #
             local_size = os.path.getsize(local_path)
             print(f"🔄 Attempt {attempt+1}: Uploading {local_size:,} bytes from {local_path}", flush=True)
             
@@ -36,7 +36,7 @@ def upload_file_to_gcs(bucket_name, local_path, gcs_blob_path, max_retries=3):
             # Upload with a timeout
             blob.upload_from_filename(local_path, timeout=300)
             
-            # CRITICAL: Reload and verify
+            
             blob.reload()
             
             # Verify size match

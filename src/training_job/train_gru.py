@@ -14,9 +14,7 @@ from torch.utils.data.distributed import DistributedSampler
 from controller_gru import Controller
 from training_data_download import training_data_download
 
-# =========================================================================
-# HELPER: Supervised Contrastive Loss
-# =========================================================================
+
 def supervised_contrastive_loss(features, labels, temperature=0.1):
     """
     Args:
@@ -28,18 +26,17 @@ def supervised_contrastive_loss(features, labels, temperature=0.1):
     batch_size = features.shape[0]
     
     labels = labels.contiguous().view(-1, 1)
-    # Mask of shape [B, B]: 1 if i and j have same label, 0 otherwise
+    
     mask = torch.eq(labels, labels.T).float().to(device)
 
-    # Compute similarity matrix (Cosine Similarity since features are normalized)
-    # [B, B]
+    
     anchor_dot_contrast = torch.matmul(features, features.T) / temperature
 
-    # For numerical stability
+   
     logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
     logits = anchor_dot_contrast - logits_max.detach()
 
-    # Mask out self-contrast (diagonal)
+    
     logits_mask = torch.scatter(
         torch.ones_like(mask),
         1,
@@ -47,23 +44,20 @@ def supervised_contrastive_loss(features, labels, temperature=0.1):
         0
     )
     
-    # Mask to ignore self-comparisons in the positive mask
+    
     mask = mask * logits_mask
 
-    # Compute Log-Sum-Exp
+    
     exp_logits = torch.exp(logits) * logits_mask
     log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)
 
-    # Compute mean log-likelihood for positive pairs
-    # Sum over j (positives), then divide by count of positives
+    
     mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-6)
 
-    # Loss is negative mean log likelihood
+    
     return -mean_log_prob_pos.mean()
 
-# =========================================================================
-# HELPER: Monotonicity Loss
-# =========================================================================
+
 def monotonicity_loss(class_logits, labels, margin=0.0):
     """
     Penalizes the model if the loss at step t is greater than step t-1.
@@ -75,33 +69,28 @@ def monotonicity_loss(class_logits, labels, margin=0.0):
     B, L, C = class_logits.shape
     device = class_logits.device
     
-    # Expand labels: [B, L]
+    
     labels_exp = labels.unsqueeze(1).expand(-1, L)
     
-    # Compute CE loss per step: [B, L]
-    # We use reduction='none' to preserve step-wise loss structure
+    
     ce_per_step = F.cross_entropy(
         class_logits.reshape(-1, C), 
         labels_exp.reshape(-1), 
         reduction='none'
     ).view(B, L)
     
-    # Calculate difference: Loss(t) - Loss(t-1)
-    # Ideally, Loss(t) < Loss(t-1), so diff should be negative.
-    # If diff is positive (loss went UP), we penalize it.
+
     loss_t = ce_per_step[:, 1:]
     loss_prev = ce_per_step[:, :-1]
     
     diff = loss_t - loss_prev
     
-    # Penalize violations (where loss increased)
+    
     penalty = F.relu(diff + margin)
     
     return penalty.mean()
 
-# =========================================================================
-# HELPER: Focal Loss
-# =========================================================================
+
 def focal_loss(inputs, targets, alpha=0.25, gamma=2.0, reduction='mean'):
     """
     Focal Loss for addressing class imbalance.
@@ -111,13 +100,13 @@ def focal_loss(inputs, targets, alpha=0.25, gamma=2.0, reduction='mean'):
         alpha: Weighting factor for the rare class (default 0.25)
         gamma: Focusing parameter (default 2.0)
     """
-    # Compute binary cross entropy (with logits)
+    
     bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
     
-    # pt is the probability of the true class
+    
     pt = torch.exp(-bce_loss)
     
-    # Focal term: (1 - pt)^gamma
+    
     f_loss = alpha * (1 - pt) ** gamma * bce_loss
 
     if reduction == 'mean':
@@ -127,16 +116,12 @@ def focal_loss(inputs, targets, alpha=0.25, gamma=2.0, reduction='mean'):
     else:
         return f_loss
 
-# =========================================================================
-# TRAINING LOOP
-# =========================================================================
+
 def train_loop(rank, flags):
     device = xm.xla_device()
     num_cores = xm.xrt_world_size()
 
-    # -----------------------------
-    # Model initialization
-    # -----------------------------
+    
     L = 24
     model = Controller(
         L=L,
@@ -147,7 +132,7 @@ def train_loop(rank, flags):
         d_halt_hidden=64
     ).to(device)
 
-    # Sync initial weights
+   
     if rank == 0:
         xm.master_print("Synchronizing initial weights...")
     for p in model.parameters():
@@ -158,14 +143,10 @@ def train_loop(rank, flags):
     diag_sample_pos = None
     diag_sample_neg = None
 
-    # =========================================================================
-    # STAGE LOOP
-    # =========================================================================
+ 
     for stage in [1, 2]:
 
-        # -----------------------------
-        # Phase setup
-        # -----------------------------
+        
         if stage == 1:
             stage_name = "STAGE 1: Backbone + Classifiers (Halting/Gates FROZEN)"
             for p in model.parameters():
@@ -183,7 +164,7 @@ def train_loop(rank, flags):
             for p in model.parameters():
                 p.requires_grad = False
             
-            # Unfreeze Recurrent Modules
+         
             for m in [model.halting_gru, model.halt_ln, model.halting_proj]:
                 for p in m.parameters():
                     p.requires_grad = True
@@ -196,9 +177,7 @@ def train_loop(rank, flags):
             xm.master_print(f"STARTING {stage_name}")
             xm.master_print("#" * 80)
 
-        # -----------------------------
-        # Optimizer + scheduler
-        # -----------------------------
+      
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = optim.AdamW(trainable_params, lr=flags["lr"], weight_decay=1e-2)
 
@@ -211,9 +190,7 @@ def train_loop(rank, flags):
             optimizer, T_0=T_0, T_mult=2, eta_min=1e-6
         )
 
-        # =========================================================================
-        # CHUNK LOOP
-        # =========================================================================
+ 
         for chunk_idx in range(28):
             filename = f"embeddings_chunk_{chunk_idx}.npz"
 
@@ -234,9 +211,7 @@ def train_loop(rank, flags):
             if teacher_cls.shape[1] == 25:
                 teacher_cls = teacher_cls[:, 1:25, :]
 
-            # -----------------------------
-            # Slice evenly across replicas
-            # -----------------------------
+
             total_bs = flags["batch_size"] * num_cores
             n_groups = teacher_cls.shape[0] // total_bs
             N = n_groups * total_bs
@@ -261,9 +236,7 @@ def train_loop(rank, flags):
                 drop_last=True
             )
 
-            # =========================================================================
-            # EPOCH LOOP
-            # =========================================================================
+
             for epoch in range(flags["epochs"]):
                 sampler.set_epoch(epoch)
                 model.train()
@@ -275,14 +248,11 @@ def train_loop(rank, flags):
                     x = x.to(device)
                     y = y.to(device)
 
-                    # Capture return values (now 4 items)
                     halting_logits, class_logits, z, saved_states = model(x)
 
-                    # -----------------------------
-                    # Stage-specific losses
-                    # -----------------------------
+
                     if stage == 1:
-                        # 1. FOCAL LOSS (Replaces Weighted BCE)
+
                         labels_expanded = y.float().unsqueeze(1).expand(-1, class_logits.shape[1])
                         class_logits_positive = class_logits[:, :, 1]
                         
@@ -308,19 +278,18 @@ def train_loop(rank, flags):
                         )
                         loss_soft = kl_elementwise.sum(dim=-1)
 
-                        # 3. SUPERVISED CONTRASTIVE LOSS
+
                         z_pooled = torch.mean(z, dim=1)
                         features = F.normalize(z_pooled, dim=1)
                         loss_contrast = supervised_contrastive_loss(features, y, temperature=0.1)
 
-                        # 4. MONOTONICITY LOSS
                         loss_mono = monotonicity_loss(class_logits, y)
 
                         alpha_weight = 0.5
                         ce_per_layer = (alpha_weight * loss_hard) + ((1 - alpha_weight) * loss_soft)
                         loss_cls = ce_per_layer.mean()
                         
-                        # Combined Loss: CE/Focal + SupCon + Monotonicity
+  
                         loss = (loss_cls * 2) + (0.1 * loss_contrast) + (0.1 * loss_mono)
 
                         if rank == 0 and batch_idx == 0:
@@ -338,12 +307,11 @@ def train_loop(rank, flags):
                                 diag_sample_neg = extract_sample(0)
 
                     else:
-                        # STAGE 2: RECURRENT HALTING + DIVERSITY
+
                         preds = torch.argmax(class_logits, dim=-1)
                         is_correct = (preds == y.unsqueeze(1)).float()
 
-                        # 1. FOCAL LOSS for Halting (Replaces Weighted BCE)
-                        # Alpha=0.25 is standard for detection/halting
+
                         loss_halt = focal_loss(
                             halting_logits, 
                             is_correct, 
@@ -358,11 +326,11 @@ def train_loop(rank, flags):
                         h_entropy = -(h_safe * h_safe.log() + (1 - h_safe) * (1 - h_safe).log())
                         loss_entropy = -entropy_weight * h_entropy.mean()
 
-                        # 3. INNOVATION / DIVERSITY LOSS
+
                         h_stack = torch.stack(saved_states, dim=1)
                         h_prev = torch.cat([torch.zeros_like(h_stack[:, :1, :]), h_stack[:, :-1, :]], dim=1)
                         
-                        # A. Stagnation Penalty
+
                         cos_sim = F.cosine_similarity(h_stack, h_prev, dim=-1)
                         loss_diversity = F.relu(cos_sim - 0.9).mean() * 0.1
                         
