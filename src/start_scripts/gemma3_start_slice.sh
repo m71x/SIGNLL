@@ -198,7 +198,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="cd ~/SIGNLL && source ~/edel_env/bin/activate && PJRT_DEVICE=TPU python3 src/llm_research/elarge_test.py"
+  --command="cd ~/SIGNLL && source ~/edel_env/bin/activate && PJRT_DEVICE=TPU python3 src/llm_research/easydel_test.py"
 
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
