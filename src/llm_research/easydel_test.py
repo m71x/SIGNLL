@@ -86,9 +86,7 @@ for i, user_prompt in enumerate(prompts):
 # ---------------------------------------------------------
 # Graceful Exit Block
 # ---------------------------------------------------------
-# ---------------------------------------------------------
-# Graceful Exit Block
-# ---------------------------------------------------------
+
 
 # 1. Clean up the engine explicitly to free device memory
 #    (Helps prevent "Resource Busy" errors on the next run)

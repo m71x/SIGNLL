@@ -75,7 +75,7 @@ for i, user_prompt in enumerate(prompts):
 
 # 1. Clean up the engine explicitly to free device memory
 #    (Helps prevent "Resource Busy" errors on the next run)
-esurge.shutdown()
+
 print(f"[Worker {jax.process_index()}] Finished chat loop")
 sys.stdout.flush()
 
