@@ -92,3 +92,9 @@ for i, user_prompt in enumerate(prompts):
 
 # 1. Clean up the engine explicitly to free device memory
 #    (Helps prevent "Resource Busy" errors on the next run)
+
+if is_master:
+    print('Generation complete, shutting down')
+engine.shutdown()
+multihost_utils.sync_global_devices("end of script")
+jax.distributed.shutdown()
