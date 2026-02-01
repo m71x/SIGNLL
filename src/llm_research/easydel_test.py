@@ -21,7 +21,7 @@ if is_master:
     print(f"Local devices: {jax.local_device_count()}")
     print("Starting model initialization...")
 
-model_id = "your-model-id"
+model_id = "Qwen/Qwen2.5-Coder-14B-Instruct"
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -31,7 +31,7 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
     param_dtype=jnp.bfloat16,
     precision=lax.Precision.DEFAULT,
     auto_shard_model=True,
-    sharding_axis_dims=(1, 1, 1, -1, 1),
+    sharding_axis_dims=(1, 1, 8, 4, 1),
     config_kwargs=ed.EasyDeLBaseConfigDict(
         attn_mechanism=ed.AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3,
         attn_dtype=jnp.bfloat16,
