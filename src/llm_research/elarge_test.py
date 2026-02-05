@@ -1,21 +1,19 @@
 import jax
+import jax.numpy as jnp
 import sys
 import os
-import gc # Added for memory cleanup
+import gc
+from jax.experimental import multihost_utils
+import easydel as ed
 
-# 1. CRITICAL: Initialize distributed system BEFORE importing EasyDeL
+# 1. Initialize distributed system
 jax.distributed.initialize() 
 from jax.experimental import multihost_utils
 
-# 2. NOW it is safe to import EasyDeL
-import easydel as ed
-
-# Determine if this specific VM is the primary worker
+# 2. Setup model and engine
 is_master = jax.process_index() == 0
 
 if is_master:
-    print(f"Total devices: {jax.device_count()}")
-    print(f"Local devices: {jax.local_device_count()}")
     print("Starting model initialization...")
 
 elm = (
@@ -29,66 +27,82 @@ elm = (
 )
 
 esurge = elm.build_esurge()
+prompts = ["Explain the difference between TCP and UDP in one paragraph."]
 
-# ---------------------------------------------------------
-# #### NEW: Define your list of independent prompts ####
-# ---------------------------------------------------------
-prompts = [
-    "Write a recursive fibonacci sequence implementation in python using memoization",
-    "Explain the difference between TCP and UDP in one paragraph.",
-    "Write a haiku about a TPU pod."
-]
-
-# ---------------------------------------------------------
-# #### NEW: Loop through prompts ####
-# ---------------------------------------------------------
 for i, user_prompt in enumerate(prompts):
-    
-    # Master prints a separator to keep logs clean
     if is_master:
-        print(f"\n\n{'='*40}")
-        print(f"PROMPT {i+1}: {user_prompt}")
-        print(f"{'='*40}\nResponse: ", end="", flush=True)
+        print(f"\nPROMPT: {user_prompt}\nResponse: ", end="", flush=True)
 
-    # We create a FRESH conversation list for every loop iteration.
-    # This ensures no history (and no KV cache) is carried over from the previous run.
     conversation = [{"role": "user", "content": user_prompt}]
-
-    # Run the chat generation
+    
+    # --- STEP 1: GENERATION ---
+    # We collect deltas so we can reconstruct the full string for the forward pass
+    generated_text = ""
     for output in esurge.chat(
         conversation,
-        sampling_params=ed.SamplingParams(max_tokens=512),
+        sampling_params=ed.SamplingParams(max_tokens=256),
         stream=True,
     ):
         if is_master:
             print(output.delta_text, end="", flush=True)
+            generated_text += output.delta_text
+
+    # --- STEP 2: OBSERVATION (Forward Pass) ---
+    if is_master:
+        print("\n\n--- Starting Activation Extraction ---")
+
+    # Reconstruct the full conversation context
+    full_convo = conversation + [{"role": "assistant", "content": generated_text}]
+    
+    # Tokenize the full conversation
+    input_ids = elm.tokenizer.apply_chat_template(
+        full_convo, 
+        return_tensors="np", 
+        add_generation_prompt=False
+    )
+
+    # Perform a manual forward pass to get hidden states and logits
+    # We use elm.model.apply, which is the functional core of the model
+    model_outputs = elm.model.apply(
+        {'params': elm.params},
+        input_ids=input_ids,
+        output_hidden_states=True, # This captures all layers
+        return_dict=True,
+        train=False
+    )
+
+    # Extract final layer activations (Shape: [Batch, Seq_Len, Hidden_Dim])
+    final_layer = model_outputs.hidden_states[-1]
+    
+    # Calculate probabilities from logits for the "Observation" analysis
+    probs = jax.nn.softmax(model_outputs.logits, axis=-1)
 
     if is_master:
-        print(f"\n\n[Stats] Tokens/s: {output.tokens_per_second:.2f}")
+        # Example: Show data for the last 3 generated tokens
+        last_n = 3
+        seq_len = input_ids.shape[1]
+        
+        print(f"Total Sequence Length: {seq_len}")
+        print(f"Final Layer Activation Shape: {final_layer.shape}")
 
-# ---------------------------------------------------------
-# Graceful Exit Block
-# ---------------------------------------------------------
-# ---------------------------------------------------------
-# Graceful Exit Block
-# ---------------------------------------------------------
+        for pos in range(seq_len - last_n, seq_len):
+            token_id = input_ids[0, pos]
+            token_str = elm.tokenizer.decode([token_id])
+            
+            # Get Top 3 most likely tokens at this position for analysis
+            top_k_indices = jnp.argsort(probs[0, pos, :])[-3:][::-1]
+            top_k_probs = probs[0, pos, top_k_indices]
+            
+            print(f"\nToken at pos {pos}: '{token_str}'")
+            print(f" - Activation Vector (first 5 dims): {final_layer[0, pos, :5]}")
+            for k in range(3):
+                t_name = elm.tokenizer.decode([top_k_indices[k]])
+                print(f" - Prob {k+1}: {t_name} ({top_k_probs[k]*100:.2f}%)")
 
-# 1. Clean up the engine explicitly to free device memory
-#    (Helps prevent "Resource Busy" errors on the next run)
-
-print(f"[Worker {jax.process_index()}] Finished chat loop")
-sys.stdout.flush()
-
-del esurge
-del elm
+# Graceful Exit
+if is_master: print("\nCleaning up...")
+del esurge, elm
 gc.collect()
-
-print(f"[Worker {jax.process_index()}] Entering barrier")
-sys.stdout.flush()
-
 multihost_utils.sync_global_devices("ready_to_kill")
-
-print(f"[Worker {jax.process_index()}] Exiting now")
-sys.stdout.flush()
 jax.distributed.shutdown()
 sys.exit(0)
