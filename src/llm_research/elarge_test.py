@@ -3,11 +3,13 @@ import jax.numpy as jnp
 import sys
 import os
 import gc
+
+jax.distributed.initialize() 
 from jax.experimental import multihost_utils
 import easydel as ed
 
 # 1. Initialize distributed system
-jax.distributed.initialize() 
+
 from jax.experimental import multihost_utils
 
 # 2. Setup model and engine
