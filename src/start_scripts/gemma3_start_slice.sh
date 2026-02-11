@@ -82,6 +82,11 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --worker=all \
+  --command="df -h"
+
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --worker=all \
   --command="sudo mount -o remount,size=150G /dev/shm"
 
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -302,3 +307,8 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
     --worker=5
+
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --worker=all \
+  --command="rm -rf ~/.cache/huggingface/hub/models--Qwen--Qwen2.5-Coder-14B-Instruct && df -h /"
