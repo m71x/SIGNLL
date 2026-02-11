@@ -70,7 +70,6 @@ if is_master:
 model_outputs = elm._model(
     input_ids=input_ids,
     output_hidden_states=True,
-    train=False,
 )
 
 # Last layer activations  →  shape: (batch, seq_len, hidden_dim)
