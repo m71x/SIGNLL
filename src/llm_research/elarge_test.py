@@ -70,7 +70,6 @@ if is_master:
 model_outputs = elm._model(
     input_ids=input_ids,
     output_hidden_states=True,
-    return_dict=True,
     train=False,
 )
 
