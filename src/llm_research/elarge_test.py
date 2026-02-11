@@ -7,15 +7,19 @@ import gc
 jax.distributed.initialize()
 from jax.experimental import multihost_utils
 import easydel as ed
+from transformers import AutoTokenizer
 
 is_master = jax.process_index() == 0
 
 if is_master:
     print("Starting model initialization...")
 
-# 2. Load model via eLargeModel
+# 2. Load tokenizer and model
+model_id = "Qwen/Qwen2.5-Coder-14B-Instruct"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+
 elm = (
-    ed.eLargeModel.from_pretrained("Qwen/Qwen2.5-Coder-14B-Instruct")
+    ed.eLargeModel.from_pretrained(model_id)
     .set_dtype("bf16")
     .set_sharding(
         axis_dims=(1, 1, 8, 4, 1),
@@ -53,7 +57,7 @@ if is_master:
 
 full_conversation = conversation + [{"role": "assistant", "content": generated_text}]
 
-input_ids = elm._tokenizer.apply_chat_template(
+input_ids = tokenizer.apply_chat_template(
     full_conversation,
     return_tensors="np",
     add_generation_prompt=False,
@@ -93,7 +97,7 @@ if is_master:
     print(f"\nPer-token detail (last {last_n} positions):")
     for pos in range(seq_len - last_n, seq_len):
         token_id = int(input_ids[0, pos])
-        token_str = elm._tokenizer.decode([token_id])
+        token_str = tokenizer.decode([token_id])
 
         top_k_indices = jnp.argsort(probs[0, pos, :])[-3:][::-1]
         top_k_probs = probs[0, pos, top_k_indices]
@@ -101,7 +105,7 @@ if is_master:
         print(f"\n  Position {pos} — token: '{token_str}'")
         print(f"    Activation (first 5 dims): {last_layer_activations[0, pos, :5]}")
         for k in range(3):
-            t_name = elm._tokenizer.decode([int(top_k_indices[k])])
+            t_name = tokenizer.decode([int(top_k_indices[k])])
             print(f"    Top-{k+1} prediction: '{t_name}' ({float(top_k_probs[k])*100:.2f}%)")
 
 # ── CLEANUP ────────────────────────────────────────────────────────────
