@@ -1,7 +1,9 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 import sys
 import gc
+from jax.sharding import Mesh
 
 # 1. Initialize distributed system
 jax.distributed.initialize()
@@ -18,17 +20,21 @@ if is_master:
 model_id = "Qwen/Qwen2.5-Coder-14B-Instruct"
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 
+axis_dims = (1, 1, 8, 4, 1)
+axis_names = ("dp", "fsdp", "tp", "sp", "selective")
+
 elm = (
     ed.eLargeModel.from_pretrained(model_id)
     .set_dtype("bf16")
-    .set_sharding(
-        axis_dims=(1, 1, 8, 4, 1),
-        axis_names=("dp", "fsdp", "tp", "sp", "selective"),
-    )
+    .set_sharding(axis_dims=axis_dims, axis_names=axis_names)
     .set_esurge(max_model_len=4096, max_num_seqs=32)
 )
 
 esurge = elm.build_esurge()
+
+# Create the JAX mesh (needed for direct forward passes on the sharded model)
+devices = np.array(jax.devices()).reshape(axis_dims)
+mesh = Mesh(devices, axis_names)
 
 # ── STEP 1: GENERATION ─────────────────────────────────────────────────
 prompt = "Explain the difference between TCP and UDP in one paragraph."
@@ -66,11 +72,12 @@ input_ids = tokenizer.apply_chat_template(
 if is_master:
     print(f"Tokenized sequence length: {input_ids.shape[1]}")
 
-# Forward pass with hidden-state capture
-model_outputs = elm._model(
-    input_ids=input_ids,
-    output_hidden_states=True,
-)
+# Forward pass with hidden-state capture (must run inside mesh context)
+with mesh:
+    model_outputs = elm._model(
+        input_ids=jnp.array(input_ids),
+        output_hidden_states=True,
+    )
 
 # Last layer activations  →  shape: (batch, seq_len, hidden_dim)
 last_layer_activations = model_outputs.hidden_states[-1]
