@@ -106,38 +106,51 @@ with model_mesh:
 last_layer_activations = model_outputs.hidden_states[-1]
 logits = model_outputs.logits
 
+# ALL workers must participate in sharded array ops (float, mean, softmax, etc.)
+# Only print() calls are guarded by is_master.
+num_layers = len(model_outputs.hidden_states)
+act = last_layer_activations[0]  # (seq_len, hidden_dim)
+mean_val = float(jnp.mean(act))
+std_val = float(jnp.std(act))
+min_val = float(jnp.min(act))
+max_val = float(jnp.max(act))
+
+probs = jax.nn.softmax(logits, axis=-1)
+seq_len = input_ids.shape[1]
+last_n = min(5, seq_len)
+
+# Pre-compute per-token data on ALL workers
+token_data = []
+for pos in range(seq_len - last_n, seq_len):
+    token_id = int(input_ids[0, pos])
+    top_k_indices = jnp.argsort(probs[0, pos, :])[-3:][::-1]
+    top_k_probs = probs[0, pos, top_k_indices]
+    act_slice = last_layer_activations[0, pos, :5]
+    # Materialize values on all workers
+    top_k_ids = [int(top_k_indices[k]) for k in range(3)]
+    top_k_ps = [float(top_k_probs[k]) for k in range(3)]
+    act_vals = act_slice.tolist()
+    token_data.append((pos, token_id, top_k_ids, top_k_ps, act_vals))
+
+# Only master prints results
 if is_master:
-    print(f"Number of hidden-state layers returned: {len(model_outputs.hidden_states)}")
+    print(f"Number of hidden-state layers returned: {num_layers}")
     print(f"Last-layer activation shape: {last_layer_activations.shape}")
 
-    # ── Summary statistics ──
-    # Use process_allgather to collect the full array on master
-    act_local = last_layer_activations[0]  # (seq_len, hidden_dim)
-
     print(f"\nLast-layer activation statistics:")
-    print(f"  mean : {float(jnp.mean(act_local)):.6f}")
-    print(f"  std  : {float(jnp.std(act_local)):.6f}")
-    print(f"  min  : {float(jnp.min(act_local)):.6f}")
-    print(f"  max  : {float(jnp.max(act_local)):.6f}")
-
-    # ── Per-token detail for the last 5 tokens ──
-    probs = jax.nn.softmax(logits, axis=-1)
-    seq_len = input_ids.shape[1]
-    last_n = min(5, seq_len)
+    print(f"  mean : {mean_val:.6f}")
+    print(f"  std  : {std_val:.6f}")
+    print(f"  min  : {min_val:.6f}")
+    print(f"  max  : {max_val:.6f}")
 
     print(f"\nPer-token detail (last {last_n} positions):")
-    for pos in range(seq_len - last_n, seq_len):
-        token_id = int(input_ids[0, pos])
+    for pos, token_id, top_k_ids, top_k_ps, act_vals in token_data:
         token_str = tokenizer.decode([token_id])
-
-        top_k_indices = jnp.argsort(probs[0, pos, :])[-3:][::-1]
-        top_k_probs = probs[0, pos, top_k_indices]
-
         print(f"\n  Position {pos} — token: '{token_str}'")
-        print(f"    Activation (first 5 dims): {last_layer_activations[0, pos, :5]}")
+        print(f"    Activation (first 5 dims): {act_vals}")
         for k in range(3):
-            t_name = tokenizer.decode([int(top_k_indices[k])])
-            print(f"    Top-{k+1} prediction: '{t_name}' ({float(top_k_probs[k])*100:.2f}%)")
+            t_name = tokenizer.decode([top_k_ids[k]])
+            print(f"    Top-{k+1} prediction: '{t_name}' ({top_k_ps[k]*100:.2f}%)")
 
 # ── CLEANUP ────────────────────────────────────────────────────────────
 if is_master:
