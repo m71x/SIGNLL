@@ -33,11 +33,6 @@ elm = (
 
 esurge = elm.build_esurge()
 
-# Create the JAX mesh (needed for direct forward passes on the sharded model)
-# Must use create_device_mesh to match EasyDeL's topology-aware device ordering
-device_mesh = create_device_mesh(axis_dims)
-mesh = Mesh(device_mesh, axis_names)
-
 # ── STEP 1: GENERATION ─────────────────────────────────────────────────
 prompt = "Explain the difference between TCP and UDP in one paragraph."
 conversation = [{"role": "user", "content": prompt}]
@@ -45,21 +40,32 @@ conversation = [{"role": "user", "content": prompt}]
 if is_master:
     print(f"\nPROMPT: {prompt}\nResponse: ", end="", flush=True)
 
+# IMPORTANT: Accumulate generated_text on ALL workers, not just master.
+# All workers must have identical text for the forward pass, otherwise
+# tokenization produces different sequences on each worker → TPU halt.
 generated_text = ""
 for output in esurge.chat(
     conversation,
     sampling_params=ed.SamplingParams(max_tokens=256),
     stream=True,
 ):
+    generated_text += output.delta_text
     if is_master:
         print(output.delta_text, end="", flush=True)
-        generated_text += output.delta_text
 
 if is_master:
     print("\n")
 
 # ── STEP 2: ACTIVATION EXTRACTION (Forward Pass) ──────────────────────
-# Build the full conversation (user prompt + model response) and tokenize
+if is_master:
+    print("--- Shutting down eSurge before forward pass ---")
+
+# Stop the eSurge engine to free up TPU resources and avoid conflicts
+# with the direct forward pass
+del esurge
+gc.collect()
+multihost_utils.sync_global_devices("esurge_stopped")
+
 if is_master:
     print("--- Feeding response back into the model for activation extraction ---")
 
@@ -74,8 +80,11 @@ input_ids = tokenizer.apply_chat_template(
 if is_master:
     print(f"Tokenized sequence length: {input_ids.shape[1]}")
 
+# Use the mesh from the model's own config (guarantees matching device ordering)
+model_mesh = elm._model.config.mesh
+
 # Forward pass with hidden-state capture (must run inside mesh context)
-with mesh:
+with model_mesh:
     model_outputs = elm._model(
         input_ids=jnp.array(input_ids),
         output_hidden_states=True,
@@ -118,7 +127,7 @@ if is_master:
 # ── CLEANUP ────────────────────────────────────────────────────────────
 if is_master:
     print("\nCleaning up...")
-del esurge, elm
+del elm
 gc.collect()
 multihost_utils.sync_global_devices("ready_to_kill")
 jax.distributed.shutdown()
