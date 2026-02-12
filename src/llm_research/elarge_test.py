@@ -80,21 +80,26 @@ input_ids = tokenizer.apply_chat_template(
 if is_master:
     print(f"Tokenized sequence length: {input_ids.shape[1]}")
 
+# JIT-compile the forward pass to avoid multi-host assertion failures.
+# In eager mode, intermediate attention outputs are sharded arrays that fail
+# is_fully_addressable checks. JIT keeps them on-device as compiled ops.
+@jax.jit
+def extract_activations(input_ids):
+    outputs = elm._model(
+        input_ids=input_ids,
+        output_hidden_states=True,
+    )
+    return outputs.logits, outputs.hidden_states[-1]
+
 # Use the mesh from the model's own config (guarantees matching device ordering)
 model_mesh = elm._model.config.mesh
 
-# Forward pass with hidden-state capture (must run inside mesh context)
 with model_mesh:
-    model_outputs = elm._model(
-        input_ids=jnp.array(input_ids),
-        output_hidden_states=True,
-    )
-
-# Last layer activations  →  shape: (batch, seq_len, hidden_dim)
-last_layer_activations = model_outputs.hidden_states[-1]
+    if is_master:
+        print("Compiling and running forward pass (this may take a minute)...")
+    logits, last_layer_activations = extract_activations(jnp.array(input_ids))
 
 if is_master:
-    print(f"Number of hidden-state layers returned: {len(model_outputs.hidden_states)}")
     print(f"Last-layer activation shape: {last_layer_activations.shape}")
 
     # ── Summary statistics ──
@@ -106,7 +111,7 @@ if is_master:
     print(f"  max  : {float(jnp.max(act)):.6f}")
 
     # ── Per-token detail for the last 5 tokens ──
-    probs = jax.nn.softmax(model_outputs.logits, axis=-1)
+    probs = jax.nn.softmax(logits, axis=-1)
     seq_len = input_ids.shape[1]
     last_n = min(5, seq_len)
 
