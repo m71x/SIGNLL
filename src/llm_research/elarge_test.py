@@ -4,6 +4,7 @@ import numpy as np
 import sys
 import gc
 from jax.sharding import Mesh
+from jax.experimental.mesh_utils import create_device_mesh
 
 # 1. Initialize distributed system
 jax.distributed.initialize()
@@ -33,8 +34,9 @@ elm = (
 esurge = elm.build_esurge()
 
 # Create the JAX mesh (needed for direct forward passes on the sharded model)
-devices = np.array(jax.devices()).reshape(axis_dims)
-mesh = Mesh(devices, axis_names)
+# Must use create_device_mesh to match EasyDeL's topology-aware device ordering
+device_mesh = create_device_mesh(axis_dims)
+mesh = Mesh(device_mesh, axis_names)
 
 # ── STEP 1: GENERATION ─────────────────────────────────────────────────
 prompt = "Explain the difference between TCP and UDP in one paragraph."
