@@ -88,29 +88,15 @@ elm = (
     ed.eLargeModel.from_pretrained(model_id)
     .set_dtype("bf16")
     .set_sharding(axis_dims=axis_dims, axis_names=axis_names)
-    .set_esurge(max_model_len=4096, max_num_seqs=32)
+    .set_esurge(max_model_len=4096, max_num_seqs=4)
 )
 
-# Monkey-patch EasyDeL output dataclass validation for multi-host (once).
-# In eager mode on multi-host, intermediate arrays are sharded across hosts
-# and fail is_fully_replicated/is_fully_addressable checks in __post_init__.
-import easydel.infra.modeling_outputs as _mo
-for _name, _cls in inspect.getmembers(_mo, inspect.isclass):
-    if hasattr(_cls, '__post_init__'):
-        _cls.__post_init__ = lambda self: None
-
-if is_master:
-    print("Patched output validation for multi-host forward pass")
-
-# Build esurge once to populate elm._model, then grab the mesh
+# ── PHASE 1: GENERATE ALL RESPONSES ────────────────────────────────────
+# Build eSurge once for all generations to avoid recompilation overhead
+# and memory fragmentation from repeated build/teardown cycles.
 esurge = elm.build_esurge()
-model_mesh = elm._model.config.mesh
-del esurge
-gc.collect()
-multihost_utils.sync_global_devices("initial_esurge_cleanup")
 
-# ── Collect results across all prompts ──────────────────────────────────
-all_results = []
+generated_responses = []
 
 for prompt_idx, prompt in enumerate(PROMPTS):
     if is_master:
@@ -118,8 +104,6 @@ for prompt_idx, prompt in enumerate(PROMPTS):
         print(f"[{prompt_idx + 1}/{len(PROMPTS)}] PROMPT: {prompt}")
         print(f"{'=' * 70}")
 
-    # ── STEP 1: GENERATION ──────────────────────────────────────────────
-    esurge = elm.build_esurge()
     conversation = [{"role": "user", "content": prompt}]
 
     if is_master:
@@ -141,13 +125,44 @@ for prompt_idx, prompt in enumerate(PROMPTS):
     if is_master:
         print("\n")
 
-    # ── STEP 2: ACTIVATION EXTRACTION (Forward Pass) ────────────────────
-    if is_master:
-        print("--- Shutting down eSurge before forward pass ---")
+    generated_responses.append((prompt, conversation, generated_text))
 
-    del esurge
-    gc.collect()
-    multihost_utils.sync_global_devices(f"esurge_stopped_{prompt_idx}")
+    if is_master:
+        print(f"✓ Generation {prompt_idx + 1}/{len(PROMPTS)} complete")
+
+# ── PHASE 2: SHUTDOWN eSurge ───────────────────────────────────────────
+if is_master:
+    print("\n" + "=" * 70)
+    print("All generations complete. Shutting down eSurge for activation extraction...")
+    print("=" * 70)
+
+del esurge
+gc.collect()
+multihost_utils.sync_global_devices("esurge_stopped")
+
+# Monkey-patch EasyDeL output dataclass validation for multi-host.
+# In eager mode on multi-host, intermediate arrays are sharded across hosts
+# and fail is_fully_replicated/is_fully_addressable checks in __post_init__.
+# These are just validation asserts — not needed for the computation itself.
+import easydel.infra.modeling_outputs as _mo
+for _name, _cls in inspect.getmembers(_mo, inspect.isclass):
+    if hasattr(_cls, '__post_init__'):
+        _cls.__post_init__ = lambda self: None
+
+if is_master:
+    print("Patched output validation for multi-host forward pass")
+
+# Use the mesh from the model's own config (guarantees matching device ordering)
+model_mesh = elm._model.config.mesh
+
+# ── PHASE 3: ACTIVATION EXTRACTION (Forward Passes) ───────────────────
+all_results = []
+
+for prompt_idx, (prompt, conversation, generated_text) in enumerate(generated_responses):
+    if is_master:
+        print(f"\n{'=' * 70}")
+        print(f"[{prompt_idx + 1}/{len(PROMPTS)}] Forward pass: {prompt[:60]}...")
+        print(f"{'=' * 70}")
 
     full_conversation = conversation + [{"role": "assistant", "content": generated_text}]
 
@@ -160,7 +175,7 @@ for prompt_idx, prompt in enumerate(PROMPTS):
     if is_master:
         print(f"Tokenized sequence length: {input_ids.shape[1]}")
 
-    # Forward pass inside the mesh context
+    # Forward pass in eager mode inside the mesh context
     with model_mesh:
         if is_master:
             print("Running forward pass...")
@@ -173,7 +188,8 @@ for prompt_idx, prompt in enumerate(PROMPTS):
     last_layer_activations = model_outputs.hidden_states[-1]
     logits = model_outputs.logits
 
-    # ALL workers must participate in sharded array ops
+    # ALL workers must participate in sharded array ops (float, mean, softmax, etc.)
+    # Only print() calls are guarded by is_master.
     num_layers = len(model_outputs.hidden_states)
     act = last_layer_activations[0]  # (seq_len, hidden_dim)
     mean_val = float(jnp.mean(act))
@@ -192,6 +208,7 @@ for prompt_idx, prompt in enumerate(PROMPTS):
         top_k_indices = jnp.argsort(probs[0, pos, :])[-3:][::-1]
         top_k_probs = probs[0, pos, top_k_indices]
         act_slice = last_layer_activations[0, pos, :5]
+        # Materialize values on all workers
         top_k_ids = [int(top_k_indices[k]) for k in range(3)]
         top_k_ps = [float(top_k_probs[k]) for k in range(3)]
         act_vals = act_slice.tolist()
@@ -252,10 +269,10 @@ for prompt_idx, prompt in enumerate(PROMPTS):
     # Free activation memory before next iteration
     del model_outputs, last_layer_activations, logits, probs, act
     gc.collect()
-    multihost_utils.sync_global_devices(f"prompt_done_{prompt_idx}")
+    multihost_utils.sync_global_devices(f"forward_done_{prompt_idx}")
 
     if is_master:
-        print(f"\n✓ Prompt {prompt_idx + 1}/{len(PROMPTS)} complete")
+        print(f"\n✓ Forward pass {prompt_idx + 1}/{len(PROMPTS)} complete")
 
 # ── SAVE RESULTS ────────────────────────────────────────────────────────
 if is_master:
