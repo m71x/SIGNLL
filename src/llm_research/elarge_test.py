@@ -102,7 +102,12 @@ for _name, _cls in inspect.getmembers(_mo, inspect.isclass):
 if is_master:
     print("Patched output validation for multi-host forward pass")
 
+# Build esurge once to populate elm._model, then grab the mesh
+esurge = elm.build_esurge()
 model_mesh = elm._model.config.mesh
+del esurge
+gc.collect()
+multihost_utils.sync_global_devices("initial_esurge_cleanup")
 
 # ── Collect results across all prompts ──────────────────────────────────
 all_results = []
