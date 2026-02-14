@@ -5,6 +5,7 @@ import sys
 import gc
 import json
 import inspect
+import time
 
 # 1. Initialize distributed system
 jax.distributed.initialize()
@@ -71,6 +72,61 @@ PROMPTS = [
     "What is the Turing test and has any AI passed it?",
     "Explain the concept of opportunity cost with a practical example.",
     "Why do we have leap years? Explain the calendar mathematics behind it.",
+    # --- Philosophy / Ethics ---
+    "What is the ship of Theseus paradox and what does it tell us about identity?",
+    "Explain the difference between utilitarianism and deontological ethics.",
+    "What did Socrates mean by 'I know that I know nothing'?",
+    "Describe the Chinese Room argument against strong AI.",
+    "What is existentialism? Summarize the views of Sartre and Camus.",
+    "Explain the concept of the social contract as described by Hobbes, Locke, and Rousseau.",
+    "What is the problem of evil in philosophy of religion?",
+    "Describe the Is-Ought problem identified by David Hume.",
+    "What is determinism versus free will? Summarize the main positions.",
+    "Explain Plato's Allegory of the Cave and its modern relevance.",
+    # --- History / Geography ---
+    "What caused the fall of the Roman Empire?",
+    "Explain the significance of the Silk Road in world history.",
+    "What was the Manhattan Project and what were its consequences?",
+    "Describe the causes and effects of the French Revolution.",
+    "What is the significance of the Rosetta Stone?",
+    "Explain the Cold War in terms a middle schooler could understand.",
+    "What were the main achievements of the Golden Age of Islam?",
+    "Describe the historical importance of the printing press.",
+    "What led to the partition of India in 1947?",
+    "Explain the significance of the Treaty of Westphalia.",
+    # --- Technology / Computing ---
+    "How does public-key cryptography work? Explain RSA simply.",
+    "What is a blockchain and how does it achieve consensus?",
+    "Explain how a CPU executes an instruction step by step.",
+    "What is the difference between HTTP and HTTPS?",
+    "How does DNS work when you type a URL into your browser?",
+    "Explain the CAP theorem in distributed systems with examples.",
+    "What is containerization and how does Docker work?",
+    "Describe how a compiler differs from an interpreter.",
+    "What is MapReduce and why was it revolutionary for big data?",
+    "Explain how Wi-Fi works at a physical and protocol level.",
+    # --- Health / Biology ---
+    "How does the human immune system fight off a viral infection?",
+    "Explain how antibiotics work and why resistance is a problem.",
+    "What happens in the brain during sleep and why is sleep important?",
+    "Describe how the human eye processes light into vision.",
+    "What is the microbiome and how does it affect human health?",
+    "Explain how muscles grow in response to exercise.",
+    "What causes allergic reactions at a cellular level?",
+    "Describe how the heart pumps blood through the circulatory system.",
+    "What is epigenetics and how can environment affect gene expression?",
+    "Explain the difference between Type 1 and Type 2 diabetes.",
+    # --- Practical / How-To ---
+    "Explain how to solve a Rubik's cube using the beginner method.",
+    "What are the key principles of effective public speaking?",
+    "Describe the scientific method with a real-world example experiment.",
+    "Explain how compound interest works with a numerical example.",
+    "What are the main differences between renting and buying a home?",
+    "Describe how to read a scientific research paper effectively.",
+    "What is the Pomodoro technique and why does it improve productivity?",
+    "Explain the basics of personal budgeting using the 50/30/20 rule.",
+    "How does a car engine convert fuel into motion?",
+    "What are the key steps in designing a good database schema?",
 ]
 
 if is_master:
@@ -113,19 +169,27 @@ for prompt_idx, prompt in enumerate(PROMPTS):
     # All workers must have identical text for the forward pass, otherwise
     # tokenization produces different sequences on each worker → TPU halt.
     generated_text = ""
+    num_generated_tokens = 0
+    gen_start_time = time.time()
     for output in esurge.chat(
         conversation,
         sampling_params=ed.SamplingParams(max_tokens=256),
         stream=True,
     ):
         generated_text += output.delta_text
+        num_generated_tokens += 1
         if is_master:
             print(output.delta_text, end="", flush=True)
+    gen_elapsed = time.time() - gen_start_time
+
+    tokens_per_sec = num_generated_tokens / gen_elapsed if gen_elapsed > 0 else 0.0
 
     if is_master:
-        print("\n")
+        print(f"\n")
+        print(f"  Generated {num_generated_tokens} tokens in {gen_elapsed:.2f}s "
+              f"({tokens_per_sec:.2f} tokens/sec)")
 
-    generated_responses.append((prompt, conversation, generated_text))
+    generated_responses.append((prompt, conversation, generated_text, num_generated_tokens, gen_elapsed, tokens_per_sec))
 
     if is_master:
         print(f"✓ Generation {prompt_idx + 1}/{len(PROMPTS)} complete")
@@ -158,7 +222,7 @@ model_mesh = elm._model.config.mesh
 # ── PHASE 3: ACTIVATION EXTRACTION (Forward Passes) ───────────────────
 all_results = []
 
-for prompt_idx, (prompt, conversation, generated_text) in enumerate(generated_responses):
+for prompt_idx, (prompt, conversation, generated_text, num_generated_tokens, gen_elapsed, tokens_per_sec) in enumerate(generated_responses):
     if is_master:
         print(f"\n{'=' * 70}")
         print(f"[{prompt_idx + 1}/{len(PROMPTS)}] Forward pass: {prompt[:60]}...")
@@ -239,6 +303,9 @@ for prompt_idx, (prompt, conversation, generated_text) in enumerate(generated_re
         "prompt_index": prompt_idx,
         "prompt": prompt,
         "response": generated_text,
+        "generation_tokens": num_generated_tokens,
+        "generation_time_sec": round(gen_elapsed, 3),
+        "generation_tokens_per_sec": round(tokens_per_sec, 2),
         "seq_len": int(seq_len),
         "num_layers": int(num_layers),
         "activation_stats": {
