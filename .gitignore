@@ -214,3 +214,18 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Training data & large binary files
+training_data/
+*.ftz
+*.tfrecord
+*.npz
+*.zip
+*.csv
+
+# Misc
+=4.45.0
+
+training_data/
+
+testing_data/

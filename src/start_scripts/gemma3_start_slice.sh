@@ -198,6 +198,12 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all \
   --command="cd ~/SIGNLL && git fetch origin && git reset --hard origin/main"
   
+
+gcloud compute tpus tpu-vm ssh <TPU_NAME> --worker=all \
+    --command="cd ~/SIGNLL && git pull && source ~/edel_env/bin/activate && \
+      pip install datasets && \
+      PJRT_DEVICE=TPU python3 src/llm_research/regret_training.py"
+      
 #run eval (no tmux)
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
