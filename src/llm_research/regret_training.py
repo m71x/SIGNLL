@@ -141,7 +141,7 @@ for p_idx, problem in enumerate(problems):
     # Broadcast reward to all workers
     reward_arr = jnp.array([reward if is_master else 0.0])
     reward_arr = multihost_utils.process_allgather(reward_arr)
-    reward = float(reward_arr[0])  # Master's value at index 0
+    reward = float(reward_arr.flatten()[0])  # Master's value at index 0
 
     baseline_results.append({
         "task_id": problem.task_id,
@@ -359,7 +359,7 @@ for pass_num, p_idx in enumerate(passing_indices):
             # Broadcast perturbed reward
             r_arr = jnp.array([perturbed_reward if is_master else 0.0])
             r_arr = multihost_utils.process_allgather(r_arr)
-            perturbed_reward = float(r_arr[0])
+            perturbed_reward = float(r_arr.flatten()[0])
 
             # Compute regret
             regret = max(0.0, result["reward"] - perturbed_reward)
