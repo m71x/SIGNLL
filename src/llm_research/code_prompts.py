@@ -70,7 +70,7 @@ def load_mbpp() -> List[CodeProblem]:
 
     for row in ds:
         task_id = f"mbpp/{row['task_id']}"
-        text = row["text"]               # natural language description
+        text = row["prompt"]             # natural language description
         test_list = row["test_list"]      # list of assert statements
         # MBPP doesn't always have a clean entry_point; extract from first test
         entry_point = _extract_entry_point(test_list)
