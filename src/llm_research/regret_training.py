@@ -99,9 +99,27 @@ if is_master:
 
 esurge = elm.build_esurge()
 
+# Resume from checkpoint if available
 baseline_results = []
+start_idx = 0
+if is_master and os.path.exists(BASELINE_PATH):
+    try:
+        with open(BASELINE_PATH) as f:
+            baseline_results = json.load(f)
+        start_idx = len(baseline_results)
+        print(f"  Resuming from checkpoint: {start_idx}/{len(problems)} already done")
+    except Exception as e:
+        print(f"  Could not load checkpoint: {e}, starting fresh")
+        baseline_results = []
+        start_idx = 0
 
-for p_idx, problem in enumerate(problems):
+# Broadcast start_idx to all workers
+start_arr = jnp.array([start_idx if is_master else 0])
+start_arr = multihost_utils.process_allgather(start_arr)
+start_idx = int(start_arr.flatten()[0])
+
+for p_idx in range(start_idx, len(problems)):
+    problem = problems[p_idx]
     conversation = build_code_prompt(problem)
 
     if is_master:
@@ -154,9 +172,13 @@ for p_idx, problem in enumerate(problems):
         "elapsed": elapsed,
     })
 
-    # Periodic GC
+    # Periodic GC and checkpoint saving
     if (p_idx + 1) % BATCH_SIZE == 0:
         gc.collect()
+        if is_master and (p_idx + 1) % (BATCH_SIZE * 5) == 0:
+            with open(BASELINE_PATH, "w") as f:
+                json.dump(baseline_results, f, indent=2, default=str)
+            print(f"  [Checkpoint saved: {len(baseline_results)}/{len(problems)}]")
         multihost_utils.sync_global_devices(f"baseline_batch_{p_idx}")
 
 multihost_utils.sync_global_devices("baseline_done")
