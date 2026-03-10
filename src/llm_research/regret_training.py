@@ -291,6 +291,17 @@ for pass_num, p_idx in enumerate(passing_indices):
     if is_master:
         print(f"  Model has {num_layers_total} layers, using: {valid_layers}")
 
+    # Gather hidden states to numpy for target layers
+    # (sharded JAX arrays can't be converted to numpy directly on multi-host)
+    gathered_hidden = {}
+    for l_idx in valid_layers:
+        gathered_hidden[l_idx] = np.array(
+            multihost_utils.process_allgather(baseline_hidden[l_idx + 1])
+        )
+
+    if is_master:
+        print(f"  Gathered hidden states for {len(valid_layers)} layers to numpy")
+
     # Select response positions to perturb (subsample if too many)
     response_positions = list(range(response_start, seq_len - 1))  # exclude last token
     if len(response_positions) > MAX_POSITIONS_PER_PROMPT:
@@ -303,9 +314,8 @@ for pass_num, p_idx in enumerate(passing_indices):
 
     # For each target layer × position: perturb, rollout, measure regret
     for layer_idx in valid_layers:
-        # Get hidden state at this layer for all positions
-        # hidden_states[layer_idx + 1] = output of decoder layer `layer_idx`
-        layer_hidden = baseline_hidden[layer_idx + 1]  # (1, seq_len, hidden_dim)
+        # Get hidden state at this layer (already gathered to numpy)
+        layer_hidden = gathered_hidden[layer_idx]  # (1, seq_len, hidden_dim)
 
         for pos in response_positions:
             # Get baseline logits at this position → greedy chosen token
@@ -317,7 +327,7 @@ for pass_num, p_idx in enumerate(passing_indices):
 
             # If perturbation didn't change the token, regret = 0 (skip expensive rollout)
             if perturbed_token == chosen_token:
-                hidden_vec = np.array(layer_hidden[0, pos, :])
+                hidden_vec = layer_hidden[0, pos, :]
                 regret_hidden_states.append(hidden_vec)
                 regret_layer_indices.append(layer_idx)
                 regret_positions.append(pos)
@@ -379,7 +389,7 @@ for pass_num, p_idx in enumerate(passing_indices):
             print(f"    Layer {layer_idx}: {nonzero}/{len(response_positions)} positions with regret > 0")
 
     # Cleanup after each prompt
-    del baseline_out, baseline_logits, baseline_hidden
+    del baseline_out, baseline_logits, baseline_hidden, gathered_hidden
     gc.collect()
     multihost_utils.sync_global_devices(f"perturb_done_{pass_num}")
 
