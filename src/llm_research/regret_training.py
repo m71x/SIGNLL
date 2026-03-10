@@ -296,7 +296,7 @@ for pass_num, p_idx in enumerate(passing_indices):
     gathered_hidden = {}
     for l_idx in valid_layers:
         gathered_hidden[l_idx] = np.array(
-            multihost_utils.process_allgather(baseline_hidden[l_idx + 1])
+            multihost_utils.process_allgather(baseline_hidden[l_idx + 1], tiled=True)
         )
 
     if is_master:
