@@ -85,111 +85,169 @@ elm = (
     ed.eLargeModel.from_pretrained(MODEL_ID)
     .set_dtype("bf16")
     .set_sharding(axis_dims=axis_dims, axis_names=axis_names)
-    .set_esurge(max_model_len=4096, max_num_seqs=4)
 )
+
+# Only configure eSurge if we'll need it for Phase 1
+# (skip if Phase 1 checkpoint is complete)
+_phase1_done = False
+if is_master and os.path.exists(BASELINE_PATH):
+    try:
+        with open(BASELINE_PATH) as f:
+            _n = len(json.load(f))
+        _phase1_done = _n >= len(problems)
+    except Exception:
+        pass
+
+_p1_arr = jnp.array([1.0 if (is_master and _phase1_done) else 0.0])
+_p1_arr = multihost_utils.process_allgather(_p1_arr)
+_phase1_done = float(_p1_arr.flatten()[0]) > 0.5
+
+if not _phase1_done:
+    elm = elm.set_esurge(max_model_len=4096, max_num_seqs=4)
+    if is_master:
+        print("  eSurge configured for Phase 1 generation")
+else:
+    if is_master:
+        print("  Phase 1 complete — skipping eSurge configuration")
 
 
 # ═════════════════════════════════════════════════════════════════════
 # PHASE 1: BASELINE GENERATION
 # ═════════════════════════════════════════════════════════════════════
-if is_master:
-    print(f"\n{'='*70}")
-    print("PHASE 1: Generating baseline code with greedy decoding")
-    print(f"{'='*70}")
 
-esurge = elm.build_esurge()
-
-# Resume from checkpoint if available
+# Check if Phase 1 is already complete (checkpoint with all problems)
+phase1_complete = False
 baseline_results = []
-start_idx = 0
 if is_master and os.path.exists(BASELINE_PATH):
     try:
         with open(BASELINE_PATH) as f:
             baseline_results = json.load(f)
-        start_idx = len(baseline_results)
-        print(f"  Resuming from checkpoint: {start_idx}/{len(problems)} already done")
+        if len(baseline_results) >= len(problems):
+            phase1_complete = True
+            print(f"\n  Phase 1 already complete: {len(baseline_results)} results loaded from checkpoint")
+        else:
+            print(f"\n  Partial checkpoint: {len(baseline_results)}/{len(problems)}")
     except Exception as e:
         print(f"  Could not load checkpoint: {e}, starting fresh")
         baseline_results = []
-        start_idx = 0
 
-# Broadcast start_idx to all workers
-start_arr = jnp.array([start_idx if is_master else 0])
-start_arr = multihost_utils.process_allgather(start_arr)
-start_idx = int(start_arr.flatten()[0])
+# Broadcast phase1_complete to all workers
+p1_arr = jnp.array([1.0 if (is_master and phase1_complete) else 0.0])
+p1_arr = multihost_utils.process_allgather(p1_arr)
+phase1_complete = float(p1_arr.flatten()[0]) > 0.5
 
-for p_idx in range(start_idx, len(problems)):
-    problem = problems[p_idx]
-    conversation = build_code_prompt(problem)
+if not phase1_complete:
+    if is_master:
+        print(f"\n{'='*70}")
+        print("PHASE 1: Generating baseline code with greedy decoding")
+        print(f"{'='*70}")
+
+    esurge = elm.build_esurge()
+
+    # Determine start index from checkpoint
+    start_idx = len(baseline_results)
+    start_arr = jnp.array([start_idx if is_master else 0])
+    start_arr = multihost_utils.process_allgather(start_arr)
+    start_idx = int(start_arr.flatten()[0])
+
+    for p_idx in range(start_idx, len(problems)):
+        problem = problems[p_idx]
+        conversation = build_code_prompt(problem)
+
+        if is_master:
+            print(f"\n[{p_idx+1}/{len(problems)}] {problem.task_id}")
+            print(f"  Generating...", end="", flush=True)
+
+        generated_text = ""
+        num_tokens = 0
+        t0 = time.time()
+
+        # Greedy decode: temp=0 equivalent via SamplingParams
+        for output in esurge.chat(
+            conversation,
+            sampling_params=ed.SamplingParams(
+                max_tokens=MAX_GEN_TOKENS,
+                temperature=0.0,
+            ),
+            stream=True,
+        ):
+            generated_text += output.delta_text
+            num_tokens += 1
+
+        elapsed = time.time() - t0
+
+        # Extract code from response
+        code = extract_code_from_response(generated_text)
+
+        # Execute tests — only master runs code (CPU-bound)
+        reward = 0.0
+        exec_info = {}
+        if is_master:
+            reward, exec_info = execute_code(code, problem.test_code, timeout=CODE_TIMEOUT)
+            print(f" {num_tokens} tok, {elapsed:.1f}s, R*={reward}")
+            if reward == 0.0 and exec_info.get("stderr"):
+                print(f"    Error: {exec_info['stderr'][:100]}")
+
+        # Broadcast reward to all workers
+        reward_arr = jnp.array([reward if is_master else 0.0])
+        reward_arr = multihost_utils.process_allgather(reward_arr)
+        reward = float(reward_arr.flatten()[0])  # Master's value at index 0
+
+        baseline_results.append({
+            "task_id": problem.task_id,
+            "source": problem.source,
+            "prompt_idx": p_idx,
+            "generated_text": generated_text,
+            "code": code,
+            "reward": reward,
+            "num_tokens": num_tokens,
+            "elapsed": elapsed,
+        })
+
+        # Periodic GC and checkpoint saving
+        if (p_idx + 1) % BATCH_SIZE == 0:
+            gc.collect()
+            if is_master and (p_idx + 1) % (BATCH_SIZE * 5) == 0:
+                with open(BASELINE_PATH, "w") as f:
+                    json.dump(baseline_results, f, indent=2, default=str)
+                print(f"  [Checkpoint saved: {len(baseline_results)}/{len(problems)}]")
+            multihost_utils.sync_global_devices(f"baseline_batch_{p_idx}")
+
+    multihost_utils.sync_global_devices("baseline_done")
+
+    # Save baseline results
+    if is_master:
+        passing = sum(1 for r in baseline_results if r["reward"] > 0)
+        print(f"\n  Baseline complete: {passing}/{len(problems)} passing ({100*passing/len(problems):.1f}%)")
+        with open(BASELINE_PATH, "w") as f:
+            json.dump(baseline_results, f, indent=2, default=str)
+        print(f"  Saved to {BASELINE_PATH}")
+
+    # Clean up eSurge completely before Phase 2
+    del esurge
+    gc.collect()
+    jax.clear_caches()
+    gc.collect()
+    multihost_utils.sync_global_devices("esurge_stopped")
 
     if is_master:
-        print(f"\n[{p_idx+1}/{len(problems)}] {problem.task_id}")
-        print(f"  Generating...", end="", flush=True)
+        print("  eSurge cleaned up, reloading model for Phase 2...")
 
-    generated_text = ""
-    num_tokens = 0
-    t0 = time.time()
+    # Reload model fresh to avoid corrupted TPU state from eSurge
+    del elm
+    gc.collect()
+    jax.clear_caches()
 
-    # Greedy decode: temp=0 equivalent via SamplingParams
-    for output in esurge.chat(
-        conversation,
-        sampling_params=ed.SamplingParams(
-            max_tokens=MAX_GEN_TOKENS,
-            temperature=0.0,
-        ),
-        stream=True,
-    ):
-        generated_text += output.delta_text
-        num_tokens += 1
+    elm = (
+        ed.eLargeModel.from_pretrained(MODEL_ID)
+        .set_dtype("bf16")
+        .set_sharding(axis_dims=axis_dims, axis_names=axis_names)
+    )
+    multihost_utils.sync_global_devices("model_reloaded")
 
-    elapsed = time.time() - t0
-
-    # Extract code from response
-    code = extract_code_from_response(generated_text)
-
-    # Execute tests — only master runs code (CPU-bound)
-    reward = 0.0
-    exec_info = {}
+else:
     if is_master:
-        reward, exec_info = execute_code(code, problem.test_code, timeout=CODE_TIMEOUT)
-        print(f" {num_tokens} tok, {elapsed:.1f}s, R*={reward}")
-        if reward == 0.0 and exec_info.get("stderr"):
-            print(f"    Error: {exec_info['stderr'][:100]}")
-
-    # Broadcast reward to all workers
-    reward_arr = jnp.array([reward if is_master else 0.0])
-    reward_arr = multihost_utils.process_allgather(reward_arr)
-    reward = float(reward_arr.flatten()[0])  # Master's value at index 0
-
-    baseline_results.append({
-        "task_id": problem.task_id,
-        "source": problem.source,
-        "prompt_idx": p_idx,
-        "generated_text": generated_text,
-        "code": code,
-        "reward": reward,
-        "num_tokens": num_tokens,
-        "elapsed": elapsed,
-    })
-
-    # Periodic GC and checkpoint saving
-    if (p_idx + 1) % BATCH_SIZE == 0:
-        gc.collect()
-        if is_master and (p_idx + 1) % (BATCH_SIZE * 5) == 0:
-            with open(BASELINE_PATH, "w") as f:
-                json.dump(baseline_results, f, indent=2, default=str)
-            print(f"  [Checkpoint saved: {len(baseline_results)}/{len(problems)}]")
-        multihost_utils.sync_global_devices(f"baseline_batch_{p_idx}")
-
-multihost_utils.sync_global_devices("baseline_done")
-
-# Save baseline results
-if is_master:
-    passing = sum(1 for r in baseline_results if r["reward"] > 0)
-    print(f"\n  Baseline complete: {passing}/{len(problems)} passing ({100*passing/len(problems):.1f}%)")
-    with open(BASELINE_PATH, "w") as f:
-        json.dump(baseline_results, f, indent=2, default=str)
-    print(f"  Saved to {BASELINE_PATH}")
+        print("  Skipping eSurge build — going directly to Phase 2")
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -197,12 +255,8 @@ if is_master:
 # ═════════════════════════════════════════════════════════════════════
 if is_master:
     print(f"\n{'='*70}")
-    print("PHASE 2: Shutting down eSurge, switching to forward-pass mode")
+    print("PHASE 2: Forward-pass mode for perturbation & regret collection")
     print(f"{'='*70}")
-
-del esurge
-gc.collect()
-multihost_utils.sync_global_devices("esurge_stopped")
 
 # Monkey-patch EasyDeL output validation for multi-host eager mode
 import easydel.infra.modeling_outputs as _mo
