@@ -97,25 +97,59 @@ elm = elm.set_esurge(max_model_len=4096, max_num_seqs=4)
 # ═════════════════════════════════════════════════════════════════════
 
 # Check if Phase 1 is already complete (checkpoint with all problems)
+# ALL workers load checkpoint — needed so all workers have baseline_results for Phase 2
 phase1_complete = False
 baseline_results = []
-if is_master and os.path.exists(BASELINE_PATH):
+if os.path.exists(BASELINE_PATH):
     try:
         with open(BASELINE_PATH) as f:
             baseline_results = json.load(f)
         if len(baseline_results) >= len(problems):
             phase1_complete = True
-            print(f"\n  Phase 1 already complete: {len(baseline_results)} results loaded from checkpoint")
+            if is_master:
+                print(f"\n  Phase 1 already complete: {len(baseline_results)} results loaded from checkpoint")
         else:
-            print(f"\n  Partial checkpoint: {len(baseline_results)}/{len(problems)}")
+            if is_master:
+                print(f"\n  Partial checkpoint: {len(baseline_results)}/{len(problems)}")
     except Exception as e:
-        print(f"  Could not load checkpoint: {e}, starting fresh")
+        if is_master:
+            print(f"  Could not load checkpoint: {e}, starting fresh")
         baseline_results = []
 
-# Broadcast phase1_complete to all workers
-p1_arr = jnp.array([1.0 if (is_master and phase1_complete) else 0.0])
-p1_arr = multihost_utils.process_allgather(p1_arr)
-phase1_complete = float(p1_arr.flatten()[0]) > 0.5
+# Master checks if Phase 1 is done and broadcasts to all workers
+# (master = process_index 0, which is what broadcast_one_to_all sends from)
+p1_flag = jnp.array([1.0 if (is_master and phase1_complete) else 0.0])
+p1_flag = multihost_utils.broadcast_one_to_all(p1_flag)
+phase1_complete = bool(p1_flag[0] > 0.5)
+
+# If Phase 1 is complete, broadcast baseline_results from master to all workers
+# (only master may have the checkpoint file from a previous run)
+if phase1_complete:
+    # Broadcast data length first
+    if is_master:
+        json_bytes = json.dumps(baseline_results, default=str).encode("utf-8")
+        data_len = len(json_bytes)
+    else:
+        data_len = 0
+    len_arr = multihost_utils.broadcast_one_to_all(jnp.array([data_len]))
+    data_len = int(len_arr[0])
+
+    # Broadcast the JSON data as uint8 array
+    if is_master:
+        data_arr = jnp.array(np.frombuffer(json_bytes, dtype=np.uint8))
+    else:
+        data_arr = jnp.zeros(data_len, dtype=jnp.uint8)
+    data_arr = multihost_utils.broadcast_one_to_all(data_arr)
+
+    if not is_master:
+        raw = np.array(data_arr, dtype=np.uint8).tobytes()
+        baseline_results = json.loads(raw.decode("utf-8"))
+        # Save locally for future runs
+        with open(BASELINE_PATH, "w") as f:
+            json.dump(baseline_results, f, indent=2, default=str)
+
+    if is_master:
+        print(f"  Broadcast {data_len} bytes of baseline_results to all workers")
 
 if not phase1_complete:
     if is_master:
@@ -185,23 +219,24 @@ if not phase1_complete:
             "elapsed": elapsed,
         })
 
-        # Periodic GC and checkpoint saving
+        # Periodic GC and checkpoint saving (all workers save their own copy)
         if (p_idx + 1) % BATCH_SIZE == 0:
             gc.collect()
-            if is_master and (p_idx + 1) % (BATCH_SIZE * 5) == 0:
+            if (p_idx + 1) % (BATCH_SIZE * 5) == 0:
                 with open(BASELINE_PATH, "w") as f:
                     json.dump(baseline_results, f, indent=2, default=str)
-                print(f"  [Checkpoint saved: {len(baseline_results)}/{len(problems)}]")
+                if is_master:
+                    print(f"  [Checkpoint saved: {len(baseline_results)}/{len(problems)}]")
             multihost_utils.sync_global_devices(f"baseline_batch_{p_idx}")
 
     multihost_utils.sync_global_devices("baseline_done")
 
-    # Save baseline results
+    # Save baseline results (all workers save their own copy for Phase 2 resume)
+    with open(BASELINE_PATH, "w") as f:
+        json.dump(baseline_results, f, indent=2, default=str)
     if is_master:
         passing = sum(1 for r in baseline_results if r["reward"] > 0)
         print(f"\n  Baseline complete: {passing}/{len(problems)} passing ({100*passing/len(problems):.1f}%)")
-        with open(BASELINE_PATH, "w") as f:
-            json.dump(baseline_results, f, indent=2, default=str)
         print(f"  Saved to {BASELINE_PATH}")
 
     # Clean up eSurge completely before Phase 2
