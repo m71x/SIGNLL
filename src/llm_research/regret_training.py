@@ -87,28 +87,9 @@ elm = (
     .set_sharding(axis_dims=axis_dims, axis_names=axis_names)
 )
 
-# Only configure eSurge if we'll need it for Phase 1
-# (skip if Phase 1 checkpoint is complete)
-_phase1_done = False
-if is_master and os.path.exists(BASELINE_PATH):
-    try:
-        with open(BASELINE_PATH) as f:
-            _n = len(json.load(f))
-        _phase1_done = _n >= len(problems)
-    except Exception:
-        pass
-
-_p1_arr = jnp.array([1.0 if (is_master and _phase1_done) else 0.0])
-_p1_arr = multihost_utils.process_allgather(_p1_arr)
-_phase1_done = float(_p1_arr.flatten()[0]) > 0.5
-
-if not _phase1_done:
-    elm = elm.set_esurge(max_model_len=4096, max_num_seqs=4)
-    if is_master:
-        print("  eSurge configured for Phase 1 generation")
-else:
-    if is_master:
-        print("  Phase 1 complete — skipping eSurge configuration")
+# Always configure eSurge to trigger model weight conversion into JAX
+# (elm._model is None until set_esurge initializes it)
+elm = elm.set_esurge(max_model_len=4096, max_num_seqs=4)
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -247,7 +228,19 @@ if not phase1_complete:
 
 else:
     if is_master:
-        print("  Skipping eSurge build — going directly to Phase 2")
+        print("  Phase 1 complete — building model for Phase 2 only")
+
+    # Build eSurge just to initialize _model, then immediately tear it down
+    # (no inference run = no TPU state corruption)
+    esurge = elm.build_esurge()
+    del esurge
+    gc.collect()
+    jax.clear_caches()
+    gc.collect()
+    multihost_utils.sync_global_devices("model_ready_phase2")
+
+    if is_master:
+        print("  Model initialized and eSurge cleaned up (no inference was run)")
 
 
 # ═════════════════════════════════════════════════════════════════════
