@@ -23,11 +23,11 @@ import os
 # ── CONFIGURABLE PARAMETERS ──────────────────────────────────────────
 MODEL_ID = "Qwen/Qwen2.5-Coder-14B-Instruct"
 MAX_GEN_TOKENS = 512         # Max tokens for code generation
-TARGET_LAYERS = [4, 10, 16, 22, 28, 34]  # Sample ~6 layers out of 48
+TARGET_LAYERS = [8, 24, 40]               # Sample 3 layers (early/mid/late)
 PERTURB_STRENGTH = 2.0       # Logit perturbation magnitude
 PERTURB_TEMP = 0.3           # Temperature for perturbed sampling
 PERTURB_TOP_K = 3            # Top-k competitors for perturbation
-MAX_POSITIONS_PER_PROMPT = 20  # Cap token positions to perturb per layer
+MAX_POSITIONS_PER_PROMPT = 8   # Cap token positions to perturb per layer
 BATCH_SIZE = 4               # Prompts to process before GC
 CODE_TIMEOUT = 10            # Seconds for code execution
 
@@ -310,45 +310,6 @@ regret_positions = []       # List of ints
 regret_values = []          # List of floats
 
 
-def directional_perturbation(logits, chosen_idx, k=PERTURB_TOP_K, strength=PERTURB_STRENGTH):
-    """Apply directional perturbation: decrease chosen token, boost competitors.
-
-    Args:
-        logits: (vocab_size,) logit vector.
-        chosen_idx: Index of the token chosen by greedy decode.
-        k: Number of competitor tokens to boost.
-        strength: Perturbation magnitude in units of logit std.
-
-    Returns:
-        Perturbed token index (sampled at low temperature from top-k).
-    """
-    logit_std = jnp.std(logits)
-
-    # Decrease chosen token logit
-    logits = logits.at[chosen_idx].add(-strength * logit_std)
-
-    # Find top-k competitors (excluding chosen)
-    # Set chosen to -inf temporarily for argsort
-    masked = logits.at[chosen_idx].set(-jnp.inf)
-    competitors = jnp.argsort(masked)[-k:][::-1]
-
-    # Boost competitors proportionally
-    boost = (strength / k) * logit_std
-    for c_idx in range(k):
-        logits = logits.at[competitors[c_idx]].add(boost)
-
-    # Sample at low temperature from top-k (including original chosen)
-    # Restrict to top-k tokens for sampling
-    top_k_all = jnp.argsort(logits)[-(k + 1):]  # k competitors + possibly chosen
-    top_k_logits = logits[top_k_all] / PERTURB_TEMP
-    top_k_probs = jax.nn.softmax(top_k_logits)
-
-    # Use deterministic key based on chosen_idx for reproducibility across workers
-    rng = jax.random.PRNGKey(int(chosen_idx) * 1000 + k)
-    sampled_local_idx = jax.random.categorical(rng, jnp.log(top_k_probs + 1e-10))
-    return int(top_k_all[sampled_local_idx])
-
-
 for pass_num, p_idx in enumerate(passing_indices):
     result = baseline_results[p_idx]
     problem = problems[p_idx]
@@ -416,89 +377,90 @@ for pass_num, p_idx in enumerate(passing_indices):
     if is_master:
         print(f"  Perturbing {len(response_positions)} positions × {len(valid_layers)} layers")
 
-    # For each target layer × position: perturb, rollout, measure regret
+    t_perturb_start = time.time()
+
+    # Gather all baseline logit info upfront (these are still sharded JAX arrays)
+    baseline_logits_np = np.array(
+        multihost_utils.process_allgather(baseline_logits, tiled=True)
+    )
+
+    # For each target layer × position: perturb, substitute, measure regret
+    # All perturbation + code execution is pure CPU/numpy — no TPU ops in this loop
     for layer_idx in valid_layers:
-        # Get hidden state at this layer (already gathered to numpy)
         layer_hidden = gathered_hidden[layer_idx]  # (1, seq_len, hidden_dim)
+        layer_rewards = []
 
         for pos in response_positions:
-            # Get baseline logits at this position → greedy chosen token
-            pos_logits = baseline_logits[0, pos, :]  # (vocab,)
-            chosen_token = int(jnp.argmax(pos_logits))
+            pos_logits = baseline_logits_np[0, pos, :]
+            chosen_token = int(np.argmax(pos_logits))
 
-            # Apply directional perturbation
-            perturbed_token = directional_perturbation(pos_logits, chosen_token)
+            # Deterministic perturbation (pure numpy, no JAX)
+            logit_std = float(np.std(pos_logits))
+            perturbed_logits = pos_logits.copy()
+            perturbed_logits[chosen_token] -= PERTURB_STRENGTH * logit_std
+            masked = perturbed_logits.copy()
+            masked[chosen_token] = -np.inf
+            competitors = np.argsort(masked)[-PERTURB_TOP_K:][::-1]
+            boost = (PERTURB_STRENGTH / PERTURB_TOP_K) * logit_std
+            for c in competitors:
+                perturbed_logits[c] += boost
+            top_k_all = np.argsort(perturbed_logits)[-(PERTURB_TOP_K + 1):]
+            top_k_logits = perturbed_logits[top_k_all] / PERTURB_TEMP
+            top_k_logits -= top_k_logits.max()  # numerical stability
+            top_k_probs = np.exp(top_k_logits) / np.sum(np.exp(top_k_logits))
+            rng = np.random.RandomState(int(chosen_token) * 1000 + PERTURB_TOP_K)
+            perturbed_token = int(top_k_all[rng.choice(len(top_k_probs), p=top_k_probs)])
 
-            # If perturbation didn't change the token, regret = 0 (skip expensive rollout)
             if perturbed_token == chosen_token:
-                hidden_vec = layer_hidden[0, pos, :]
-                regret_hidden_states.append(hidden_vec)
+                regret_hidden_states.append(layer_hidden[0, pos, :])
                 regret_layer_indices.append(layer_idx)
                 regret_positions.append(pos)
                 regret_values.append(0.0)
+                layer_rewards.append(0.0)
                 continue
 
-            # Build perturbed sequence: replace token at pos, greedy rollout the rest
-            perturbed_ids = np.array(input_ids[0, :pos + 1].tolist() + [perturbed_token])
-
-            # Greedy rollout from pos+1 onward using forward passes
-            current_ids = jnp.array(perturbed_ids).reshape(1, -1)
-
-            with model_mesh:
-                for rollout_step in range(seq_len - pos - 2):
-                    # Cap rollout to avoid excessive compute
-                    if current_ids.shape[1] >= seq_len:
-                        break
-                    rollout_out = elm._model(input_ids=current_ids)
-                    next_logits = rollout_out.logits[0, -1, :]
-                    next_token = int(jnp.argmax(next_logits))
-                    current_ids = jnp.concatenate(
-                        [current_ids, jnp.array([[next_token]])], axis=1
-                    )
-                    del rollout_out
-                    if next_token == tokenizer.eos_token_id:
-                        break
-
-            # Decode perturbed response and execute tests
-            perturbed_all_ids = np.array(current_ids[0])
+            # Single-token substitution: swap one token and test the code
+            perturbed_all_ids = np.array(input_ids[0])
+            perturbed_all_ids[pos + 1] = perturbed_token
             perturbed_response_ids = perturbed_all_ids[response_start:]
             perturbed_code_text = tokenizer.decode(perturbed_response_ids.tolist(), skip_special_tokens=True)
             perturbed_code = extract_code_from_response(perturbed_code_text)
 
-            # Execute — master only
+            # Execute — master only (CPU-bound, no TPU)
             perturbed_reward = 0.0
             if is_master:
                 perturbed_reward, _ = execute_code(perturbed_code, problem.test_code, timeout=CODE_TIMEOUT)
 
-            # Broadcast perturbed reward
-            r_arr = jnp.array([perturbed_reward if is_master else 0.0])
-            r_arr = multihost_utils.process_allgather(r_arr)
-            perturbed_reward = float(r_arr.flatten()[0])
-
-            # Compute regret
             regret = max(0.0, result["reward"] - perturbed_reward)
-
-            # Store data point
-            hidden_vec = np.array(layer_hidden[0, pos, :])
-            regret_hidden_states.append(hidden_vec)
+            regret_hidden_states.append(layer_hidden[0, pos, :])
             regret_layer_indices.append(layer_idx)
             regret_positions.append(pos)
             regret_values.append(regret)
-
-            del current_ids
-            gc.collect()
+            layer_rewards.append(regret)
 
         if is_master:
-            nonzero = sum(1 for v in regret_values[-len(response_positions):] if v > 0)
+            nonzero = sum(1 for v in layer_rewards if v > 0)
             print(f"    Layer {layer_idx}: {nonzero}/{len(response_positions)} positions with regret > 0")
 
+    # Single sync point per prompt (instead of per-perturbation)
+    # Broadcast all regret values from master so all workers agree
+    num_new = len(valid_layers) * len(response_positions)
+    if num_new > 0:
+        recent_regrets = regret_values[-num_new:]
+        r_arr = jnp.array(recent_regrets if is_master else [0.0] * num_new)
+        r_arr = multihost_utils.broadcast_one_to_all(r_arr)
+        if not is_master:
+            for i, v in enumerate(r_arr.tolist()):
+                regret_values[-(num_new - i)] = v
+
     # Cleanup after each prompt
-    del baseline_out, baseline_logits, baseline_hidden, gathered_hidden
+    del baseline_out, baseline_logits, baseline_logits_np, baseline_hidden, gathered_hidden
     gc.collect()
     multihost_utils.sync_global_devices(f"perturb_done_{pass_num}")
 
     if is_master:
-        print(f"  Total regret samples so far: {len(regret_values)}")
+        elapsed_perturb = time.time() - t_perturb_start
+        print(f"  Perturbation took {elapsed_perturb:.1f}s, total samples: {len(regret_values)}")
 
 multihost_utils.sync_global_devices("perturbation_complete")
 
