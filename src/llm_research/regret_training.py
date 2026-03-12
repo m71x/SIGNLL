@@ -281,207 +281,218 @@ else:
 # ═════════════════════════════════════════════════════════════════════
 # PHASE 2: PERTURBATION & REGRET COLLECTION
 # ═════════════════════════════════════════════════════════════════════
-if is_master:
-    print(f"\n{'='*70}")
-    print("PHASE 2: Forward-pass mode for perturbation & regret collection")
-    print(f"{'='*70}")
 
-# Monkey-patch EasyDeL output validation for multi-host eager mode
-import easydel.infra.modeling_outputs as _mo
-for _name, _cls in inspect.getmembers(_mo, inspect.isclass):
-    if hasattr(_cls, '__post_init__'):
-        _cls.__post_init__ = lambda self: None
+# Check if Phase 2 dataset already exists (skip if so)
+phase2_complete = is_master and os.path.exists(REGRET_DATA_PATH)
+p2_flag = jnp.array([1.0 if phase2_complete else 0.0])
+p2_flag = multihost_utils.broadcast_one_to_all(p2_flag)
+phase2_complete = bool(p2_flag[0] > 0.5)
 
-if is_master:
-    print("  Patched output validation for multi-host")
+if phase2_complete:
+    if is_master:
+        print(f"\n  Phase 2 already complete: {REGRET_DATA_PATH} exists, skipping to Phase 3")
 
-model_mesh = elm._model.config.mesh
+if not phase2_complete:
+    if is_master:
+        print(f"\n{'='*70}")
+        print("PHASE 2: Forward-pass mode for perturbation & regret collection")
+        print(f"{'='*70}")
 
-# Filter to only problems with R* > 0 (skip already-failing baselines)
-passing_indices = [i for i, r in enumerate(baseline_results) if r["reward"] > 0]
-
-if is_master:
-    print(f"  Processing {len(passing_indices)} passing prompts for perturbation")
-
-# Regret data accumulators
-regret_hidden_states = []   # List of (hidden_dim,) arrays
-regret_layer_indices = []   # List of ints
-regret_positions = []       # List of ints
-regret_values = []          # List of floats
-
-
-for pass_num, p_idx in enumerate(passing_indices):
-    result = baseline_results[p_idx]
-    problem = problems[p_idx]
+    # Monkey-patch EasyDeL output validation for multi-host eager mode
+    import easydel.infra.modeling_outputs as _mo
+    for _name, _cls in inspect.getmembers(_mo, inspect.isclass):
+        if hasattr(_cls, '__post_init__'):
+            _cls.__post_init__ = lambda self: None
 
     if is_master:
-        print(f"\n{'─'*70}")
-        print(f"[{pass_num+1}/{len(passing_indices)}] {problem.task_id} (R*={result['reward']})")
+        print("  Patched output validation for multi-host")
 
-    # Tokenize full conversation (prompt + baseline response)
-    conversation = build_code_prompt(problem)
-    full_conversation = conversation + [{"role": "assistant", "content": result["generated_text"]}]
-    input_ids = tokenizer.apply_chat_template(
-        full_conversation, return_tensors="np", add_generation_prompt=False,
-    )
-    seq_len = input_ids.shape[1]
+    model_mesh = elm._model.config.mesh
 
-    # Find where the response starts
-    prompt_only_ids = tokenizer.apply_chat_template(
-        conversation, return_tensors="np", add_generation_prompt=True,
-    )
-    response_start = prompt_only_ids.shape[1]
-    response_len = seq_len - response_start
+    # Filter to only problems with R* > 0 (skip already-failing baselines)
+    passing_indices = [i for i, r in enumerate(baseline_results) if r["reward"] > 0]
 
     if is_master:
-        print(f"  Seq len: {seq_len}, response starts at: {response_start}, response tokens: {response_len}")
+        print(f"  Processing {len(passing_indices)} passing prompts for perturbation")
 
-    # Full forward pass with hidden states
-    if is_master:
-        print(f"  Running baseline forward pass...")
+    # Regret data accumulators
+    regret_hidden_states = []   # List of (hidden_dim,) arrays
+    regret_layer_indices = []   # List of ints
+    regret_positions = []       # List of ints
+    regret_values = []          # List of floats
 
-    with model_mesh:
-        baseline_out = elm._model(
-            input_ids=jnp.array(input_ids),
-            output_hidden_states=True,
-        )
-
-    baseline_logits = baseline_out.logits      # (1, seq_len, vocab)
-    baseline_hidden = baseline_out.hidden_states  # tuple of (1, seq_len, hidden_dim)
-    num_layers_total = len(baseline_hidden) - 1   # [0]=embeddings, [1..N]=layer outputs
-
-    # Validate target layers
-    valid_layers = [l for l in TARGET_LAYERS if l < num_layers_total]
-
-    if is_master:
-        print(f"  Model has {num_layers_total} layers, using: {valid_layers}")
-
-    # Gather hidden states to numpy for target layers
-    # (sharded JAX arrays can't be converted to numpy directly on multi-host)
-    gathered_hidden = {}
-    for l_idx in valid_layers:
-        gathered_hidden[l_idx] = np.array(
-            multihost_utils.process_allgather(baseline_hidden[l_idx + 1], tiled=True)
-        )
-
-    if is_master:
-        print(f"  Gathered hidden states for {len(valid_layers)} layers to numpy")
-
-    # Select response positions to perturb (subsample if too many)
-    response_positions = list(range(response_start, seq_len - 1))  # exclude last token
-    if len(response_positions) > MAX_POSITIONS_PER_PROMPT:
-        # Evenly sample positions
-        step = len(response_positions) / MAX_POSITIONS_PER_PROMPT
-        response_positions = [response_positions[int(i * step)] for i in range(MAX_POSITIONS_PER_PROMPT)]
-
-    if is_master:
-        print(f"  Perturbing {len(response_positions)} positions × {len(valid_layers)} layers")
-
-    t_perturb_start = time.time()
-
-    # Gather all baseline logit info upfront (these are still sharded JAX arrays)
-    baseline_logits_np = np.array(
-        multihost_utils.process_allgather(baseline_logits, tiled=True)
-    )
-
-    # For each target layer × position: perturb, substitute, measure regret
-    # All perturbation + code execution is pure CPU/numpy — no TPU ops in this loop
-    for layer_idx in valid_layers:
-        layer_hidden = gathered_hidden[layer_idx]  # (1, seq_len, hidden_dim)
-        layer_rewards = []
-
-        for pos in response_positions:
-            pos_logits = baseline_logits_np[0, pos, :]
-            chosen_token = int(np.argmax(pos_logits))
-
-            # Deterministic perturbation (pure numpy, no JAX)
-            logit_std = float(np.std(pos_logits))
-            perturbed_logits = pos_logits.copy()
-            perturbed_logits[chosen_token] -= PERTURB_STRENGTH * logit_std
-            masked = perturbed_logits.copy()
-            masked[chosen_token] = -np.inf
-            competitors = np.argsort(masked)[-PERTURB_TOP_K:][::-1]
-            boost = (PERTURB_STRENGTH / PERTURB_TOP_K) * logit_std
-            for c in competitors:
-                perturbed_logits[c] += boost
-            top_k_all = np.argsort(perturbed_logits)[-(PERTURB_TOP_K + 1):]
-            top_k_logits = perturbed_logits[top_k_all] / PERTURB_TEMP
-            top_k_logits -= top_k_logits.max()  # numerical stability
-            top_k_probs = np.exp(top_k_logits) / np.sum(np.exp(top_k_logits))
-            rng = np.random.RandomState(int(chosen_token) * 1000 + PERTURB_TOP_K)
-            perturbed_token = int(top_k_all[rng.choice(len(top_k_probs), p=top_k_probs)])
-
-            if perturbed_token == chosen_token:
-                regret_hidden_states.append(layer_hidden[0, pos, :])
-                regret_layer_indices.append(layer_idx)
-                regret_positions.append(pos)
-                regret_values.append(0.0)
-                layer_rewards.append(0.0)
-                continue
-
-            # Single-token substitution: swap one token and test the code
-            perturbed_all_ids = np.array(input_ids[0])
-            perturbed_all_ids[pos + 1] = perturbed_token
-            perturbed_response_ids = perturbed_all_ids[response_start:]
-            perturbed_code_text = tokenizer.decode(perturbed_response_ids.tolist(), skip_special_tokens=True)
-            perturbed_code = extract_code_from_response(perturbed_code_text)
-
-            # Execute — master only (CPU-bound, no TPU)
-            perturbed_reward = 0.0
-            if is_master:
-                perturbed_reward, _ = execute_code(perturbed_code, problem.test_code, timeout=CODE_TIMEOUT)
-
-            regret = max(0.0, result["reward"] - perturbed_reward)
-            regret_hidden_states.append(layer_hidden[0, pos, :])
-            regret_layer_indices.append(layer_idx)
-            regret_positions.append(pos)
-            regret_values.append(regret)
-            layer_rewards.append(regret)
+    for pass_num, p_idx in enumerate(passing_indices):
+        result = baseline_results[p_idx]
+        problem = problems[p_idx]
 
         if is_master:
-            nonzero = sum(1 for v in layer_rewards if v > 0)
-            print(f"    Layer {layer_idx}: {nonzero}/{len(response_positions)} positions with regret > 0")
+            print(f"\n{'─'*70}")
+            print(f"[{pass_num+1}/{len(passing_indices)}] {problem.task_id} (R*={result['reward']})")
 
-    # Single sync point per prompt (instead of per-perturbation)
-    # Broadcast all regret values from master so all workers agree
-    num_new = len(valid_layers) * len(response_positions)
-    if num_new > 0:
-        recent_regrets = regret_values[-num_new:]
-        r_arr = jnp.array(recent_regrets if is_master else [0.0] * num_new)
-        r_arr = multihost_utils.broadcast_one_to_all(r_arr)
-        if not is_master:
-            for i, v in enumerate(r_arr.tolist()):
-                regret_values[-(num_new - i)] = v
+        # Tokenize full conversation (prompt + baseline response)
+        conversation = build_code_prompt(problem)
+        full_conversation = conversation + [{"role": "assistant", "content": result["generated_text"]}]
+        input_ids = tokenizer.apply_chat_template(
+            full_conversation, return_tensors="np", add_generation_prompt=False,
+        )
+        seq_len = input_ids.shape[1]
 
-    # Cleanup after each prompt
-    del baseline_out, baseline_logits, baseline_logits_np, baseline_hidden, gathered_hidden
-    gc.collect()
-    multihost_utils.sync_global_devices(f"perturb_done_{pass_num}")
+        # Find where the response starts
+        prompt_only_ids = tokenizer.apply_chat_template(
+            conversation, return_tensors="np", add_generation_prompt=True,
+        )
+        response_start = prompt_only_ids.shape[1]
+        response_len = seq_len - response_start
 
+        if is_master:
+            print(f"  Seq len: {seq_len}, response starts at: {response_start}, response tokens: {response_len}")
+
+        # Full forward pass with hidden states
+        if is_master:
+            print(f"  Running baseline forward pass...")
+
+        with model_mesh:
+            baseline_out = elm._model(
+                input_ids=jnp.array(input_ids),
+                output_hidden_states=True,
+            )
+
+        baseline_logits = baseline_out.logits      # (1, seq_len, vocab)
+        baseline_hidden = baseline_out.hidden_states  # tuple of (1, seq_len, hidden_dim)
+        num_layers_total = len(baseline_hidden) - 1   # [0]=embeddings, [1..N]=layer outputs
+
+        # Validate target layers
+        valid_layers = [l for l in TARGET_LAYERS if l < num_layers_total]
+
+        if is_master:
+            print(f"  Model has {num_layers_total} layers, using: {valid_layers}")
+
+        # Gather hidden states to numpy for target layers
+        # (sharded JAX arrays can't be converted to numpy directly on multi-host)
+        gathered_hidden = {}
+        for l_idx in valid_layers:
+            gathered_hidden[l_idx] = np.array(
+                multihost_utils.process_allgather(baseline_hidden[l_idx + 1], tiled=True)
+            )
+
+        if is_master:
+            print(f"  Gathered hidden states for {len(valid_layers)} layers to numpy")
+
+        # Select response positions to perturb (subsample if too many)
+        response_positions = list(range(response_start, seq_len - 1))  # exclude last token
+        if len(response_positions) > MAX_POSITIONS_PER_PROMPT:
+            # Evenly sample positions
+            step = len(response_positions) / MAX_POSITIONS_PER_PROMPT
+            response_positions = [response_positions[int(i * step)] for i in range(MAX_POSITIONS_PER_PROMPT)]
+
+        if is_master:
+            print(f"  Perturbing {len(response_positions)} positions × {len(valid_layers)} layers")
+
+        t_perturb_start = time.time()
+
+        # Gather all baseline logit info upfront (these are still sharded JAX arrays)
+        baseline_logits_np = np.array(
+            multihost_utils.process_allgather(baseline_logits, tiled=True)
+        )
+
+        # For each target layer × position: perturb, substitute, measure regret
+        # All perturbation + code execution is pure CPU/numpy — no TPU ops in this loop
+        for layer_idx in valid_layers:
+            layer_hidden = gathered_hidden[layer_idx]  # (1, seq_len, hidden_dim)
+            layer_rewards = []
+
+            for pos in response_positions:
+                pos_logits = baseline_logits_np[0, pos, :]
+                chosen_token = int(np.argmax(pos_logits))
+
+                # Deterministic perturbation (pure numpy, no JAX)
+                logit_std = float(np.std(pos_logits))
+                perturbed_logits = pos_logits.copy()
+                perturbed_logits[chosen_token] -= PERTURB_STRENGTH * logit_std
+                masked = perturbed_logits.copy()
+                masked[chosen_token] = -np.inf
+                competitors = np.argsort(masked)[-PERTURB_TOP_K:][::-1]
+                boost = (PERTURB_STRENGTH / PERTURB_TOP_K) * logit_std
+                for c in competitors:
+                    perturbed_logits[c] += boost
+                top_k_all = np.argsort(perturbed_logits)[-(PERTURB_TOP_K + 1):]
+                top_k_logits = perturbed_logits[top_k_all] / PERTURB_TEMP
+                top_k_logits -= top_k_logits.max()  # numerical stability
+                top_k_probs = np.exp(top_k_logits) / np.sum(np.exp(top_k_logits))
+                rng = np.random.RandomState(int(chosen_token) * 1000 + PERTURB_TOP_K)
+                perturbed_token = int(top_k_all[rng.choice(len(top_k_probs), p=top_k_probs)])
+
+                if perturbed_token == chosen_token:
+                    regret_hidden_states.append(np.float32(layer_hidden[0, pos, :]))
+                    regret_layer_indices.append(layer_idx)
+                    regret_positions.append(pos)
+                    regret_values.append(0.0)
+                    layer_rewards.append(0.0)
+                    continue
+
+                # Single-token substitution: swap one token and test the code
+                perturbed_all_ids = np.array(input_ids[0])
+                perturbed_all_ids[pos + 1] = perturbed_token
+                perturbed_response_ids = perturbed_all_ids[response_start:]
+                perturbed_code_text = tokenizer.decode(perturbed_response_ids.tolist(), skip_special_tokens=True)
+                perturbed_code = extract_code_from_response(perturbed_code_text)
+
+                # Execute — master only (CPU-bound, no TPU)
+                perturbed_reward = 0.0
+                if is_master:
+                    perturbed_reward, _ = execute_code(perturbed_code, problem.test_code, timeout=CODE_TIMEOUT)
+
+                regret = max(0.0, result["reward"] - perturbed_reward)
+                regret_hidden_states.append(np.float32(layer_hidden[0, pos, :]))
+                regret_layer_indices.append(layer_idx)
+                regret_positions.append(pos)
+                regret_values.append(regret)
+                layer_rewards.append(regret)
+
+            if is_master:
+                nonzero = sum(1 for v in layer_rewards if v > 0)
+                print(f"    Layer {layer_idx}: {nonzero}/{len(response_positions)} positions with regret > 0")
+
+        # Single sync point per prompt (instead of per-perturbation)
+        # Broadcast all regret values from master so all workers agree
+        num_new = len(valid_layers) * len(response_positions)
+        if num_new > 0:
+            recent_regrets = regret_values[-num_new:]
+            r_arr = jnp.array(recent_regrets if is_master else [0.0] * num_new)
+            r_arr = multihost_utils.broadcast_one_to_all(r_arr)
+            if not is_master:
+                for i, v in enumerate(r_arr.tolist()):
+                    regret_values[-(num_new - i)] = v
+
+        # Cleanup after each prompt
+        del baseline_out, baseline_logits, baseline_logits_np, baseline_hidden, gathered_hidden
+        gc.collect()
+        multihost_utils.sync_global_devices(f"perturb_done_{pass_num}")
+
+        if is_master:
+            elapsed_perturb = time.time() - t_perturb_start
+            print(f"  Perturbation took {elapsed_perturb:.1f}s, total samples: {len(regret_values)}")
+
+    multihost_utils.sync_global_devices("perturbation_complete")
+
+    # Save regret dataset
     if is_master:
-        elapsed_perturb = time.time() - t_perturb_start
-        print(f"  Perturbation took {elapsed_perturb:.1f}s, total samples: {len(regret_values)}")
+        print(f"\n{'='*70}")
+        print(f"Saving regret dataset: {len(regret_values)} samples")
 
-multihost_utils.sync_global_devices("perturbation_complete")
+        regret_data = {
+            "hidden_states": np.stack(regret_hidden_states),  # (N, hidden_dim)
+            "layer_indices": np.array(regret_layer_indices),   # (N,)
+            "positions": np.array(regret_positions),           # (N,)
+            "regret_values": np.array(regret_values),          # (N,)
+        }
+        np.savez(REGRET_DATA_PATH, **regret_data)
+        print(f"  Saved to {REGRET_DATA_PATH}")
 
-# Save regret dataset
-if is_master:
-    print(f"\n{'='*70}")
-    print(f"Saving regret dataset: {len(regret_values)} samples")
-
-    regret_data = {
-        "hidden_states": np.stack(regret_hidden_states),  # (N, hidden_dim)
-        "layer_indices": np.array(regret_layer_indices),   # (N,)
-        "positions": np.array(regret_positions),           # (N,)
-        "regret_values": np.array(regret_values),          # (N,)
-    }
-    np.savez(REGRET_DATA_PATH, **regret_data)
-    print(f"  Saved to {REGRET_DATA_PATH}")
-
-    nonzero_count = np.sum(np.array(regret_values) > 0)
-    print(f"  Non-zero regret: {nonzero_count}/{len(regret_values)} ({100*nonzero_count/max(len(regret_values),1):.1f}%)")
-    print(f"  Mean regret: {np.mean(regret_values):.4f}")
-    print(f"  Max regret: {np.max(regret_values):.4f}")
+        nonzero_count = np.sum(np.array(regret_values) > 0)
+        print(f"  Non-zero regret: {nonzero_count}/{len(regret_values)} ({100*nonzero_count/max(len(regret_values),1):.1f}%)")
+        print(f"  Mean regret: {np.mean(regret_values):.4f}")
+        print(f"  Max regret: {np.max(regret_values):.4f}")
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -504,8 +515,14 @@ if is_master:
     from flax import nnx
 
     # Load regret dataset
-    data = np.load(REGRET_DATA_PATH)
-    hidden_states = jnp.array(data["hidden_states"])
+    data = np.load(REGRET_DATA_PATH, allow_pickle=False)
+    hs = data["hidden_states"]
+    # Handle bfloat16 saved as raw bytes (dtype |V2) from earlier runs
+    if hs.dtype.kind not in ('f', 'i', 'u'):
+        # Reinterpret raw bytes as bf16 via JAX, then convert to f32
+        hs_uint16 = hs.view(np.uint16)
+        hs = np.array(jnp.array(hs_uint16).view(jnp.bfloat16).astype(jnp.float32))
+    hidden_states = jnp.array(hs, dtype=jnp.float32)
     layer_indices = jnp.array(data["layer_indices"])
     positions = jnp.array(data["positions"])
     regret_targets = jnp.array(data["regret_values"])
