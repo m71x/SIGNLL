@@ -552,7 +552,7 @@ if is_master:
 
     def train_step(model, optimizer, h, l, p, targets):
         loss, grads = nnx.value_and_grad(loss_fn)(model, h, l, p, targets)
-        optimizer.update(grads)
+        optimizer.update(model, grads)
         return loss
 
     print(f"  Training for {ESTIMATOR_EPOCHS} epochs, batch_size={ESTIMATOR_BATCH}")
