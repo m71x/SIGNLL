@@ -506,11 +506,13 @@ if not phase2_complete and phase2a_complete:
         ed.eLargeModel.from_pretrained(MODEL_ID)
         .set_dtype("bf16")
         .set_sharding(axis_dims=axis_dims, axis_names=axis_names)
-        .set_esurge(max_model_len=4096, max_num_seqs=4)
+        # Smaller eSurge config for rollouts: only 1 sequence at a time,
+        # shorter context (saves ~60% HBM vs full 4096×4 config)
+        .set_esurge(max_model_len=1024, max_num_seqs=1)
     )
 
     if is_master:
-        print("  Building eSurge for rollouts...")
+        print("  Building eSurge for rollouts (max_model_len=1024, max_num_seqs=1)...")
 
     esurge = elm.build_esurge()
 
