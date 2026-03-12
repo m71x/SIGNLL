@@ -29,7 +29,7 @@ PERTURB_STRENGTH = 2.0       # Logit perturbation magnitude
 PERTURB_TEMP = 0.3           # Temperature for perturbed sampling
 PERTURB_TOP_K = 3            # Top-k competitors for perturbation
 MAX_POSITIONS_PER_PROMPT = 20  # Token positions to perturb per prompt
-ROLLOUT_MAX_TOKENS = 256     # Max tokens for perturbed rollout generation
+ROLLOUT_MAX_TOKENS = 128     # Max tokens for perturbed rollout (fits in 512 max_model_len)
 BATCH_SIZE = 4               # Prompts to process before GC
 CODE_TIMEOUT = 10            # Seconds for code execution
 REGRET_FOCAL_ALPHA = 10.0    # Focal loss weight for non-zero regret samples
@@ -506,13 +506,13 @@ if not phase2_complete and phase2a_complete:
         ed.eLargeModel.from_pretrained(MODEL_ID)
         .set_dtype("bf16")
         .set_sharding(axis_dims=axis_dims, axis_names=axis_names)
-        # Smaller eSurge config for rollouts: only 1 sequence at a time,
-        # shorter context (saves ~60% HBM vs full 4096×4 config)
-        .set_esurge(max_model_len=1024, max_num_seqs=1)
+        # Minimal eSurge config for rollouts: smallest possible footprint
+        # to avoid OOM from HBM fragmentation after model reload
+        .set_esurge(max_model_len=512, max_num_seqs=1, hbm_utilization=0.5)
     )
 
     if is_master:
-        print("  Building eSurge for rollouts (max_model_len=1024, max_num_seqs=1)...")
+        print("  Building eSurge for rollouts (max_model_len=512, max_num_seqs=1, hbm_util=0.5)...")
 
     esurge = elm.build_esurge()
 
