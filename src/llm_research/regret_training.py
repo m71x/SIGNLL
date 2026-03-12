@@ -544,7 +544,7 @@ if is_master:
 
     # Create model and optimizer
     model = create_estimator(hidden_dim, seed=42)
-    optimizer = nnx.Optimizer(model, optax.adam(ESTIMATOR_LR))
+    optimizer = nnx.Optimizer(model, optax.adam(ESTIMATOR_LR), wrt=nnx.Param)
 
     def loss_fn(model, h, l, p, targets):
         preds = model(h, l, p)
