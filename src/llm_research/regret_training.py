@@ -11,10 +11,13 @@ Built on multi-host patterns from elarge_test.py / activation_patch_test.py.
 Runs Qwen2.5-Coder-14B on 32 TPUv4s via EasyDeL.
 """
 
+import sys
+# Force unbuffered output so tee gets lines immediately
+sys.stdout.reconfigure(line_buffering=True)
+
 import jax
 import jax.numpy as jnp
 import numpy as np
-import sys
 import gc
 import json
 import inspect
@@ -28,7 +31,7 @@ TARGET_LAYERS = [8, 24, 40]               # Sample 3 layers (early/mid/late)
 PERTURB_STRENGTH = 2.0       # Logit perturbation magnitude
 PERTURB_TEMP = 0.3           # Temperature for perturbed sampling
 PERTURB_TOP_K = 3            # Top-k competitors for perturbation
-MAX_POSITIONS_PER_PROMPT = 20  # Token positions to perturb per prompt
+MAX_POSITIONS_PER_PROMPT = 5   # Token positions to perturb per prompt (fewer but all produce rollouts)
 ROLLOUT_MAX_TOKENS = 128     # Max tokens for perturbed rollout (fits in 512 max_model_len)
 BATCH_SIZE = 4               # Prompts to process before GC
 CODE_TIMEOUT = 10            # Seconds for code execution
@@ -223,9 +226,9 @@ if not phase1_complete:
         reward = 0.0
         exec_info = {}
         if is_master:
-            reward, exec_info = execute_code(code, problem.test_code, timeout=CODE_TIMEOUT)
-            print(f" {num_tokens} tok, {elapsed:.1f}s, R*={reward}")
-            if reward == 0.0 and exec_info.get("stderr"):
+            reward, exec_info = execute_code(code, problem.test_code, timeout=CODE_TIMEOUT, partial=True)
+            print(f" {num_tokens} tok, {elapsed:.1f}s, R*={reward:.2f}")
+            if reward < 1.0 and exec_info.get("stderr"):
                 print(f"    Error: {exec_info['stderr'][:100]}")
 
         # Broadcast reward to all workers
@@ -417,24 +420,18 @@ if not phase2_complete and not phase2a_complete:
             pos_logits = baseline_logits_np[0, pos, :]
             chosen_token = int(np.argmax(pos_logits))
 
-            # Deterministic perturbation (pure numpy)
-            logit_std = float(np.std(pos_logits))
-            perturbed_logits = pos_logits.copy()
-            perturbed_logits[chosen_token] -= PERTURB_STRENGTH * logit_std
-            masked = perturbed_logits.copy()
-            masked[chosen_token] = -np.inf
-            competitors = np.argsort(masked)[-PERTURB_TOP_K:][::-1]
-            boost = (PERTURB_STRENGTH / PERTURB_TOP_K) * logit_std
-            for c in competitors:
-                perturbed_logits[c] += boost
-            top_k_all = np.argsort(perturbed_logits)[-(PERTURB_TOP_K + 1):]
-            top_k_logits = perturbed_logits[top_k_all] / PERTURB_TEMP
-            top_k_logits -= top_k_logits.max()
-            top_k_probs = np.exp(top_k_logits) / np.sum(np.exp(top_k_logits))
-            rng = np.random.RandomState(int(chosen_token) * 1000 + PERTURB_TOP_K)
-            perturbed_token = int(top_k_all[rng.choice(len(top_k_probs), p=top_k_probs)])
+            # Deterministic perturbation — always picks a DIFFERENT token
+            # by excluding the chosen token from the candidate set
+            masked_logits = pos_logits.copy()
+            masked_logits[chosen_token] = -np.inf  # exclude original token
+            competitors = np.argsort(masked_logits)[-PERTURB_TOP_K:][::-1]
+            comp_logits = masked_logits[competitors] / PERTURB_TEMP
+            comp_logits -= comp_logits.max()
+            comp_probs = np.exp(comp_logits) / np.sum(np.exp(comp_logits))
+            rng = np.random.RandomState(int(chosen_token) * 1000 + pos)
+            perturbed_token = int(competitors[rng.choice(len(comp_probs), p=comp_probs)])
 
-            same_token = (perturbed_token == chosen_token)
+            same_token = False  # guaranteed different
 
             # Collect hidden states for each target layer at this position
             for layer_idx in valid_layers:
@@ -603,7 +600,7 @@ if not phase2_complete and phase2a_complete:
             if not perturbed_code.strip():
                 # Model may have included the prefix — try combining
                 perturbed_code = extract_code_from_response(prefix_text + cont_text)
-            perturbed_reward, _ = execute_code(perturbed_code, problem.test_code, timeout=CODE_TIMEOUT)
+            perturbed_reward, _ = execute_code(perturbed_code, problem.test_code, timeout=CODE_TIMEOUT, partial=True)
 
         regret = max(0.0, pert["baseline_reward"] - perturbed_reward)
         regret_values.append(regret)
