@@ -550,7 +550,6 @@ if is_master:
         preds = model(h, l, p)
         return jnp.mean((preds.squeeze(-1) - targets) ** 2)
 
-    @nnx.jit
     def train_step(model, optimizer, h, l, p, targets):
         loss, grads = nnx.value_and_grad(loss_fn)(model, h, l, p, targets)
         optimizer.update(grads)
