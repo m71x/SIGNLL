@@ -87,15 +87,34 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 axis_dims = (1, 1, 8, 4, 1)
 axis_names = ("dp", "fsdp", "tp", "sp", "selective")
 
-elm = (
-    ed.eLargeModel.from_pretrained(MODEL_ID)
-    .set_dtype("bf16")
-    .set_sharding(axis_dims=axis_dims, axis_names=axis_names)
-)
+# Pre-check completion status BEFORE model load to pick the right config.
+# This avoids loading the model twice (which OOMs due to HBM fragmentation).
+_p2_done = is_master and os.path.exists(REGRET_DATA_PATH)
+_p2a_done = is_master and os.path.exists(PHASE2A_HIDDEN_PATH) and os.path.exists(PHASE2A_PERTURB_PATH)
+_p2_flag = multihost_utils.broadcast_one_to_all(jnp.array([1.0 if _p2_done else 0.0]))
+_p2a_flag = multihost_utils.broadcast_one_to_all(jnp.array([1.0 if _p2a_done else 0.0]))
+_need_phase2b_only = bool(_p2a_flag[0] > 0.5) and not bool(_p2_flag[0] > 0.5)
 
-# Always configure eSurge to trigger model weight conversion into JAX
-# (elm._model is None until set_esurge initializes it)
-elm = elm.set_esurge(max_model_len=4096, max_num_seqs=4)
+if _need_phase2b_only:
+    # Phase 2a done, Phase 2b needed — load model directly with Phase 2b eSurge config
+    # (skip the full-size config to avoid double-loading OOM)
+    if is_master:
+        print("  Phase 2a complete, loading model directly for Phase 2b rollouts...")
+    elm = (
+        ed.eLargeModel.from_pretrained(MODEL_ID)
+        .set_dtype("bf16")
+        .set_sharding(axis_dims=axis_dims, axis_names=axis_names)
+        .set_esurge(max_model_len=512, max_num_seqs=1, hbm_utilization=0.5)
+    )
+else:
+    elm = (
+        ed.eLargeModel.from_pretrained(MODEL_ID)
+        .set_dtype("bf16")
+        .set_sharding(axis_dims=axis_dims, axis_names=axis_names)
+    )
+    # Configure eSurge to trigger model weight conversion into JAX
+    # (elm._model is None until set_esurge initializes it)
+    elm = elm.set_esurge(max_model_len=4096, max_num_seqs=4)
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -491,25 +510,24 @@ if not phase2_complete and phase2a_complete:
         print("PHASE 2b: eSurge greedy rollouts for perturbed sequences")
         print(f"{'='*70}")
 
-    # Reload model fresh for eSurge (forward passes with output_hidden_states
-    # modify the model graph, preventing eSurge rebuild)
-    if is_master:
-        print("  Reloading model for eSurge...")
+    # If we already loaded with Phase 2b config (direct path), skip reload.
+    # Otherwise, reload model fresh (forward passes corrupt the graph).
+    if not _need_phase2b_only:
+        if is_master:
+            print("  Reloading model for eSurge...")
 
-    del elm
-    gc.collect()
-    jax.clear_caches()
-    gc.collect()
-    multihost_utils.sync_global_devices("model_freed_for_2b")
+        del elm
+        gc.collect()
+        jax.clear_caches()
+        gc.collect()
+        multihost_utils.sync_global_devices("model_freed_for_2b")
 
-    elm = (
-        ed.eLargeModel.from_pretrained(MODEL_ID)
-        .set_dtype("bf16")
-        .set_sharding(axis_dims=axis_dims, axis_names=axis_names)
-        # Minimal eSurge config for rollouts: smallest possible footprint
-        # to avoid OOM from HBM fragmentation after model reload
-        .set_esurge(max_model_len=512, max_num_seqs=1, hbm_utilization=0.5)
-    )
+        elm = (
+            ed.eLargeModel.from_pretrained(MODEL_ID)
+            .set_dtype("bf16")
+            .set_sharding(axis_dims=axis_dims, axis_names=axis_names)
+            .set_esurge(max_model_len=512, max_num_seqs=1, hbm_utilization=0.5)
+        )
 
     if is_master:
         print("  Building eSurge for rollouts (max_model_len=512, max_num_seqs=1, hbm_util=0.5)...")
