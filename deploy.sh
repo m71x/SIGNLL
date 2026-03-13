@@ -9,7 +9,7 @@ ssh-add ~/.ssh/google_compute_engine
 
 SSH_CMD="gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=${ZONE} --project=${PROJECT_ID}"
 
-SETUP="pkill -f '[p]ython.*regret_training' || true; tmux kill-session -t regret 2>/dev/null || true; sleep 2; cd ~/SIGNLL && git fetch origin && git reset --hard origin/main && rm -f phase2a_hidden_states.npz phase2a_perturbations.json regret_dataset.npz regret_estimator_weights.npz"
+SETUP="pkill -f '[p]ython.*regret_training' || true; tmux kill-session -t regret 2>/dev/null || true; sleep 2; cd ~/SIGNLL && git fetch origin && git reset --hard origin/main"
 LAUNCH='cd ~/SIGNLL && source ~/edel_env/bin/activate && rm -f ~/regret_training.log && tmux new -d -s regret "PJRT_DEVICE=TPU python3 src/llm_research/regret_training.py 2>&1 | tee ~/regret_training.log"'
 
 for w in $(seq 0 7); do
