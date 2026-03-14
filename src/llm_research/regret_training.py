@@ -49,6 +49,8 @@ PHASE2A_HIDDEN_PATH = "phase2a_hidden_states.npz"
 PHASE2A_PERTURB_PATH = "phase2a_perturbations.json"
 REGRET_DATA_PATH = "regret_dataset.npz"
 ESTIMATOR_PATH = "regret_estimator_weights"
+PHASE2B_CHECKPOINT_PATH = "phase2b_checkpoint.json"
+PHASE2B_CHECKPOINT_INTERVAL = 25  # Save every N rollouts
 
 # ── 1. INITIALIZE DISTRIBUTED SYSTEM ─────────────────────────────────
 jax.distributed.initialize()
@@ -560,12 +562,34 @@ if not phase2_complete and phase2a_complete:
 
     # Process rollouts — one per perturbation position (not per layer)
     # Regret is shared across layers at the same position
-    regret_values = []  # One per perturbation (not per layer)
+    regret_values = [None] * len(perturbations)  # One per perturbation (not per layer)
+    start_idx = 0
+
+    # Load checkpoint if exists (resume from crash)
+    if is_master and os.path.exists(PHASE2B_CHECKPOINT_PATH):
+        try:
+            with open(PHASE2B_CHECKPOINT_PATH) as f:
+                ckpt = json.load(f)
+            if len(ckpt["regret_values"]) == len(perturbations):
+                start_idx = ckpt["completed"]
+                for i in range(start_idx):
+                    regret_values[i] = ckpt["regret_values"][i]
+                print(f"  Resuming from checkpoint: {start_idx}/{len(perturbations)} already done")
+            else:
+                print(f"  Checkpoint size mismatch ({len(ckpt['regret_values'])} vs {len(perturbations)}), starting fresh")
+        except Exception as e:
+            print(f"  Could not load checkpoint: {e}, starting fresh")
+
+    # Broadcast start_idx to all workers
+    start_arr = multihost_utils.broadcast_one_to_all(jnp.array([start_idx]))
+    start_idx = int(start_arr[0])
+
     t_rollout_start = time.time()
 
-    for pert_idx, pert in enumerate(perturbations):
+    for pert_idx in range(start_idx, len(perturbations)):
+        pert = perturbations[pert_idx]
         if pert["same_token"]:
-            regret_values.append(0.0)
+            regret_values[pert_idx] = 0.0
             continue
 
         # Construct prompt for continuation
@@ -603,13 +627,36 @@ if not phase2_complete and phase2a_complete:
             perturbed_reward, _ = execute_code(perturbed_code, problem.test_code, timeout=CODE_TIMEOUT, partial=True)
 
         regret = max(0.0, pert["baseline_reward"] - perturbed_reward)
-        regret_values.append(regret)
+        regret_values[pert_idx] = regret
 
         if is_master and (pert_idx + 1) % 50 == 0:
             elapsed = time.time() - t_rollout_start
-            nonzero = sum(1 for v in regret_values if v > 0)
+            done_so_far = [v for v in regret_values if v is not None]
+            nonzero = sum(1 for v in done_so_far if v > 0)
             print(f"  [{pert_idx+1}/{len(perturbations)}] {elapsed:.0f}s, "
-                  f"non-zero regret: {nonzero}/{len(regret_values)} ({100*nonzero/max(len(regret_values),1):.1f}%)")
+                  f"non-zero regret: {nonzero}/{len(done_so_far)} ({100*nonzero/max(len(done_so_far),1):.1f}%)")
+
+        # Periodic checkpoint save (master only)
+        if is_master and (pert_idx + 1) % PHASE2B_CHECKPOINT_INTERVAL == 0:
+            ckpt_data = {
+                "completed": pert_idx + 1,
+                "regret_values": [v if v is not None else 0.0 for v in regret_values],
+            }
+            with open(PHASE2B_CHECKPOINT_PATH, "w") as f:
+                json.dump(ckpt_data, f)
+            print(f"  [Checkpoint saved: {pert_idx+1}/{len(perturbations)}]")
+
+    # Finalize: replace any None values with 0.0
+    regret_values = [v if v is not None else 0.0 for v in regret_values]
+
+    # Save final checkpoint
+    if is_master:
+        ckpt_data = {
+            "completed": len(perturbations),
+            "regret_values": regret_values,
+        }
+        with open(PHASE2B_CHECKPOINT_PATH, "w") as f:
+            json.dump(ckpt_data, f)
 
     # Broadcast regret values from master
     r_arr = jnp.array(regret_values if is_master else [0.0] * len(regret_values))
@@ -664,6 +711,11 @@ if not phase2_complete and phase2a_complete:
         print(f"  Non-zero regret: {nonzero_count}/{len(expanded_regret)} ({100*nonzero_count/len(expanded_regret):.1f}%)")
         print(f"  Mean regret: {np.mean(expanded_regret):.4f}")
         print(f"  Max regret: {np.max(expanded_regret):.4f}")
+
+        # Clean up Phase 2b checkpoint now that final dataset is saved
+        if os.path.exists(PHASE2B_CHECKPOINT_PATH):
+            os.remove(PHASE2B_CHECKPOINT_PATH)
+            print(f"  Cleaned up {PHASE2B_CHECKPOINT_PATH}")
 
 
 # ═════════════════════════════════════════════════════════════════════
