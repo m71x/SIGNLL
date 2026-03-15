@@ -50,6 +50,7 @@ BASELINE_PATH = "regret_baseline_results.json"
 PHASE2A_HIDDEN_PATH = "phase2a_hidden_states.npz"
 PHASE2A_PERTURB_PATH = "phase2a_perturbations.json"
 REGRET_DATA_PATH = "regret_dataset.npz"
+PHASE2A_FAILING_PATH = "phase2a_failing_hidden.npz"  # Hidden states from failing baselines (regret=0)
 ESTIMATOR_PATH = "regret_estimator_weights"
 PHASE2B_CHECKPOINT_PATH = "phase2b_checkpoint.json"
 PHASE2B_CHECKPOINT_INTERVAL = 25  # Save every N rollouts
@@ -346,27 +347,16 @@ if not phase2_complete and not phase2a_complete:
 
     model_mesh = elm._model.config.mesh
 
-    # Filter to only problems with R* > 0 (skip already-failing baselines)
     passing_indices = [i for i, r in enumerate(baseline_results) if r["reward"] > 0]
+    failing_indices = [i for i, r in enumerate(baseline_results) if r["reward"] == 0]
 
     if is_master:
-        print(f"  Processing {len(passing_indices)} passing prompts")
+        print(f"  Passing prompts: {len(passing_indices)}, Failing: {len(failing_indices)}")
 
-    # Accumulators for Phase 2a output
-    all_hidden_states = []    # (hidden_dim,) arrays — one per layer × position
-    all_layer_indices = []
-    all_positions = []
-    all_perturbations = []    # List of dicts: {p_idx, pos, perturbed_token, prefix_text, ...}
-
-    for pass_num, p_idx in enumerate(passing_indices):
-        result = baseline_results[p_idx]
-        problem = problems[p_idx]
-
-        if is_master:
-            print(f"\n{'─'*70}")
-            print(f"[{pass_num+1}/{len(passing_indices)}] {problem.task_id} (R*={result['reward']})")
-
-        # Tokenize full conversation (prompt + baseline response)
+    # ── Helper: run forward pass and collect hidden states + logit features ──
+    def _forward_pass_collect(p_idx, result, problem, pass_label):
+        """Run forward pass, return (hidden_states, layer_indices, positions, entropies, margins)
+        for sampled response positions across target layers."""
         conversation = build_code_prompt(problem)
         full_conversation = conversation + [{"role": "assistant", "content": result["generated_text"]}]
         input_ids = tokenizer.apply_chat_template(
@@ -374,18 +364,96 @@ if not phase2_complete and not phase2a_complete:
         )
         seq_len = input_ids.shape[1]
 
-        # Find where the response starts
         prompt_only_ids = tokenizer.apply_chat_template(
             conversation, return_tensors="np", add_generation_prompt=True,
         )
         response_start = prompt_only_ids.shape[1]
 
         if is_master:
-            print(f"  Seq len: {seq_len}, response starts: {response_start}, response tokens: {seq_len - response_start}")
+            print(f"  Seq len: {seq_len}, response: {seq_len - response_start} tokens")
 
-        # Full forward pass with hidden states
+        with model_mesh:
+            out = elm._model(
+                input_ids=jnp.array(input_ids),
+                output_hidden_states=True,
+            )
+
+        logits = out.logits
+        hidden = out.hidden_states
+        num_layers_total = len(hidden) - 1
+        valid_layers = [l for l in TARGET_LAYERS if l < num_layers_total]
+
+        gathered_hidden = {}
+        for l_idx in valid_layers:
+            gathered_hidden[l_idx] = np.array(
+                multihost_utils.process_allgather(hidden[l_idx + 1], tiled=True)
+            )
+        logits_np = np.array(
+            multihost_utils.process_allgather(logits, tiled=True)
+        )
+
+        # Select response positions
+        response_positions = list(range(response_start, seq_len - 1))
+        if len(response_positions) > MAX_POSITIONS_PER_PROMPT:
+            step = len(response_positions) / MAX_POSITIONS_PER_PROMPT
+            response_positions = [response_positions[int(i * step)] for i in range(MAX_POSITIONS_PER_PROMPT)]
+
+        hs_list, li_list, pos_list, ent_list, mar_list = [], [], [], [], []
+
+        for pos in response_positions:
+            pos_logits = logits_np[0, pos, :]
+
+            # Compute logit features: entropy and margin
+            shifted = pos_logits - pos_logits.max()
+            probs = np.exp(shifted) / np.sum(np.exp(shifted))
+            entropy = float(-np.sum(probs * np.log(probs + 1e-10)))
+            sorted_logits = np.sort(pos_logits)
+            margin = float(sorted_logits[-1] - sorted_logits[-2])
+
+            for layer_idx in valid_layers:
+                hs_list.append(np.float32(gathered_hidden[layer_idx][0, pos, :]))
+                li_list.append(layer_idx)
+                pos_list.append(pos)
+                ent_list.append(entropy)
+                mar_list.append(margin)
+
+        # Cleanup
+        del out, logits, logits_np, hidden, gathered_hidden
+        gc.collect()
+
+        return (hs_list, li_list, pos_list, ent_list, mar_list,
+                input_ids, response_start, response_positions, valid_layers, logits_np if False else None)
+
+    # ── Process passing baselines (perturbation planning + hidden states) ──
+    all_hidden_states = []
+    all_layer_indices = []
+    all_positions = []
+    all_entropies = []
+    all_margins = []
+    all_perturbations = []
+
+    for pass_num, p_idx in enumerate(passing_indices):
+        result = baseline_results[p_idx]
+        problem = problems[p_idx]
+
         if is_master:
-            print(f"  Running forward pass...")
+            print(f"\n{'─'*70}")
+            print(f"[{pass_num+1}/{len(passing_indices)}] {problem.task_id} (R*={result['reward']:.2f})")
+
+        # Forward pass
+        conversation = build_code_prompt(problem)
+        full_conversation = conversation + [{"role": "assistant", "content": result["generated_text"]}]
+        input_ids = tokenizer.apply_chat_template(
+            full_conversation, return_tensors="np", add_generation_prompt=False,
+        )
+        seq_len = input_ids.shape[1]
+        prompt_only_ids = tokenizer.apply_chat_template(
+            conversation, return_tensors="np", add_generation_prompt=True,
+        )
+        response_start = prompt_only_ids.shape[1]
+
+        if is_master:
+            print(f"  Seq len: {seq_len}, response: {seq_len - response_start} tokens")
 
         with model_mesh:
             baseline_out = elm._model(
@@ -396,21 +464,18 @@ if not phase2_complete and not phase2a_complete:
         baseline_logits = baseline_out.logits
         baseline_hidden = baseline_out.hidden_states
         num_layers_total = len(baseline_hidden) - 1
-
         valid_layers = [l for l in TARGET_LAYERS if l < num_layers_total]
 
-        # Gather hidden states and logits to numpy
         gathered_hidden = {}
         for l_idx in valid_layers:
             gathered_hidden[l_idx] = np.array(
                 multihost_utils.process_allgather(baseline_hidden[l_idx + 1], tiled=True)
             )
-
         baseline_logits_np = np.array(
             multihost_utils.process_allgather(baseline_logits, tiled=True)
         )
 
-        # Select response positions to perturb
+        # Select response positions
         response_positions = list(range(response_start, seq_len - 1))
         if len(response_positions) > MAX_POSITIONS_PER_PROMPT:
             step = len(response_positions) / MAX_POSITIONS_PER_PROMPT
@@ -419,15 +484,20 @@ if not phase2_complete and not phase2a_complete:
         if is_master:
             print(f"  {len(response_positions)} positions × {len(valid_layers)} layers")
 
-        # Compute perturbations and collect hidden states
         for pos in response_positions:
             pos_logits = baseline_logits_np[0, pos, :]
             chosen_token = int(np.argmax(pos_logits))
 
-            # Deterministic perturbation — always picks a DIFFERENT token
-            # by excluding the chosen token from the candidate set
+            # Logit features
+            shifted = pos_logits - pos_logits.max()
+            probs = np.exp(shifted) / np.sum(np.exp(shifted))
+            entropy = float(-np.sum(probs * np.log(probs + 1e-10)))
+            sorted_logits = np.sort(pos_logits)
+            margin = float(sorted_logits[-1] - sorted_logits[-2])
+
+            # Perturbation: pick a DIFFERENT token
             masked_logits = pos_logits.copy()
-            masked_logits[chosen_token] = -np.inf  # exclude original token
+            masked_logits[chosen_token] = -np.inf
             competitors = np.argsort(masked_logits)[-PERTURB_TOP_K:][::-1]
             comp_logits = masked_logits[competitors] / PERTURB_TEMP
             comp_logits -= comp_logits.max()
@@ -435,26 +505,20 @@ if not phase2_complete and not phase2a_complete:
             rng = np.random.RandomState(int(chosen_token) * 1000 + pos)
             perturbed_token = int(competitors[rng.choice(len(comp_probs), p=comp_probs)])
 
-            same_token = False  # guaranteed different
-
-            # Collect hidden states for each target layer at this position
             for layer_idx in valid_layers:
-                layer_hidden = gathered_hidden[layer_idx]
-                all_hidden_states.append(np.float32(layer_hidden[0, pos, :]))
+                all_hidden_states.append(np.float32(gathered_hidden[layer_idx][0, pos, :]))
                 all_layer_indices.append(layer_idx)
                 all_positions.append(pos)
+                all_entropies.append(entropy)
+                all_margins.append(margin)
 
-            # Build the perturbed prefix text for Phase 2b rollout
-            # (one rollout per position, shared across layers)
-            if not same_token:
-                perturbed_prefix_ids = np.array(input_ids[0][:pos + 1])
-                perturbed_prefix_ids[pos] = perturbed_token
-                prefix_response_text = tokenizer.decode(
-                    perturbed_prefix_ids[response_start:].tolist(),
-                    skip_special_tokens=True,
-                )
-            else:
-                prefix_response_text = ""
+            # Build perturbed prefix for Phase 2b rollout
+            perturbed_prefix_ids = np.array(input_ids[0][:pos + 1])
+            perturbed_prefix_ids[pos] = perturbed_token
+            prefix_response_text = tokenizer.decode(
+                perturbed_prefix_ids[response_start:].tolist(),
+                skip_special_tokens=True,
+            )
 
             all_perturbations.append({
                 "p_idx": int(p_idx),
@@ -462,13 +526,12 @@ if not phase2_complete and not phase2a_complete:
                 "response_start": int(response_start),
                 "chosen_token": int(chosen_token),
                 "perturbed_token": int(perturbed_token),
-                "same_token": same_token,
+                "same_token": False,
                 "prefix_response_text": prefix_response_text,
                 "baseline_reward": float(result["reward"]),
                 "num_layers": len(valid_layers),
             })
 
-        # Cleanup per prompt
         del baseline_out, baseline_logits, baseline_logits_np, baseline_hidden, gathered_hidden
         gc.collect()
         multihost_utils.sync_global_devices(f"phase2a_{pass_num}")
@@ -476,23 +539,112 @@ if not phase2_complete and not phase2a_complete:
         if is_master and (pass_num + 1) % 10 == 0:
             print(f"  Progress: {pass_num+1}/{len(passing_indices)}, samples: {len(all_perturbations)}")
 
+    multihost_utils.sync_global_devices("phase2a_passing_done")
+
+    # ── Process failing baselines (hidden states only, regret=0) ──
+    if is_master:
+        print(f"\n{'─'*70}")
+        print(f"Processing {len(failing_indices)} failing baselines (regret=0, no rollouts needed)")
+
+    fail_hidden_states = []
+    fail_layer_indices = []
+    fail_positions = []
+    fail_entropies = []
+    fail_margins = []
+
+    for fail_num, p_idx in enumerate(failing_indices):
+        result = baseline_results[p_idx]
+        problem = problems[p_idx]
+
+        if is_master and (fail_num + 1) % 20 == 0:
+            print(f"  Failing: {fail_num+1}/{len(failing_indices)}")
+
+        conversation = build_code_prompt(problem)
+        full_conversation = conversation + [{"role": "assistant", "content": result["generated_text"]}]
+        input_ids = tokenizer.apply_chat_template(
+            full_conversation, return_tensors="np", add_generation_prompt=False,
+        )
+        seq_len = input_ids.shape[1]
+        prompt_only_ids = tokenizer.apply_chat_template(
+            conversation, return_tensors="np", add_generation_prompt=True,
+        )
+        response_start = prompt_only_ids.shape[1]
+
+        with model_mesh:
+            out = elm._model(
+                input_ids=jnp.array(input_ids),
+                output_hidden_states=True,
+            )
+
+        logits_out = out.logits
+        hidden_out = out.hidden_states
+        num_layers_total = len(hidden_out) - 1
+        valid_layers = [l for l in TARGET_LAYERS if l < num_layers_total]
+
+        gathered_hidden = {}
+        for l_idx in valid_layers:
+            gathered_hidden[l_idx] = np.array(
+                multihost_utils.process_allgather(hidden_out[l_idx + 1], tiled=True)
+            )
+        logits_np = np.array(
+            multihost_utils.process_allgather(logits_out, tiled=True)
+        )
+
+        response_positions = list(range(response_start, seq_len - 1))
+        if len(response_positions) > MAX_POSITIONS_PER_PROMPT:
+            step = len(response_positions) / MAX_POSITIONS_PER_PROMPT
+            response_positions = [response_positions[int(i * step)] for i in range(MAX_POSITIONS_PER_PROMPT)]
+
+        for pos in response_positions:
+            pos_logits = logits_np[0, pos, :]
+            shifted = pos_logits - pos_logits.max()
+            probs = np.exp(shifted) / np.sum(np.exp(shifted))
+            entropy = float(-np.sum(probs * np.log(probs + 1e-10)))
+            sorted_logits = np.sort(pos_logits)
+            margin = float(sorted_logits[-1] - sorted_logits[-2])
+
+            for layer_idx in valid_layers:
+                fail_hidden_states.append(np.float32(gathered_hidden[layer_idx][0, pos, :]))
+                fail_layer_indices.append(layer_idx)
+                fail_positions.append(pos)
+                fail_entropies.append(entropy)
+                fail_margins.append(margin)
+
+        del out, logits_out, logits_np, hidden_out, gathered_hidden
+        gc.collect()
+        multihost_utils.sync_global_devices(f"phase2a_fail_{fail_num}")
+
     multihost_utils.sync_global_devices("phase2a_complete")
 
-    # Save Phase 2a data (master only — hidden states are already gathered)
+    # Save Phase 2a data
     if is_master:
-        print(f"\n  Saving Phase 2a data: {len(all_perturbations)} perturbations, {len(all_hidden_states)} hidden states")
+        print(f"\n  Saving Phase 2a data:")
+        print(f"    Passing: {len(all_perturbations)} perturbations, {len(all_hidden_states)} hidden states")
+        print(f"    Failing: {len(fail_hidden_states)} hidden states (all regret=0)")
 
         np.savez(
             PHASE2A_HIDDEN_PATH,
             hidden_states=np.stack(all_hidden_states),
             layer_indices=np.array(all_layer_indices),
             positions=np.array(all_positions),
+            entropies=np.array(all_entropies),
+            margins=np.array(all_margins),
         )
         with open(PHASE2A_PERTURB_PATH, "w") as f:
             json.dump(all_perturbations, f, indent=2)
 
+        if fail_hidden_states:
+            np.savez(
+                PHASE2A_FAILING_PATH,
+                hidden_states=np.stack(fail_hidden_states),
+                layer_indices=np.array(fail_layer_indices),
+                positions=np.array(fail_positions),
+                entropies=np.array(fail_entropies),
+                margins=np.array(fail_margins),
+            )
+
         n_need_rollout = sum(1 for p in all_perturbations if not p["same_token"])
-        print(f"  Saved to {PHASE2A_HIDDEN_PATH} and {PHASE2A_PERTURB_PATH}")
+        print(f"  Saved to {PHASE2A_HIDDEN_PATH}, {PHASE2A_PERTURB_PATH}, {PHASE2A_FAILING_PATH}")
         print(f"  Perturbations needing rollout: {n_need_rollout}/{len(all_perturbations)}")
 
     phase2a_complete = True
@@ -672,15 +824,18 @@ if not phase2_complete and phase2a_complete:
     gc.collect()
 
     # Assemble final regret dataset: expand regret per position → per layer × position
+    # Then merge with failing baseline data (all regret=0)
     if is_master:
         elapsed_total = time.time() - t_rollout_start
         print(f"\n  Rollouts complete in {elapsed_total:.0f}s")
 
-        # Load Phase 2a hidden states
+        # Load Phase 2a hidden states (passing baselines)
         h_data = np.load(PHASE2A_HIDDEN_PATH)
         hidden_states_all = h_data["hidden_states"]
         layer_indices_all = h_data["layer_indices"]
         positions_all = h_data["positions"]
+        entropies_all = h_data["entropies"]
+        margins_all = h_data["margins"]
 
         # Each perturbation maps to num_layers hidden state entries
         # perturbations[i] → hidden states at indices [i*num_layers : (i+1)*num_layers]
@@ -696,21 +851,43 @@ if not phase2_complete and phase2a_complete:
         assert len(expanded_regret) == len(hidden_states_all), \
             f"Mismatch: {len(expanded_regret)} regret vs {len(hidden_states_all)} hidden states"
 
+        # Merge failing baseline data (all regret=0, no rollouts needed)
+        if os.path.exists(PHASE2A_FAILING_PATH):
+            fail_data = np.load(PHASE2A_FAILING_PATH)
+            fail_hs = fail_data["hidden_states"]
+            fail_li = fail_data["layer_indices"]
+            fail_pos = fail_data["positions"]
+            fail_ent = fail_data["entropies"]
+            fail_mar = fail_data["margins"]
+            fail_regret = np.zeros(len(fail_hs))
+
+            print(f"\n  Merging {len(fail_hs)} failing baseline samples (regret=0)")
+            hidden_states_all = np.concatenate([hidden_states_all, fail_hs])
+            layer_indices_all = np.concatenate([layer_indices_all, fail_li])
+            positions_all = np.concatenate([positions_all, fail_pos])
+            entropies_all = np.concatenate([entropies_all, fail_ent])
+            margins_all = np.concatenate([margins_all, fail_mar])
+            expanded_regret = np.concatenate([expanded_regret, fail_regret])
+
         # Save final regret dataset
+        total = len(expanded_regret)
         print(f"\n{'='*70}")
-        print(f"Saving regret dataset: {len(expanded_regret)} samples")
+        print(f"Saving regret dataset: {total} samples")
 
         np.savez(
             REGRET_DATA_PATH,
             hidden_states=hidden_states_all,
             layer_indices=layer_indices_all,
             positions=positions_all,
+            entropies=entropies_all,
+            margins=margins_all,
             regret_values=expanded_regret,
         )
         print(f"  Saved to {REGRET_DATA_PATH}")
 
         nonzero_count = np.sum(expanded_regret > 0)
-        print(f"  Non-zero regret: {nonzero_count}/{len(expanded_regret)} ({100*nonzero_count/len(expanded_regret):.1f}%)")
+        print(f"  Non-zero regret: {nonzero_count}/{total} ({100*nonzero_count/total:.1f}%)")
+        print(f"  Zero regret: {total - nonzero_count}/{total} ({100*(total-nonzero_count)/total:.1f}%)")
         print(f"  Mean regret: {np.mean(expanded_regret):.4f}")
         print(f"  Max regret: {np.max(expanded_regret):.4f}")
 
@@ -754,9 +931,22 @@ if is_master:
     positions = jnp.array(data["positions"])
     regret_targets = jnp.array(data["regret_values"])
 
+    # Load logit features (entropy, margin)
+    if "entropies" in data:
+        entropies_raw = jnp.array(data["entropies"], dtype=jnp.float32)
+        margins_raw = jnp.array(data["margins"], dtype=jnp.float32)
+        has_logit_features = True
+    else:
+        has_logit_features = False
+        entropies_raw = jnp.zeros(len(regret_targets))
+        margins_raw = jnp.zeros(len(regret_targets))
+
     N = hidden_states.shape[0]
     hidden_dim = hidden_states.shape[1]
     print(f"  Dataset: {N} samples, hidden_dim={hidden_dim}")
+    if has_logit_features:
+        print(f"  Logit features: entropy range [{float(jnp.min(entropies_raw)):.2f}, {float(jnp.max(entropies_raw)):.2f}], "
+              f"margin range [{float(jnp.min(margins_raw)):.2f}, {float(jnp.max(margins_raw)):.2f}]")
 
     # Binary targets: fragile (regret > 0) vs safe (regret = 0)
     binary_targets = (regret_targets > 0).astype(jnp.float32)
@@ -781,6 +971,21 @@ if is_master:
         hidden_states = hidden_states.at[mask].set(
             (hidden_states[mask] - jnp.array(mean)) / (jnp.array(std) + 1e-8)
         )
+
+    # Normalize entropy and margin (z-score)
+    ent_mean = float(jnp.mean(entropies_raw))
+    ent_std = float(jnp.std(entropies_raw))
+    mar_mean = float(jnp.mean(margins_raw))
+    mar_std = float(jnp.std(margins_raw))
+    norm_stats["entropy_mean"] = ent_mean
+    norm_stats["entropy_std"] = ent_std
+    norm_stats["margin_mean"] = mar_mean
+    norm_stats["margin_std"] = mar_std
+    entropies_norm = ((entropies_raw - ent_mean) / (ent_std + 1e-8)).reshape(-1, 1)
+    margins_norm = ((margins_raw - mar_mean) / (mar_std + 1e-8)).reshape(-1, 1)
+    if has_logit_features:
+        print(f"  Entropy: mean={ent_mean:.3f}, std={ent_std:.3f}")
+        print(f"  Margin:  mean={mar_mean:.3f}, std={mar_std:.3f}")
 
     # Normalize layer index and position to [0, 1]
     num_layers = max(int(jnp.max(layer_indices)) + 1, 1)
@@ -820,8 +1025,8 @@ if is_master:
     pos_weight = (1.0 - nonzero_frac) / max(nonzero_frac, 1e-6)
     print(f"  BCE pos_weight: {pos_weight:.3f} (balancing {nonzero_frac:.1%} positives)")
 
-    def loss_fn(model, h, l, p, targets):
-        preds = model(h, l, p, deterministic=False).squeeze(-1)
+    def loss_fn(model, h, l, p, ent, mar, targets):
+        preds = model(h, l, p, ent, mar, deterministic=False).squeeze(-1)
         # Weighted BCE loss
         # BCE = -[w*t*log(p) + (1-t)*log(1-p)]
         eps = 1e-7
@@ -829,8 +1034,8 @@ if is_master:
         bce = -(pos_weight * targets * jnp.log(preds) + (1 - targets) * jnp.log(1 - preds))
         return jnp.mean(bce)
 
-    def train_step(model, optimizer, h, l, p, targets):
-        loss, grads = nnx.value_and_grad(loss_fn)(model, h, l, p, targets)
+    def train_step(model, optimizer, h, l, p, ent, mar, targets):
+        loss, grads = nnx.value_and_grad(loss_fn)(model, h, l, p, ent, mar, targets)
         optimizer.update(model, grads)
         return loss
 
@@ -853,6 +1058,7 @@ if is_master:
             loss = train_step(
                 model, optimizer,
                 hidden_states[idx], layer_norm[idx], pos_norm[idx],
+                entropies_norm[idx], margins_norm[idx],
                 binary_targets[idx],
             )
             epoch_losses.append(float(loss))
@@ -861,6 +1067,7 @@ if is_master:
 
         # Validation: BCE loss + accuracy (deterministic mode = no dropout)
         val_preds = model(hidden_states[val_idx], layer_norm[val_idx], pos_norm[val_idx],
+                          entropies_norm[val_idx], margins_norm[val_idx],
                           deterministic=True).squeeze(-1)
         val_bce = float(jnp.mean(
             -(binary_targets[val_idx] * jnp.log(jnp.clip(val_preds, 1e-7, 1-1e-7))

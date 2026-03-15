@@ -11,6 +11,7 @@ import os
 REGRET_DATA_PATH = "regret_dataset.npz"
 PHASE2A_HIDDEN_PATH = "phase2a_hidden_states.npz"
 PHASE2A_PERTURB_PATH = "phase2a_perturbations.json"
+PHASE2A_FAILING_PATH = "phase2a_failing_hidden.npz"
 PHASE2B_CHECKPOINT_PATH = "phase2b_checkpoint.json"
 
 # Load existing regret dataset
@@ -52,7 +53,7 @@ nonzero = sum(1 for v in regret_per_pert if v > 0)
 print(f"Non-zero regret: {nonzero}/{n_perturbations} ({100*nonzero/n_perturbations:.1f}%)")
 
 # Delete Phase 2a outputs and regret dataset (will be regenerated with new layers)
-for path in [PHASE2A_HIDDEN_PATH, PHASE2A_PERTURB_PATH, REGRET_DATA_PATH]:
+for path in [PHASE2A_HIDDEN_PATH, PHASE2A_PERTURB_PATH, PHASE2A_FAILING_PATH, REGRET_DATA_PATH]:
     if os.path.exists(path):
         os.remove(path)
         print(f"Deleted {path}")

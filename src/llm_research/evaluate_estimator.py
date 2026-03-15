@@ -24,7 +24,7 @@ PROJECT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".
 REGRET_DATA_PATH = os.path.join(PROJECT_ROOT, "regret_dataset.npz")
 ESTIMATOR_PATH = os.path.join(PROJECT_ROOT, "regret_estimator_weights.npz")
 
-TARGET_LAYERS = [8, 24, 40]
+TARGET_LAYERS = [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44]
 
 
 # ── NUMPY MLP INFERENCE ─────────────────────────────────────────────
@@ -58,17 +58,23 @@ class NumpyEstimator:
             print(f"  Weight keys: {keys[:10]}")
             raise ValueError(f"Unknown weight format. Keys: {keys}")
 
-        # Detect model version by hidden size
+        # Detect model version by layer sizes
         kernel = self._get("linear1/kernel")
+        in_dim = kernel.shape[0]
         out_dim = kernel.shape[1]
-        self.is_v2 = out_dim == 512  # v2 = 512, v1 = 256
+        self.is_v2 = out_dim == 512  # v2/v3 = 512, v1 = 256
+        self.has_logit_inputs = "entropy_mean" in self.norm_stats
 
+        n_norm_layers = sum(1 for k in self.norm_stats if k.startswith("layer_") and k.endswith("_mean"))
         if self.norm_stats:
-            print(f"  Per-layer normalization stats loaded ({len(self.norm_stats)//2} layers)")
-        if self.is_v2:
+            print(f"  Per-layer normalization stats loaded ({n_norm_layers} layers)")
+        if self.has_logit_inputs:
+            print(f"  Model v3 detected (logit features, 512→128→1, sigmoid)")
+        elif self.is_v2:
             print(f"  Model v2 detected (512→128→1, sigmoid)")
         else:
             print(f"  Model v1 detected (256→64→1, ReLU)")
+        print(f"  Input dim: {in_dim}, first hidden: {out_dim}")
 
     def _get(self, name):
         if self.fmt == "value":
@@ -89,8 +95,21 @@ class NumpyEstimator:
                 hs[mask] = (hs[mask] - self.norm_stats[mean_key]) / (self.norm_stats[std_key] + 1e-8)
         return hs
 
-    def __call__(self, hidden_state, layer_idx, position):
-        x = np.concatenate([hidden_state, layer_idx, position], axis=-1)
+    def normalize_logit_features(self, entropies, margins):
+        """Apply z-score normalization to entropy and margin using saved stats."""
+        ent = entropies.copy()
+        mar = margins.copy()
+        if "entropy_mean" in self.norm_stats:
+            ent = (ent - float(self.norm_stats["entropy_mean"])) / (float(self.norm_stats["entropy_std"]) + 1e-8)
+        if "margin_mean" in self.norm_stats:
+            mar = (mar - float(self.norm_stats["margin_mean"])) / (float(self.norm_stats["margin_std"]) + 1e-8)
+        return ent, mar
+
+    def __call__(self, hidden_state, layer_idx, position, entropy=None, margin=None):
+        if entropy is not None and margin is not None:
+            x = np.concatenate([hidden_state, layer_idx, position, entropy, margin], axis=-1)
+        else:
+            x = np.concatenate([hidden_state, layer_idx, position], axis=-1)
         x = gelu(x @ self._get("linear1/kernel") + self._get("linear1/bias"))
         x = gelu(x @ self._get("linear2/kernel") + self._get("linear2/bias"))
         x = x @ self._get("linear3/kernel") + self._get("linear3/bias")
@@ -113,12 +132,17 @@ def load_data():
                 (hs_u16[i].astype(np.uint32) << 16).tobytes(), dtype=np.float32
             )
         hs = hs_f32
-    return {
+    result = {
         "hidden_states": np.array(hs, dtype=np.float32),
         "layer_indices": data["layer_indices"],
         "positions": data["positions"],
         "regret_values": data["regret_values"],
     }
+    # Load logit features if available
+    if "entropies" in data:
+        result["entropies"] = data["entropies"].astype(np.float32)
+        result["margins"] = data["margins"].astype(np.float32)
+    return result
 
 
 def predict_all(model, data):
@@ -134,7 +158,14 @@ def predict_all(model, data):
     layer_norm = layers.astype(np.float32).reshape(-1, 1) / (num_layers - 1)
     pos_norm = positions.astype(np.float32).reshape(-1, 1) / (max_pos - 1)
 
-    preds = model(hs, layer_norm, pos_norm)
+    # Use logit features if available
+    if "entropies" in data:
+        ent = data["entropies"].reshape(-1, 1)
+        mar = data["margins"].reshape(-1, 1)
+        ent, mar = model.normalize_logit_features(ent, mar)
+        preds = model(hs, layer_norm, pos_norm, ent, mar)
+    else:
+        preds = model(hs, layer_norm, pos_norm)
     return preds.squeeze(-1)
 
 
@@ -300,7 +331,19 @@ def eval_early_exit_simulation(preds, targets, layer_indices):
     print("  'Safe exit' = true regret was 0, 'Unsafe exit' = true regret > 0")
 
     n_layers = len(TARGET_LAYERS)
-    n_perturbations = len(targets) // n_layers
+
+    # Determine perturbation count (excluding appended failing baselines)
+    perturb_path = os.path.join(PROJECT_ROOT, "phase2a_perturbations.json")
+    if os.path.exists(perturb_path):
+        import json
+        with open(perturb_path) as f:
+            n_perturbations = len(json.load(f))
+        # Only use perturbation samples for early-exit simulation
+        n_pert_samples = n_perturbations * n_layers
+        preds = preds[:n_pert_samples]
+        targets = targets[:n_pert_samples]
+    else:
+        n_perturbations = len(targets) // n_layers
 
     print(f"\n  Perturbations: {n_perturbations}, Layers: {TARGET_LAYERS}")
 
@@ -426,8 +469,18 @@ def eval_train_val(model, data):
     print(f"\n  {'Split':>6} {'N':>6} {'MSE':>10} {'MAE':>10} {'Corr':>10} {'Acc':>8}")
     print(f"  {'─'*52}")
 
+    # Normalize logit features if available
+    has_logit = "entropies" in data
+    if has_logit:
+        ent = data["entropies"].reshape(-1, 1)
+        mar = data["margins"].reshape(-1, 1)
+        ent, mar = model.normalize_logit_features(ent, mar)
+
     for name, idx in [("Train", train_idx), ("Val", val_idx)]:
-        p = model(hs[idx], layer_norm[idx], pos_norm[idx]).squeeze(-1)
+        if has_logit:
+            p = model(hs[idx], layer_norm[idx], pos_norm[idx], ent[idx], mar[idx]).squeeze(-1)
+        else:
+            p = model(hs[idx], layer_norm[idx], pos_norm[idx]).squeeze(-1)
         t = targets[idx]
         b = binary[idx]
         mse = np.mean((p - t) ** 2)
@@ -524,6 +577,9 @@ def main():
     hdim = data["hidden_states"].shape[1]
     print(f"  Samples: {N}, Hidden dim: {hdim}")
     print(f"  Layers: {sorted(np.unique(data['layer_indices']))}")
+    if "entropies" in data:
+        print(f"  Logit features: entropy [{data['entropies'].min():.2f}, {data['entropies'].max():.2f}], "
+              f"margin [{data['margins'].min():.2f}, {data['margins'].max():.2f}]")
 
     print("Loading model...")
     model = NumpyEstimator(ESTIMATOR_PATH)

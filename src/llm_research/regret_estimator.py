@@ -2,20 +2,20 @@
 Regret Estimator — Flax MLP Model
 ===================================
 Lightweight MLP that predicts whether a token position is "fragile"
-(perturbation causes regret) from hidden states, layer index, and position.
+(perturbation causes regret) from hidden states, layer index, position,
+and logit features (entropy, margin).
 
-Architecture (v2 — binary classification with per-layer normalization):
+Architecture (v3 — binary classification with logit features):
     Input: normalized hidden_state (hidden_dim) + layer_idx (1) + position (1)
-    → Linear(hidden_dim+2, 512) → GELU → Dropout(0.1)
+           + entropy (1) + margin (1)
+    → Linear(hidden_dim+4, 512) → GELU → Dropout(0.1)
     → Linear(512, 128) → GELU → Dropout(0.1)
     → Linear(128, 1) → Sigmoid
     Output: P(fragile) ∈ [0, 1]
 
-Key changes from v1:
-    - Per-layer hidden state normalization (fixes layer 40 dead neurons)
-    - Binary classification with BCE loss (matches data: 82% regret=1.0)
-    - Dropout for regularization (train/val gap was large)
-    - Wider bottleneck (512→128 vs 256→64)
+Key changes from v2:
+    - Added token entropy and logit margin as input features
+    - These help distinguish confident (safe) vs uncertain (fragile) positions
 """
 
 import jax
@@ -25,28 +25,32 @@ import numpy as np
 
 
 class RegretEstimator(nnx.Module):
-    """MLP that predicts fragility probability from hidden states + metadata."""
+    """MLP that predicts fragility probability from hidden states + metadata + logit features."""
 
     def __init__(self, hidden_dim: int, rngs: nnx.Rngs, dropout_rate: float = 0.1):
-        self.linear1 = nnx.Linear(hidden_dim + 2, 512, rngs=rngs)
+        # hidden_state (hidden_dim) + layer_idx (1) + position (1) + entropy (1) + margin (1)
+        self.linear1 = nnx.Linear(hidden_dim + 4, 512, rngs=rngs)
         self.linear2 = nnx.Linear(512, 128, rngs=rngs)
         self.linear3 = nnx.Linear(128, 1, rngs=rngs)
         self.dropout1 = nnx.Dropout(rate=dropout_rate, rngs=rngs)
         self.dropout2 = nnx.Dropout(rate=dropout_rate, rngs=rngs)
 
-    def __call__(self, hidden_state, layer_idx, position, *, deterministic: bool = True):
+    def __call__(self, hidden_state, layer_idx, position, entropy, margin,
+                 *, deterministic: bool = True):
         """Forward pass.
 
         Args:
             hidden_state: (batch, hidden_dim) hidden state vectors (should be pre-normalized).
             layer_idx: (batch, 1) normalized layer index [0, 1].
             position: (batch, 1) normalized position [0, 1].
+            entropy: (batch, 1) token entropy (log-normalized).
+            margin: (batch, 1) logit margin top1-top2 (log-normalized).
             deterministic: If True, disable dropout (for inference/validation).
 
         Returns:
             (batch, 1) predicted fragility probability [0, 1].
         """
-        x = jnp.concatenate([hidden_state, layer_idx, position], axis=-1)
+        x = jnp.concatenate([hidden_state, layer_idx, position, entropy, margin], axis=-1)
         x = nnx.gelu(self.linear1(x))
         x = self.dropout1(x, deterministic=deterministic)
         x = nnx.gelu(self.linear2(x))
@@ -63,6 +67,7 @@ def create_estimator(hidden_dim: int, seed: int = 0, dropout_rate: float = 0.1):
 
 def predict_regret(model: RegretEstimator, hidden_states, layer_indices,
                    positions, num_layers: int, max_seq_len: int,
+                   entropies=None, margins=None,
                    norm_stats: dict = None):
     """Batch inference: predict fragility for multiple (hidden_state, layer, pos) tuples.
 
@@ -73,12 +78,16 @@ def predict_regret(model: RegretEstimator, hidden_states, layer_indices,
         positions: (N,) array of integer token positions.
         num_layers: Total number of layers (for normalization).
         max_seq_len: Maximum sequence length (for normalization).
+        entropies: (N,) array of token entropies. Zeros if not provided.
+        margins: (N,) array of logit margins. Zeros if not provided.
         norm_stats: Optional dict with per-layer mean/std for hidden state normalization.
                     Keys: "layer_{idx}_mean", "layer_{idx}_std" as (hidden_dim,) arrays.
+                    Also "entropy_mean", "entropy_std", "margin_mean", "margin_std".
 
     Returns:
         (N,) array of predicted fragility probabilities.
     """
+    N = hidden_states.shape[0]
     hs = jnp.array(hidden_states, dtype=jnp.float32)
 
     # Apply per-layer normalization if stats provided
@@ -98,7 +107,23 @@ def predict_regret(model: RegretEstimator, hidden_states, layer_indices,
     layer_norm = layer_indices.astype(jnp.float32).reshape(-1, 1) / max(num_layers - 1, 1)
     pos_norm = positions.astype(jnp.float32).reshape(-1, 1) / max(max_seq_len - 1, 1)
 
-    predictions = model(hs, layer_norm, pos_norm, deterministic=True)
+    # Normalize entropy and margin
+    if entropies is not None:
+        ent = jnp.array(entropies, dtype=jnp.float32).reshape(-1, 1)
+    else:
+        ent = jnp.zeros((N, 1))
+    if margins is not None:
+        mar = jnp.array(margins, dtype=jnp.float32).reshape(-1, 1)
+    else:
+        mar = jnp.zeros((N, 1))
+
+    if norm_stats is not None:
+        if "entropy_mean" in norm_stats:
+            ent = (ent - norm_stats["entropy_mean"]) / (norm_stats["entropy_std"] + 1e-8)
+        if "margin_mean" in norm_stats:
+            mar = (mar - norm_stats["margin_mean"]) / (norm_stats["margin_std"] + 1e-8)
+
+    predictions = model(hs, layer_norm, pos_norm, ent, mar, deterministic=True)
     return predictions.squeeze(-1)
 
 
