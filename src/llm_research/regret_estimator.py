@@ -109,7 +109,11 @@ def save_estimator(model: RegretEstimator, path: str, norm_stats: dict = None):
     np_dict = {}
     for path_tuple, leaf in zip(flat_state.paths, flat_state.leaves):
         key = "/".join(str(p) for p in path_tuple)
-        np_dict[key] = np.array(leaf.value)
+        try:
+            np_dict[key] = np.array(leaf.value)
+        except TypeError:
+            # Skip PRNGKey arrays from dropout layers (can't convert to numpy)
+            continue
 
     # Save normalization stats alongside weights
     if norm_stats is not None:
