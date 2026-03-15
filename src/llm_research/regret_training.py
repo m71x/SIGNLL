@@ -27,7 +27,7 @@ import os
 # ── CONFIGURABLE PARAMETERS ──────────────────────────────────────────
 MODEL_ID = "Qwen/Qwen2.5-Coder-14B-Instruct"
 MAX_GEN_TOKENS = 512         # Max tokens for code generation
-TARGET_LAYERS = [8, 24, 40]               # Sample 3 layers (early/mid/late)
+TARGET_LAYERS = [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44]  # Every 4th layer
 PERTURB_STRENGTH = 2.0       # Logit perturbation magnitude
 PERTURB_TEMP = 0.3           # Temperature for perturbed sampling
 PERTURB_TOP_K = 3            # Top-k competitors for perturbation
