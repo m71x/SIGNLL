@@ -5,17 +5,18 @@ Lightweight MLP that predicts whether a token position is "fragile"
 (perturbation causes regret) from hidden states, layer index, position,
 and logit features (entropy, margin).
 
-Architecture (v3 — binary classification with logit features):
+Architecture (v4 — LayerNorm + regularization for earlier exits):
     Input: normalized hidden_state (hidden_dim) + layer_idx (1) + position (1)
            + entropy (1) + margin (1)
-    → Linear(hidden_dim+4, 512) → GELU → Dropout(0.1)
-    → Linear(512, 128) → GELU → Dropout(0.1)
+    → Linear(hidden_dim+4, 512) → LayerNorm → GELU → Dropout(0.2)
+    → Linear(512, 128) → LayerNorm → GELU → Dropout(0.2)
     → Linear(128, 1) → Sigmoid
     Output: P(fragile) ∈ [0, 1]
 
-Key changes from v2:
-    - Added token entropy and logit margin as input features
-    - These help distinguish confident (safe) vs uncertain (fragile) positions
+Key changes from v3:
+    - Added LayerNorm after each hidden layer (training stability)
+    - Increased dropout to 0.2 (reduces train/val gap)
+    - Label smoothing + weight decay + layer-weighted loss in training
 """
 
 import jax
@@ -27,10 +28,12 @@ import numpy as np
 class RegretEstimator(nnx.Module):
     """MLP that predicts fragility probability from hidden states + metadata + logit features."""
 
-    def __init__(self, hidden_dim: int, rngs: nnx.Rngs, dropout_rate: float = 0.1):
+    def __init__(self, hidden_dim: int, rngs: nnx.Rngs, dropout_rate: float = 0.2):
         # hidden_state (hidden_dim) + layer_idx (1) + position (1) + entropy (1) + margin (1)
         self.linear1 = nnx.Linear(hidden_dim + 4, 512, rngs=rngs)
+        self.ln1 = nnx.LayerNorm(512, rngs=rngs)
         self.linear2 = nnx.Linear(512, 128, rngs=rngs)
+        self.ln2 = nnx.LayerNorm(128, rngs=rngs)
         self.linear3 = nnx.Linear(128, 1, rngs=rngs)
         self.dropout1 = nnx.Dropout(rate=dropout_rate, rngs=rngs)
         self.dropout2 = nnx.Dropout(rate=dropout_rate, rngs=rngs)
@@ -51,9 +54,9 @@ class RegretEstimator(nnx.Module):
             (batch, 1) predicted fragility probability [0, 1].
         """
         x = jnp.concatenate([hidden_state, layer_idx, position, entropy, margin], axis=-1)
-        x = nnx.gelu(self.linear1(x))
+        x = self.ln1(nnx.gelu(self.linear1(x)))
         x = self.dropout1(x, deterministic=deterministic)
-        x = nnx.gelu(self.linear2(x))
+        x = self.ln2(nnx.gelu(self.linear2(x)))
         x = self.dropout2(x, deterministic=deterministic)
         x = self.linear3(x)
         return jax.nn.sigmoid(x)

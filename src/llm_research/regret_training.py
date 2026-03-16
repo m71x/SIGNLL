@@ -31,7 +31,7 @@ TARGET_LAYERS = [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44]  # Every 4th layer
 PERTURB_STRENGTH = 2.0       # Logit perturbation magnitude
 PERTURB_TEMP = 0.3           # Temperature for perturbed sampling
 PERTURB_TOP_K = 3            # Top-k competitors for perturbation
-MAX_POSITIONS_PER_PROMPT = 5   # Token positions to perturb per prompt (fewer but all produce rollouts)
+MAX_POSITIONS_PER_PROMPT = 10  # Token positions to perturb per prompt
 ROLLOUT_MAX_TOKENS = 128     # Max tokens for perturbed rollout (fits in 512 max_model_len)
 BATCH_SIZE = 4               # Prompts to process before GC
 CODE_TIMEOUT = 10            # Seconds for code execution
@@ -42,7 +42,9 @@ ESTIMATOR_LR = 3e-4
 ESTIMATOR_EPOCHS = 200
 ESTIMATOR_BATCH = 256
 ESTIMATOR_PATIENCE = 30          # Early stopping patience
-ESTIMATOR_DROPOUT = 0.1
+ESTIMATOR_DROPOUT = 0.2
+ESTIMATOR_WEIGHT_DECAY = 1e-4
+LABEL_SMOOTHING = 0.05          # Smooth targets: 0→0.05, 1→0.95
 TRAIN_SPLIT = 0.8
 
 # Output paths
@@ -948,10 +950,12 @@ if is_master:
         print(f"  Logit features: entropy range [{float(jnp.min(entropies_raw)):.2f}, {float(jnp.max(entropies_raw)):.2f}], "
               f"margin range [{float(jnp.min(margins_raw)):.2f}, {float(jnp.max(margins_raw)):.2f}]")
 
-    # Binary targets: fragile (regret > 0) vs safe (regret = 0)
-    binary_targets = (regret_targets > 0).astype(jnp.float32)
-    nonzero_frac = float(jnp.mean(binary_targets))
-    print(f"  Fragile fraction: {nonzero_frac:.3f} ({int(jnp.sum(binary_targets))}/{N})")
+    # Binary targets with label smoothing: fragile (regret > 0) vs safe (regret = 0)
+    binary_raw = (regret_targets > 0).astype(jnp.float32)
+    binary_targets = binary_raw * (1 - LABEL_SMOOTHING) + (1 - binary_raw) * LABEL_SMOOTHING
+    nonzero_frac = float(jnp.mean(binary_raw))
+    print(f"  Fragile fraction: {nonzero_frac:.3f} ({int(jnp.sum(binary_raw))}/{N})")
+    print(f"  Label smoothing: {LABEL_SMOOTHING} (targets: 0→{LABEL_SMOOTHING}, 1→{1-LABEL_SMOOTHING})")
 
     # ── Per-layer hidden state normalization ──
     # Compute mean/std per layer from training data (fixes layer 40 dead neurons)
@@ -1019,29 +1023,46 @@ if is_master:
         ],
         boundaries=[warmup_steps],
     )
-    optimizer = nnx.Optimizer(model, optax.adam(schedule), wrt=nnx.Param)
+    optimizer = nnx.Optimizer(model, optax.adamw(schedule, weight_decay=ESTIMATOR_WEIGHT_DECAY), wrt=nnx.Param)
 
     # Positive weight for BCE loss (balance classes)
     pos_weight = (1.0 - nonzero_frac) / max(nonzero_frac, 1e-6)
     print(f"  BCE pos_weight: {pos_weight:.3f} (balancing {nonzero_frac:.1%} positives)")
 
-    def loss_fn(model, h, l, p, ent, mar, targets):
+    # Layer weights: earlier layers get higher weight to improve early-exit predictions
+    # Layer 4 → weight 2.0, Layer 44 → weight 1.0 (linear interpolation)
+    max_target_layer = max(TARGET_LAYERS)
+    min_target_layer = min(TARGET_LAYERS)
+    layer_weight_map = {}
+    for tl in TARGET_LAYERS:
+        # Linear from 2.0 (earliest) to 1.0 (latest)
+        frac = (tl - min_target_layer) / max(max_target_layer - min_target_layer, 1)
+        layer_weight_map[tl] = 2.0 - frac
+    print(f"  Layer weights: {min_target_layer}→{layer_weight_map[min_target_layer]:.1f}, "
+          f"{max_target_layer}→{layer_weight_map[max_target_layer]:.1f}")
+
+    # Pre-compute per-sample layer weights
+    sample_layer_weights = jnp.ones(N)
+    for tl, w in layer_weight_map.items():
+        mask = layer_indices == tl
+        sample_layer_weights = sample_layer_weights.at[mask].set(w)
+
+    def loss_fn(model, h, l, p, ent, mar, targets, weights):
         preds = model(h, l, p, ent, mar, deterministic=False).squeeze(-1)
-        # Weighted BCE loss
-        # BCE = -[w*t*log(p) + (1-t)*log(1-p)]
+        # Weighted BCE loss with per-sample layer weights
         eps = 1e-7
         preds = jnp.clip(preds, eps, 1 - eps)
         bce = -(pos_weight * targets * jnp.log(preds) + (1 - targets) * jnp.log(1 - preds))
-        return jnp.mean(bce)
+        return jnp.mean(bce * weights)
 
-    def train_step(model, optimizer, h, l, p, ent, mar, targets):
-        loss, grads = nnx.value_and_grad(loss_fn)(model, h, l, p, ent, mar, targets)
+    def train_step(model, optimizer, h, l, p, ent, mar, targets, weights):
+        loss, grads = nnx.value_and_grad(loss_fn)(model, h, l, p, ent, mar, targets, weights)
         optimizer.update(model, grads)
         return loss
 
     print(f"  Training for up to {ESTIMATOR_EPOCHS} epochs (patience={ESTIMATOR_PATIENCE})")
     print(f"  LR: cosine decay from {ESTIMATOR_LR} with {warmup_steps}-step warmup")
-    print(f"  Dropout: {ESTIMATOR_DROPOUT}")
+    print(f"  Dropout: {ESTIMATOR_DROPOUT}, Weight decay: {ESTIMATOR_WEIGHT_DECAY}")
 
     best_val_loss = float("inf")
     patience_counter = 0
@@ -1059,7 +1080,7 @@ if is_master:
                 model, optimizer,
                 hidden_states[idx], layer_norm[idx], pos_norm[idx],
                 entropies_norm[idx], margins_norm[idx],
-                binary_targets[idx],
+                binary_targets[idx], sample_layer_weights[idx],
             )
             epoch_losses.append(float(loss))
 
@@ -1073,7 +1094,7 @@ if is_master:
             -(binary_targets[val_idx] * jnp.log(jnp.clip(val_preds, 1e-7, 1-1e-7))
               + (1 - binary_targets[val_idx]) * jnp.log(jnp.clip(1 - val_preds, 1e-7, 1-1e-7)))
         ))
-        val_acc = float(jnp.mean((val_preds > 0.5) == binary_targets[val_idx]))
+        val_acc = float(jnp.mean((val_preds > 0.5) == binary_raw[val_idx]))
 
         if val_bce < best_val_loss:
             best_val_loss = val_bce

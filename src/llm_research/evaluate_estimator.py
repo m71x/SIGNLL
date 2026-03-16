@@ -105,13 +105,27 @@ class NumpyEstimator:
             mar = (mar - float(self.norm_stats["margin_mean"])) / (float(self.norm_stats["margin_std"]) + 1e-8)
         return ent, mar
 
+    def _layer_norm(self, x, name):
+        """Apply LayerNorm if weights exist."""
+        scale_key = f"{name}/scale"
+        bias_key = f"{name}/bias"
+        # Check both formats
+        try:
+            scale = self._get(scale_key)
+            bias = self._get(bias_key)
+        except KeyError:
+            return x
+        mean = np.mean(x, axis=-1, keepdims=True)
+        var = np.var(x, axis=-1, keepdims=True)
+        return scale * (x - mean) / np.sqrt(var + 1e-5) + bias
+
     def __call__(self, hidden_state, layer_idx, position, entropy=None, margin=None):
         if entropy is not None and margin is not None:
             x = np.concatenate([hidden_state, layer_idx, position, entropy, margin], axis=-1)
         else:
             x = np.concatenate([hidden_state, layer_idx, position], axis=-1)
-        x = gelu(x @ self._get("linear1/kernel") + self._get("linear1/bias"))
-        x = gelu(x @ self._get("linear2/kernel") + self._get("linear2/bias"))
+        x = self._layer_norm(gelu(x @ self._get("linear1/kernel") + self._get("linear1/bias")), "ln1")
+        x = self._layer_norm(gelu(x @ self._get("linear2/kernel") + self._get("linear2/bias")), "ln2")
         x = x @ self._get("linear3/kernel") + self._get("linear3/bias")
         if self.is_v2:
             return sigmoid(x)
