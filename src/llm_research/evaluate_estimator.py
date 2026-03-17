@@ -16,15 +16,20 @@ Analyses:
 """
 
 import os
+import sys
 import numpy as np
 from scipy import special  # for GELU
 
+# Add script directory to path for local imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import (TARGET_LAYERS, TRAIN_SPLIT,
+                    REGRET_DATA_PATH as _REGRET_DATA_PATH,
+                    ESTIMATOR_PATH as _ESTIMATOR_PATH)
+
 # ── PATHS ────────────────────────────────────────────────────────────
 PROJECT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
-REGRET_DATA_PATH = os.path.join(PROJECT_ROOT, "regret_dataset.npz")
-ESTIMATOR_PATH = os.path.join(PROJECT_ROOT, "regret_estimator_weights.npz")
-
-TARGET_LAYERS = [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44]
+REGRET_DATA_PATH = os.path.join(PROJECT_ROOT, _REGRET_DATA_PATH)
+ESTIMATOR_PATH = os.path.join(PROJECT_ROOT, f"{_ESTIMATOR_PATH}.npz")
 
 
 # ── NUMPY MLP INFERENCE ─────────────────────────────────────────────
@@ -466,8 +471,8 @@ def eval_train_val(model, data):
     perm = np.random.RandomState(42).permutation(N)
     fragile_idx = perm[binary[perm] > 0]
     safe_idx = perm[binary[perm] == 0]
-    f_split = int(len(fragile_idx) * 0.8)
-    s_split = int(len(safe_idx) * 0.8)
+    f_split = int(len(fragile_idx) * TRAIN_SPLIT)
+    s_split = int(len(safe_idx) * TRAIN_SPLIT)
     train_idx = np.concatenate([fragile_idx[:f_split], safe_idx[:s_split]])
     val_idx = np.concatenate([fragile_idx[f_split:], safe_idx[s_split:]])
 
@@ -517,8 +522,8 @@ def print_improvements(preds, targets):
     if corr < 0.3:
         suggestions.append(
             "LOW CORRELATION (r={:.3f}): MLP struggles with regret magnitude.\n"
-            "  -> Deeper network: add 512-unit layer, or use residual connections.\n"
-            "  -> Add input features: token entropy, logit margin from forward pass.".format(corr)
+            "  -> Deeper network: add residual connections.\n"
+            "  -> Consider attention-based architecture for layer interactions.".format(corr)
         )
 
     if unique_regrets < 20:
@@ -532,44 +537,26 @@ def print_improvements(preds, targets):
     if np.mean(preds) > np.mean(targets) * 1.5:
         suggestions.append(
             "OVER-PREDICTION: mean pred={:.3f} vs mean target={:.3f}.\n"
-            "  -> Reduce focal alpha from 10.0 to 3.0-5.0.\n"
-            "  -> Add asymmetric loss: penalize over-prediction less than under-prediction.".format(
+            "  -> Reduce class weight or tune pos_weight.\n"
+            "  -> Add asymmetric loss: penalize over-prediction less.".format(
                 np.mean(preds), np.mean(targets))
         )
 
     if pred_std < tgt_std * 0.3:
         suggestions.append(
             "LOW VARIANCE: pred_std={:.4f} vs target_std={:.4f}.\n"
-            "  -> Model may be underfitting. Increase hidden sizes or add layers.\n"
-            "  -> Try softplus output instead of ReLU (smoother gradients near 0).".format(pred_std, tgt_std)
+            "  -> Model may be underfitting. Add layers or increase capacity.".format(pred_std, tgt_std)
         )
 
     suggestions.append(
-        "DATA SCALE:\n"
-        "  -> Current: 5 positions/prompt, 3 layers, ~310 prompts = 4650 samples.\n"
-        "  -> Increase to 10 positions/prompt -> ~9300 samples.\n"
-        "  -> Add layers [4, 12, 16, 20, 28, 32, 36, 44] for finer granularity.\n"
-        "  -> Multiple perturbations per position (different competitor tokens)."
+        "DATA:\n"
+        "  -> Multiple perturbations per position (different competitor tokens).\n"
+        "  -> Focus sampling on high-entropy positions (uncertain = more informative).\n"
+        "  -> Cross-task generalization: train on HumanEval, test on MBPP."
     )
 
     suggestions.append(
-        "ARCHITECTURE:\n"
-        "  -> Learnable layer embeddings instead of scalar index.\n"
-        "  -> Add dropout (0.1-0.2) for regularization.\n"
-        "  -> Try binary classification (fragile/safe) as auxiliary task.\n"
-        "  -> Wider bottleneck: 256->128->1 instead of 256->64->1."
-    )
-
-    suggestions.append(
-        "TRAINING:\n"
-        "  -> Cosine LR schedule with warmup (currently flat 1e-4).\n"
-        "  -> Train 200+ epochs with patience-based early stopping.\n"
-        "  -> Try Huber loss instead of MSE (robust to outliers).\n"
-        "  -> Stratified train/val split to balance regret distribution."
-    )
-
-    suggestions.append(
-        "EVALUATION (next steps):\n"
+        "NEXT STEPS:\n"
         "  -> End-to-end early-exit test: run model with regret gating on held-out problems.\n"
         "  -> Compare against confidence-only baseline (entropy/margin threshold).\n"
         "  -> Measure actual compute savings vs quality degradation curve.\n"

@@ -12,11 +12,9 @@ import numpy as np
 import os
 import sys
 
-REGRET_DATA_PATH = "regret_dataset.npz"
-PHASE2A_HIDDEN_PATH = "phase2a_hidden_states.npz"
-PHASE2A_PERTURB_PATH = "phase2a_perturbations.json"
-PHASE2A_FAILING_PATH = "phase2a_failing_hidden.npz"
-PHASE2B_CHECKPOINT_PATH = "phase2b_checkpoint.json"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import (REGRET_DATA_PATH, PHASE2A_HIDDEN_PATH, PHASE2A_PERTURB_PATH,
+                    PHASE2A_FAILING_PATH, PHASE2B_CHECKPOINT_PATH)
 
 full_reset = "--full" in sys.argv
 

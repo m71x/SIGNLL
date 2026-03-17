@@ -25,37 +25,21 @@ import time
 import os
 
 # ── CONFIGURABLE PARAMETERS ──────────────────────────────────────────
-MODEL_ID = "Qwen/Qwen2.5-Coder-14B-Instruct"
-MAX_GEN_TOKENS = 512         # Max tokens for code generation
-TARGET_LAYERS = [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44]  # Every 4th layer
-PERTURB_STRENGTH = 2.0       # Logit perturbation magnitude
-PERTURB_TEMP = 0.3           # Temperature for perturbed sampling
-PERTURB_TOP_K = 3            # Top-k competitors for perturbation
-MAX_POSITIONS_PER_PROMPT = 10  # Token positions to perturb per prompt
-ROLLOUT_MAX_TOKENS = 128     # Max tokens for perturbed rollout (fits in 512 max_model_len)
-BATCH_SIZE = 4               # Prompts to process before GC
-CODE_TIMEOUT = 10            # Seconds for code execution
+# All shared constants are in config.py; import them here.
+from config import (  # noqa: E402
+    MODEL_ID, MAX_GEN_TOKENS, TARGET_LAYERS,
+    PERTURB_STRENGTH, PERTURB_TEMP, PERTURB_TOP_K,
+    MAX_POSITIONS_PER_PROMPT, ROLLOUT_MAX_TOKENS, CODE_TIMEOUT,
+    ESTIMATOR_LR, ESTIMATOR_EPOCHS, ESTIMATOR_BATCH,
+    ESTIMATOR_PATIENCE, ESTIMATOR_DROPOUT, ESTIMATOR_WEIGHT_DECAY,
+    LABEL_SMOOTHING, TRAIN_SPLIT,
+    BASELINE_PATH, PHASE2A_HIDDEN_PATH, PHASE2A_PERTURB_PATH,
+    REGRET_DATA_PATH, PHASE2A_FAILING_PATH, ESTIMATOR_PATH,
+    PHASE2B_CHECKPOINT_PATH, PHASE2B_CHECKPOINT_INTERVAL, BATCH_SIZE,
+)
+
+# Training-specific (not shared)
 REGRET_FOCAL_ALPHA = 10.0    # Focal loss weight for non-zero regret samples
-
-# Regret estimator training
-ESTIMATOR_LR = 3e-4
-ESTIMATOR_EPOCHS = 200
-ESTIMATOR_BATCH = 256
-ESTIMATOR_PATIENCE = 30          # Early stopping patience
-ESTIMATOR_DROPOUT = 0.2
-ESTIMATOR_WEIGHT_DECAY = 1e-4
-LABEL_SMOOTHING = 0.05          # Smooth targets: 0→0.05, 1→0.95
-TRAIN_SPLIT = 0.8
-
-# Output paths
-BASELINE_PATH = "regret_baseline_results.json"
-PHASE2A_HIDDEN_PATH = "phase2a_hidden_states.npz"
-PHASE2A_PERTURB_PATH = "phase2a_perturbations.json"
-REGRET_DATA_PATH = "regret_dataset.npz"
-PHASE2A_FAILING_PATH = "phase2a_failing_hidden.npz"  # Hidden states from failing baselines (regret=0)
-ESTIMATOR_PATH = "regret_estimator_weights"
-PHASE2B_CHECKPOINT_PATH = "phase2b_checkpoint.json"
-PHASE2B_CHECKPOINT_INTERVAL = 25  # Save every N rollouts
 
 # ── 1. INITIALIZE DISTRIBUTED SYSTEM ─────────────────────────────────
 jax.distributed.initialize()

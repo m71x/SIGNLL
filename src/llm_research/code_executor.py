@@ -9,6 +9,31 @@ import subprocess
 import tempfile
 import os
 
+MAX_OUTPUT_LENGTH = 2000  # Truncate stdout/stderr to this length
+
+
+def _run_script(script: str, timeout: int) -> subprocess.CompletedProcess:
+    """Write script to temp file, execute it, and clean up."""
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(script)
+            tmp_path = f.name
+
+        return subprocess.run(
+            ["python3", tmp_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
 
 def execute_code(code: str, test_code: str, timeout: int = 10, partial: bool = False) -> tuple:
     """Execute generated code against test assertions in a sandboxed subprocess.
@@ -27,101 +52,59 @@ def execute_code(code: str, test_code: str, timeout: int = 10, partial: bool = F
     if partial:
         return _execute_partial(code, test_code, timeout)
 
-    # Combine code + tests into a single script
-    full_script = f"{code}\n\n{test_code}"
-
     info = {"stdout": "", "stderr": "", "error": None, "timeout": False}
 
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".py", delete=False
-        ) as f:
-            f.write(full_script)
-            tmp_path = f.name
-
-        result = subprocess.run(
-            ["python3", tmp_path],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-        )
-
-        info["stdout"] = result.stdout[:2000]
-        info["stderr"] = result.stderr[:2000]
+        result = _run_script(f"{code}\n\n{test_code}", timeout)
+        info["stdout"] = result.stdout[:MAX_OUTPUT_LENGTH]
+        info["stderr"] = result.stderr[:MAX_OUTPUT_LENGTH]
 
         if result.returncode == 0:
             return 1.0, info
-        else:
-            info["error"] = f"Exit code {result.returncode}"
-            return 0.0, info
+        info["error"] = f"Exit code {result.returncode}"
+        return 0.0, info
 
     except subprocess.TimeoutExpired:
         info["timeout"] = True
         info["error"] = f"Timeout after {timeout}s"
         return 0.0, info
-
     except Exception as e:
         info["error"] = str(e)
         return 0.0, info
 
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except (OSError, UnboundLocalError):
-            pass
-
 
 def _execute_partial(code: str, test_code: str, timeout: int = 10) -> tuple:
     """Run each test assertion individually and return fraction passed."""
-    # Split test_code into individual test cases
     test_cases = _split_tests(test_code)
     if not test_cases:
-        # Can't split — fall back to binary
         return execute_code(code, test_code, timeout, partial=False)
 
     info = {"stdout": "", "stderr": "", "error": None, "passed": 0, "total": len(test_cases)}
 
     # Build a script that runs each test in a try/except and prints PASS/FAIL
-    lines = [code, "", "import sys", f"_results = []"]
-    for i, tc in enumerate(test_cases):
-        lines.append(f"try:")
-        # Indent each line of the test case
+    lines = [code, "", "_results = []"]
+    for tc in test_cases:
+        lines.append("try:")
         for tl in tc.split("\n"):
             lines.append(f"    {tl}")
-        lines.append(f"    _results.append(1)")
-        lines.append(f"except Exception:")
-        lines.append(f"    _results.append(0)")
-    lines.append(f"print(f'PARTIAL_RESULTS:{{sum(_results)}}/{{len(_results)}}')")
-
-    full_script = "\n".join(lines)
+        lines.append("    _results.append(1)")
+        lines.append("except Exception:")
+        lines.append("    _results.append(0)")
+    lines.append("print(f'PARTIAL_RESULTS:{sum(_results)}/{len(_results)}')")
 
     try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            f.write(full_script)
-            tmp_path = f.name
+        result = _run_script("\n".join(lines), timeout)
 
-        result = subprocess.run(
-            ["python3", tmp_path],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-        )
-
-        # Parse results from stdout
         for line in result.stdout.split("\n"):
             if line.startswith("PARTIAL_RESULTS:"):
                 parts = line.split(":")[1].split("/")
-                passed = int(parts[0])
-                total = int(parts[1])
+                passed, total = int(parts[0]), int(parts[1])
                 info["passed"] = passed
                 info["total"] = total
                 return passed / max(total, 1), info
 
-        # Script ran but no results line — likely crashed before printing
         info["error"] = f"No results (exit {result.returncode})"
-        info["stderr"] = result.stderr[:2000]
+        info["stderr"] = result.stderr[:MAX_OUTPUT_LENGTH]
         return 0.0, info
 
     except subprocess.TimeoutExpired:
@@ -131,11 +114,6 @@ def _execute_partial(code: str, test_code: str, timeout: int = 10) -> tuple:
     except Exception as e:
         info["error"] = str(e)
         return 0.0, info
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except (OSError, UnboundLocalError):
-            pass
 
 
 def _split_tests(test_code: str) -> list:
