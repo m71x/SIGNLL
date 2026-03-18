@@ -5,18 +5,22 @@ Lightweight MLP that predicts whether a token position is "fragile"
 (perturbation causes regret) from hidden states, layer index, position,
 and logit features (entropy, margin).
 
-Architecture (v4 — LayerNorm + regularization for earlier exits):
-    Input: normalized hidden_state (hidden_dim) + layer_idx (1) + position (1)
-           + entropy (1) + margin (1)
-    → Linear(hidden_dim+4, 512) → LayerNorm → GELU → Dropout(0.2)
+Architecture (v5 — V2 logit probing + convergence features):
+    Input: normalized hidden_state (hidden_dim) + metadata features (num_meta)
+           v4 num_meta=4:  [layer_idx, position, entropy, margin]
+           v5 num_meta=13: [layer_idx, position, entropy, margin,
+                            agreement, confidence, kl_div, int_entropy,
+                            cos_sim, rel_change, proj_final,
+                            is_syntax, is_whitespace]
+    → Linear(hidden_dim+num_meta, 512) → LayerNorm → GELU → Dropout(0.2)
     → Linear(512, 128) → LayerNorm → GELU → Dropout(0.2)
     → Linear(128, 1) → Sigmoid
-    Output: P(fragile) ∈ [0, 1]
+    Output: P(fragile / not converged) ∈ [0, 1]
 
-Key changes from v3:
-    - Added LayerNorm after each hidden layer (training stability)
-    - Increased dropout to 0.2 (reduces train/val gap)
-    - Label smoothing + weight decay + layer-weighted loss in training
+Key changes from v4:
+    - Flexible num_meta_features for V2 extra features
+    - __call__ accepts optional extra_features tensor
+    - Backward compatible with v4 callers (extra_features=None)
 """
 
 import jax
@@ -26,11 +30,13 @@ import numpy as np
 
 
 class RegretEstimator(nnx.Module):
-    """MLP that predicts fragility probability from hidden states + metadata + logit features."""
+    """MLP that predicts fragility/non-convergence from hidden states + metadata."""
 
-    def __init__(self, hidden_dim: int, rngs: nnx.Rngs, dropout_rate: float = 0.2):
-        # hidden_state (hidden_dim) + layer_idx (1) + position (1) + entropy (1) + margin (1)
-        self.linear1 = nnx.Linear(hidden_dim + 4, 512, rngs=rngs)
+    def __init__(self, hidden_dim: int, rngs: nnx.Rngs, dropout_rate: float = 0.2,
+                 num_meta_features: int = 4):
+        # Total input = hidden_state (hidden_dim) + metadata (num_meta_features)
+        self.num_meta_features = num_meta_features
+        self.linear1 = nnx.Linear(hidden_dim + num_meta_features, 512, rngs=rngs)
         self.ln1 = nnx.LayerNorm(512, rngs=rngs)
         self.linear2 = nnx.Linear(512, 128, rngs=rngs)
         self.ln2 = nnx.LayerNorm(128, rngs=rngs)
@@ -39,21 +45,25 @@ class RegretEstimator(nnx.Module):
         self.dropout2 = nnx.Dropout(rate=dropout_rate, rngs=rngs)
 
     def __call__(self, hidden_state, layer_idx, position, entropy, margin,
-                 *, deterministic: bool = True):
+                 extra_features=None, *, deterministic: bool = True):
         """Forward pass.
 
         Args:
             hidden_state: (batch, hidden_dim) hidden state vectors (should be pre-normalized).
             layer_idx: (batch, 1) normalized layer index [0, 1].
             position: (batch, 1) normalized position [0, 1].
-            entropy: (batch, 1) token entropy (log-normalized).
-            margin: (batch, 1) logit margin top1-top2 (log-normalized).
+            entropy: (batch, 1) token entropy (z-score normalized).
+            margin: (batch, 1) logit margin top1-top2 (z-score normalized).
+            extra_features: (batch, V2_NUM_EXTRA_FEATURES) optional V2 features.
             deterministic: If True, disable dropout (for inference/validation).
 
         Returns:
-            (batch, 1) predicted fragility probability [0, 1].
+            (batch, 1) predicted fragility/non-convergence probability [0, 1].
         """
-        x = jnp.concatenate([hidden_state, layer_idx, position, entropy, margin], axis=-1)
+        parts = [hidden_state, layer_idx, position, entropy, margin]
+        if extra_features is not None:
+            parts.append(extra_features)
+        x = jnp.concatenate(parts, axis=-1)
         x = self.ln1(nnx.gelu(self.linear1(x)))
         x = self.dropout1(x, deterministic=deterministic)
         x = self.ln2(nnx.gelu(self.linear2(x)))
@@ -62,15 +72,18 @@ class RegretEstimator(nnx.Module):
         return jax.nn.sigmoid(x)
 
 
-def create_estimator(hidden_dim: int, seed: int = 0, dropout_rate: float = 0.1):
+def create_estimator(hidden_dim: int, seed: int = 0, dropout_rate: float = 0.1,
+                     num_meta_features: int = 4):
     """Create a fresh RegretEstimator with random weights."""
     rngs = nnx.Rngs(seed)
-    return RegretEstimator(hidden_dim=hidden_dim, rngs=rngs, dropout_rate=dropout_rate)
+    return RegretEstimator(hidden_dim=hidden_dim, rngs=rngs, dropout_rate=dropout_rate,
+                           num_meta_features=num_meta_features)
 
 
 def predict_regret(model: RegretEstimator, hidden_states, layer_indices,
                    positions, num_layers: int, max_seq_len: int,
                    entropies=None, margins=None,
+                   extra_features=None,
                    norm_stats: dict = None):
     """Batch inference: predict fragility for multiple (hidden_state, layer, pos) tuples.
 
@@ -83,9 +96,8 @@ def predict_regret(model: RegretEstimator, hidden_states, layer_indices,
         max_seq_len: Maximum sequence length (for normalization).
         entropies: (N,) array of token entropies. Zeros if not provided.
         margins: (N,) array of logit margins. Zeros if not provided.
+        extra_features: (N, V2_NUM_EXTRA_FEATURES) optional V2 features.
         norm_stats: Optional dict with per-layer mean/std for hidden state normalization.
-                    Keys: "layer_{idx}_mean", "layer_{idx}_std" as (hidden_dim,) arrays.
-                    Also "entropy_mean", "entropy_std", "margin_mean", "margin_std".
 
     Returns:
         (N,) array of predicted fragility probabilities.
@@ -126,7 +138,25 @@ def predict_regret(model: RegretEstimator, hidden_states, layer_indices,
         if "margin_mean" in norm_stats:
             mar = (mar - norm_stats["margin_mean"]) / (norm_stats["margin_std"] + 1e-8)
 
-    predictions = model(hs, layer_norm, pos_norm, ent, mar, deterministic=True)
+    # V2 extra features
+    ef = None
+    if extra_features is not None:
+        ef = jnp.array(extra_features, dtype=jnp.float32)
+        # Normalize V2 features using saved stats
+        if norm_stats is not None:
+            v2_feature_names = ["agreement", "confidence", "kl_div", "int_entropy",
+                                "cos_sim", "rel_change", "proj_final",
+                                "is_syntax", "is_whitespace"]
+            for i, fname in enumerate(v2_feature_names):
+                mean_key = f"v2_{fname}_mean"
+                std_key = f"v2_{fname}_std"
+                if mean_key in norm_stats:
+                    ef = ef.at[:, i].set(
+                        (ef[:, i] - norm_stats[mean_key]) / (norm_stats[std_key] + 1e-8)
+                    )
+
+    predictions = model(hs, layer_norm, pos_norm, ent, mar,
+                        extra_features=ef, deterministic=True)
     return predictions.squeeze(-1)
 
 
@@ -151,14 +181,26 @@ def save_estimator(model: RegretEstimator, path: str, norm_stats: dict = None):
     np.savez(file=path, **np_dict)
 
 
-def load_estimator(path: str, hidden_dim: int):
+def load_estimator(path: str, hidden_dim: int, num_meta_features: int = None):
     """Load estimator weights and normalization stats from disk.
+
+    Args:
+        path: Path to .npz weights file.
+        hidden_dim: Hidden state dimension.
+        num_meta_features: Number of metadata features. If None, auto-detected from weights.
 
     Returns:
         (model, norm_stats) tuple. norm_stats is None if not saved.
     """
-    model = create_estimator(hidden_dim)
     data = np.load(path)
+
+    # Auto-detect num_meta_features from linear1 input dim
+    if num_meta_features is None:
+        key = "linear1/kernel" if "linear1/kernel" in data else "linear1/kernel/value"
+        input_dim = data[key].shape[0]
+        num_meta_features = input_dim - hidden_dim
+
+    model = create_estimator(hidden_dim, num_meta_features=num_meta_features)
     state = nnx.state(model)
     flat_state = state.flat_state()
     new_entries = []

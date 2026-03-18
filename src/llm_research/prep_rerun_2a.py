@@ -4,8 +4,10 @@ Run on master worker (worker 2) before deploying with new TARGET_LAYERS.
 Extracts per-perturbation regret values from regret_dataset.npz and saves
 as phase2b_checkpoint.json so Phase 2b skips rollouts on next run.
 
-If --full is passed, also clears Phase 2b checkpoint (for when
-MAX_POSITIONS_PER_PROMPT changed and perturbations are incompatible).
+Flags:
+  --full   Clear all Phase 2a, 2b, and dataset files for complete re-run.
+  --v2     V2 mode: clear Phase 2a + dataset only (no Phase 2b checkpoint
+           needed since V2 skips rollouts).
 """
 import json
 import numpy as np
@@ -17,6 +19,17 @@ from config import (REGRET_DATA_PATH, PHASE2A_HIDDEN_PATH, PHASE2A_PERTURB_PATH,
                     PHASE2A_FAILING_PATH, PHASE2B_CHECKPOINT_PATH)
 
 full_reset = "--full" in sys.argv
+v2_reset = "--v2" in sys.argv
+
+if v2_reset:
+    print("V2 RESET: clearing Phase 2a and dataset files (no Phase 2b needed)")
+    for path in [PHASE2A_HIDDEN_PATH, PHASE2A_PERTURB_PATH, PHASE2A_FAILING_PATH,
+                 REGRET_DATA_PATH]:
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"  Deleted {path}")
+    print("\nReady for V2 re-run (Phase 2a with logit probing + Phase 3).")
+    sys.exit(0)
 
 if full_reset:
     print("FULL RESET: clearing all Phase 2a, 2b, and dataset files")

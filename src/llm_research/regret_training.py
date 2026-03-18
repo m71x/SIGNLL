@@ -36,6 +36,7 @@ from config import (  # noqa: E402
     BASELINE_PATH, PHASE2A_HIDDEN_PATH, PHASE2A_PERTURB_PATH,
     REGRET_DATA_PATH, PHASE2A_FAILING_PATH, ESTIMATOR_PATH,
     PHASE2B_CHECKPOINT_PATH, PHASE2B_CHECKPOINT_INTERVAL, BATCH_SIZE,
+    V2_MODE, V2_SKIP_PHASE2B, V2_NUM_EXTRA_FEATURES, SYNTAX_TOKENS,
 )
 
 # Training-specific (not shared)
@@ -410,6 +411,107 @@ if not phase2_complete and not phase2a_complete:
         return (hs_list, li_list, pos_list, ent_list, mar_list,
                 input_ids, response_start, response_positions, valid_layers, logits_np if False else None)
 
+    # ── V2 helpers: logit probing + convergence + token type ──
+    def _rms_norm_np(x, weight, eps=1e-6):
+        """Apply RMSNorm in numpy: x * weight / sqrt(mean(x^2) + eps)."""
+        rms = np.sqrt(np.mean(x ** 2) + eps)
+        return (x / rms) * weight
+
+    def _compute_v2_features(gathered_hidden, final_logits_pos, layer_idx, prev_layer_idx,
+                             valid_layers, pos, lm_head_kernel, final_norm_weight,
+                             token_str):
+        """Compute V2 features for a single (position, layer) pair.
+
+        Returns dict with: agreement, confidence, kl_div, int_entropy,
+                          cos_sim, rel_change, proj_final, is_syntax, is_whitespace
+        """
+        h = gathered_hidden[layer_idx][0, pos, :].astype(np.float32)
+
+        # ── Logit probing: intermediate logits via lm_head ──
+        h_normed = _rms_norm_np(h, final_norm_weight)
+        intermediate_logits = h_normed @ lm_head_kernel  # (vocab_size,)
+
+        # Agreement: argmax match with final layer
+        agreement = float(np.argmax(intermediate_logits) == np.argmax(final_logits_pos))
+
+        # Confidence: softmax probability of top intermediate token
+        int_shifted = intermediate_logits - intermediate_logits.max()
+        int_probs = np.exp(int_shifted) / np.sum(np.exp(int_shifted))
+        confidence = float(int_probs[np.argmax(intermediate_logits)])
+
+        # KL divergence: KL(final || intermediate)
+        fin_shifted = final_logits_pos - final_logits_pos.max()
+        fin_probs = np.exp(fin_shifted) / np.sum(np.exp(fin_shifted))
+        kl_raw = float(np.sum(fin_probs * np.log((fin_probs + 1e-10) / (int_probs + 1e-10))))
+        kl_div = np.log1p(max(kl_raw, 0.0))  # log-scale to prevent outliers
+
+        # Intermediate entropy
+        int_entropy = float(-np.sum(int_probs * np.log(int_probs + 1e-10)))
+
+        # ── Convergence metrics ──
+        if prev_layer_idx is not None and prev_layer_idx in gathered_hidden:
+            h_prev = gathered_hidden[prev_layer_idx][0, pos, :].astype(np.float32)
+            h_norm = np.linalg.norm(h)
+            h_prev_norm = np.linalg.norm(h_prev)
+
+            # Cosine similarity (log-scaled to avoid saturation near 1.0)
+            cos_raw = np.dot(h, h_prev) / (h_norm * h_prev_norm + 1e-10)
+            cos_sim = -np.log1p(-np.clip(cos_raw, -1.0, 1.0 - 1e-7))  # log(1/(1-cos))
+
+            # Relative L2 change (log-scaled)
+            rel_raw = np.linalg.norm(h - h_prev) / (h_prev_norm + 1e-10)
+            rel_change = np.log1p(rel_raw)
+        else:
+            cos_sim = 0.0
+            rel_change = 1.0  # max change for first layer
+
+        # Projection onto final hidden state direction
+        final_layer = max(valid_layers)
+        h_final = gathered_hidden[final_layer][0, pos, :].astype(np.float32)
+        h_final_norm = np.linalg.norm(h_final) + 1e-10
+        proj_final = float(np.dot(h, h_final) / (np.linalg.norm(h) * h_final_norm + 1e-10))
+
+        # ── Token type features ──
+        tok_stripped = token_str.strip()
+        is_syntax = float(tok_stripped in SYNTAX_TOKENS)
+        is_whitespace = float(tok_stripped == '')
+
+        return {
+            "agreement": agreement,
+            "confidence": confidence,
+            "kl_div": float(kl_div),
+            "int_entropy": int_entropy,
+            "cos_sim": float(cos_sim),
+            "rel_change": float(rel_change),
+            "proj_final": proj_final,
+            "is_syntax": is_syntax,
+            "is_whitespace": is_whitespace,
+        }
+
+    # ── Extract lm_head + final norm params for V2 logit probing ──
+    lm_head_kernel = None
+    final_norm_weight = None
+    if V2_MODE:
+        if is_master:
+            print("  V2 MODE: extracting lm_head and final norm parameters...")
+
+        with model_mesh:
+            # lm_head.kernel: (hidden_dim, vocab_size)
+            _lm_k = elm._model.lm_head.kernel
+            lm_head_kernel_jax = multihost_utils.process_allgather(_lm_k, tiled=True)
+            lm_head_kernel = np.array(lm_head_kernel_jax, dtype=np.float32)
+            del lm_head_kernel_jax
+
+            # Final RMSNorm weight: (hidden_dim,)
+            _norm_w = elm._model.model.norm.kernel
+            norm_w_jax = multihost_utils.process_allgather(_norm_w, tiled=True)
+            final_norm_weight = np.array(norm_w_jax, dtype=np.float32)
+            del norm_w_jax
+
+        if is_master:
+            print(f"    lm_head kernel: {lm_head_kernel.shape}")
+            print(f"    final norm weight: {final_norm_weight.shape}")
+
     # ── Process passing baselines (perturbation planning + hidden states) ──
     all_hidden_states = []
     all_layer_indices = []
@@ -417,6 +519,8 @@ if not phase2_complete and not phase2a_complete:
     all_entropies = []
     all_margins = []
     all_perturbations = []
+    all_v2_features = []  # V2: list of 9-element feature lists
+    all_v2_kl_targets = []  # V2: layer-dependent soft KL targets
 
     for pass_num, p_idx in enumerate(passing_indices):
         result = baseline_results[p_idx]
@@ -491,12 +595,31 @@ if not phase2_complete and not phase2a_complete:
             rng = np.random.RandomState(int(chosen_token) * 1000 + pos)
             perturbed_token = int(competitors[rng.choice(len(comp_probs), p=comp_probs)])
 
-            for layer_idx in valid_layers:
+            # V2: decode token string for token-type features
+            token_str = tokenizer.decode([int(input_ids[0, pos])]) if V2_MODE else ""
+
+            for li, layer_idx in enumerate(valid_layers):
                 all_hidden_states.append(np.float32(gathered_hidden[layer_idx][0, pos, :]))
                 all_layer_indices.append(layer_idx)
                 all_positions.append(pos)
                 all_entropies.append(entropy)
                 all_margins.append(margin)
+
+                # V2: compute logit probing + convergence + token-type features
+                if V2_MODE:
+                    prev_layer = valid_layers[li - 1] if li > 0 else None
+                    v2f = _compute_v2_features(
+                        gathered_hidden, pos_logits, layer_idx, prev_layer,
+                        valid_layers, pos, lm_head_kernel, final_norm_weight,
+                        token_str,
+                    )
+                    all_v2_features.append([
+                        v2f["agreement"], v2f["confidence"], v2f["kl_div"],
+                        v2f["int_entropy"], v2f["cos_sim"], v2f["rel_change"],
+                        v2f["proj_final"], v2f["is_syntax"], v2f["is_whitespace"],
+                    ])
+                    # Soft KL target: 1 - exp(-kl) → 0 when converged, 1 when divergent
+                    all_v2_kl_targets.append(1.0 - np.exp(-v2f["kl_div"]))
 
             # Build perturbed prefix for Phase 2b rollout
             perturbed_prefix_ids = np.array(input_ids[0][:pos + 1])
@@ -537,6 +660,8 @@ if not phase2_complete and not phase2a_complete:
     fail_positions = []
     fail_entropies = []
     fail_margins = []
+    fail_v2_features = []
+    fail_v2_kl_targets = []
 
     for fail_num, p_idx in enumerate(failing_indices):
         result = baseline_results[p_idx]
@@ -589,12 +714,30 @@ if not phase2_complete and not phase2a_complete:
             sorted_logits = np.sort(pos_logits)
             margin = float(sorted_logits[-1] - sorted_logits[-2])
 
-            for layer_idx in valid_layers:
+            # V2: decode token string for token-type features
+            token_str = tokenizer.decode([int(input_ids[0, pos])]) if V2_MODE else ""
+
+            for li, layer_idx in enumerate(valid_layers):
                 fail_hidden_states.append(np.float32(gathered_hidden[layer_idx][0, pos, :]))
                 fail_layer_indices.append(layer_idx)
                 fail_positions.append(pos)
                 fail_entropies.append(entropy)
                 fail_margins.append(margin)
+
+                # V2: compute features for failing baselines too
+                if V2_MODE:
+                    prev_layer = valid_layers[li - 1] if li > 0 else None
+                    v2f = _compute_v2_features(
+                        gathered_hidden, pos_logits, layer_idx, prev_layer,
+                        valid_layers, pos, lm_head_kernel, final_norm_weight,
+                        token_str,
+                    )
+                    fail_v2_features.append([
+                        v2f["agreement"], v2f["confidence"], v2f["kl_div"],
+                        v2f["int_entropy"], v2f["cos_sim"], v2f["rel_change"],
+                        v2f["proj_final"], v2f["is_syntax"], v2f["is_whitespace"],
+                    ])
+                    fail_v2_kl_targets.append(1.0 - np.exp(-v2f["kl_div"]))
 
         del out, logits_out, logits_np, hidden_out, gathered_hidden
         gc.collect()
@@ -608,26 +751,36 @@ if not phase2_complete and not phase2a_complete:
         print(f"    Passing: {len(all_perturbations)} perturbations, {len(all_hidden_states)} hidden states")
         print(f"    Failing: {len(fail_hidden_states)} hidden states (all regret=0)")
 
-        np.savez(
-            PHASE2A_HIDDEN_PATH,
+        save_kwargs = dict(
             hidden_states=np.stack(all_hidden_states),
             layer_indices=np.array(all_layer_indices),
             positions=np.array(all_positions),
             entropies=np.array(all_entropies),
             margins=np.array(all_margins),
         )
+        if V2_MODE and all_v2_features:
+            save_kwargs["v2_features"] = np.array(all_v2_features, dtype=np.float32)
+            save_kwargs["v2_kl_targets"] = np.array(all_v2_kl_targets, dtype=np.float32)
+            print(f"    V2 features shape: {save_kwargs['v2_features'].shape}")
+            print(f"    V2 KL targets: mean={np.mean(all_v2_kl_targets):.4f}, "
+                  f"std={np.std(all_v2_kl_targets):.4f}")
+        np.savez(PHASE2A_HIDDEN_PATH, **save_kwargs)
+
         with open(PHASE2A_PERTURB_PATH, "w") as f:
             json.dump(all_perturbations, f, indent=2)
 
         if fail_hidden_states:
-            np.savez(
-                PHASE2A_FAILING_PATH,
+            fail_kwargs = dict(
                 hidden_states=np.stack(fail_hidden_states),
                 layer_indices=np.array(fail_layer_indices),
                 positions=np.array(fail_positions),
                 entropies=np.array(fail_entropies),
                 margins=np.array(fail_margins),
             )
+            if V2_MODE and fail_v2_features:
+                fail_kwargs["v2_features"] = np.array(fail_v2_features, dtype=np.float32)
+                fail_kwargs["v2_kl_targets"] = np.array(fail_v2_kl_targets, dtype=np.float32)
+            np.savez(PHASE2A_FAILING_PATH, **fail_kwargs)
 
         n_need_rollout = sum(1 for p in all_perturbations if not p["same_token"])
         print(f"  Saved to {PHASE2A_HIDDEN_PATH}, {PHASE2A_PERTURB_PATH}, {PHASE2A_FAILING_PATH}")
@@ -643,7 +796,63 @@ if is_master:
 # PHASE 2b: eSURGE ROLLOUTS — GREEDY CONTINUATION & REGRET
 # ═════════════════════════════════════════════════════════════════════
 
-if not phase2_complete and phase2a_complete:
+# ── V2: Skip Phase 2b and assemble dataset directly from Phase 2a ──
+if V2_MODE and V2_SKIP_PHASE2B and not phase2_complete and phase2a_complete:
+    if is_master:
+        print(f"\n{'='*70}")
+        print("V2 MODE: Skipping Phase 2b rollouts — assembling dataset from logit probing targets")
+        print(f"{'='*70}")
+
+        # Load Phase 2a data
+        h_data = np.load(PHASE2A_HIDDEN_PATH)
+        hidden_states_all = h_data["hidden_states"]
+        layer_indices_all = h_data["layer_indices"]
+        positions_all = h_data["positions"]
+        entropies_all = h_data["entropies"]
+        margins_all = h_data["margins"]
+        v2_features_all = h_data["v2_features"]
+        v2_kl_targets_all = h_data["v2_kl_targets"]
+
+        # Merge failing baseline data
+        if os.path.exists(PHASE2A_FAILING_PATH):
+            fail_data = np.load(PHASE2A_FAILING_PATH)
+            print(f"  Merging {len(fail_data['hidden_states'])} failing baseline samples")
+            hidden_states_all = np.concatenate([hidden_states_all, fail_data["hidden_states"]])
+            layer_indices_all = np.concatenate([layer_indices_all, fail_data["layer_indices"]])
+            positions_all = np.concatenate([positions_all, fail_data["positions"]])
+            entropies_all = np.concatenate([entropies_all, fail_data["entropies"]])
+            margins_all = np.concatenate([margins_all, fail_data["margins"]])
+            v2_features_all = np.concatenate([v2_features_all, fail_data["v2_features"]])
+            v2_kl_targets_all = np.concatenate([v2_kl_targets_all, fail_data["v2_kl_targets"]])
+
+        # V2 uses KL targets as the primary training signal (no regret needed)
+        # Store KL targets as "regret_values" for backward compatibility with Phase 3
+        total = len(v2_kl_targets_all)
+        print(f"\n  V2 Dataset: {total} samples")
+        print(f"  KL target stats: mean={np.mean(v2_kl_targets_all):.4f}, "
+              f"std={np.std(v2_kl_targets_all):.4f}, "
+              f"min={np.min(v2_kl_targets_all):.4f}, max={np.max(v2_kl_targets_all):.4f}")
+
+        # Count how many samples are "converged" (KL target < 0.1)
+        converged = np.sum(v2_kl_targets_all < 0.1)
+        print(f"  Converged (KL target < 0.1): {converged}/{total} ({100*converged/total:.1f}%)")
+
+        np.savez(
+            REGRET_DATA_PATH,
+            hidden_states=hidden_states_all,
+            layer_indices=layer_indices_all,
+            positions=positions_all,
+            entropies=entropies_all,
+            margins=margins_all,
+            regret_values=v2_kl_targets_all,  # V2: KL targets instead of regret
+            v2_features=v2_features_all,
+        )
+        print(f"  Saved V2 dataset to {REGRET_DATA_PATH}")
+
+    phase2_complete = True
+    multihost_utils.sync_global_devices("v2_dataset_assembled")
+
+if not phase2_complete and phase2a_complete and not (V2_MODE and V2_SKIP_PHASE2B):
     if is_master:
         print(f"\n{'='*70}")
         print("PHASE 2b: eSurge greedy rollouts for perturbed sequences")
@@ -837,6 +1046,11 @@ if not phase2_complete and phase2a_complete:
         assert len(expanded_regret) == len(hidden_states_all), \
             f"Mismatch: {len(expanded_regret)} regret vs {len(hidden_states_all)} hidden states"
 
+        # V2: load V2 features from Phase 2a if available
+        v2_features_all = None
+        if V2_MODE and "v2_features" in h_data:
+            v2_features_all = h_data["v2_features"]
+
         # Merge failing baseline data (all regret=0, no rollouts needed)
         if os.path.exists(PHASE2A_FAILING_PATH):
             fail_data = np.load(PHASE2A_FAILING_PATH)
@@ -855,13 +1069,15 @@ if not phase2_complete and phase2a_complete:
             margins_all = np.concatenate([margins_all, fail_mar])
             expanded_regret = np.concatenate([expanded_regret, fail_regret])
 
+            if v2_features_all is not None and "v2_features" in fail_data:
+                v2_features_all = np.concatenate([v2_features_all, fail_data["v2_features"]])
+
         # Save final regret dataset
         total = len(expanded_regret)
         print(f"\n{'='*70}")
         print(f"Saving regret dataset: {total} samples")
 
-        np.savez(
-            REGRET_DATA_PATH,
+        save_kwargs = dict(
             hidden_states=hidden_states_all,
             layer_indices=layer_indices_all,
             positions=positions_all,
@@ -869,6 +1085,9 @@ if not phase2_complete and phase2a_complete:
             margins=margins_all,
             regret_values=expanded_regret,
         )
+        if v2_features_all is not None:
+            save_kwargs["v2_features"] = v2_features_all
+        np.savez(REGRET_DATA_PATH, **save_kwargs)
         print(f"  Saved to {REGRET_DATA_PATH}")
 
         nonzero_count = np.sum(expanded_regret > 0)
@@ -927,6 +1146,16 @@ if is_master:
         entropies_raw = jnp.zeros(len(regret_targets))
         margins_raw = jnp.zeros(len(regret_targets))
 
+    # V2: load extra features if available
+    has_v2_features = "v2_features" in data
+    if has_v2_features:
+        v2_extra_raw = jnp.array(data["v2_features"], dtype=jnp.float32)
+        num_meta = 4 + v2_extra_raw.shape[1]  # base (4) + V2 extras
+        print(f"  V2 features detected: {v2_extra_raw.shape[1]} extra features (total meta={num_meta})")
+    else:
+        v2_extra_raw = None
+        num_meta = 4
+
     N = hidden_states.shape[0]
     hidden_dim = hidden_states.shape[1]
     print(f"  Dataset: {N} samples, hidden_dim={hidden_dim}")
@@ -934,15 +1163,26 @@ if is_master:
         print(f"  Logit features: entropy range [{float(jnp.min(entropies_raw)):.2f}, {float(jnp.max(entropies_raw)):.2f}], "
               f"margin range [{float(jnp.min(margins_raw)):.2f}, {float(jnp.max(margins_raw)):.2f}]")
 
-    # Binary targets with label smoothing: fragile (regret > 0) vs safe (regret = 0)
-    binary_raw = (regret_targets > 0).astype(jnp.float32)
-    binary_targets = binary_raw * (1 - LABEL_SMOOTHING) + (1 - binary_raw) * LABEL_SMOOTHING
-    nonzero_frac = float(jnp.mean(binary_raw))
-    print(f"  Fragile fraction: {nonzero_frac:.3f} ({int(jnp.sum(binary_raw))}/{N})")
-    print(f"  Label smoothing: {LABEL_SMOOTHING} (targets: 0→{LABEL_SMOOTHING}, 1→{1-LABEL_SMOOTHING})")
+    # V2: use soft KL targets directly (continuous [0,1], already layer-dependent)
+    # Non-V2: binary targets with label smoothing
+    if has_v2_features:
+        # regret_targets are actually soft KL targets in V2 mode (stored as regret_values)
+        # Threshold for binary classification: converged (< 0.5) vs not converged (>= 0.5)
+        binary_raw = (regret_targets > 0.5).astype(jnp.float32)
+        # Use the continuous KL target directly (no label smoothing needed — already soft)
+        training_targets = regret_targets
+        nonzero_frac = float(jnp.mean(binary_raw))
+        print(f"  V2 KL targets: mean={float(jnp.mean(regret_targets)):.4f}, "
+              f"std={float(jnp.std(regret_targets)):.4f}")
+        print(f"  Not converged (>0.5): {nonzero_frac:.3f} ({int(jnp.sum(binary_raw))}/{N})")
+    else:
+        binary_raw = (regret_targets > 0).astype(jnp.float32)
+        training_targets = binary_raw * (1 - LABEL_SMOOTHING) + (1 - binary_raw) * LABEL_SMOOTHING
+        nonzero_frac = float(jnp.mean(binary_raw))
+        print(f"  Fragile fraction: {nonzero_frac:.3f} ({int(jnp.sum(binary_raw))}/{N})")
+        print(f"  Label smoothing: {LABEL_SMOOTHING} (targets: 0→{LABEL_SMOOTHING}, 1→{1-LABEL_SMOOTHING})")
 
     # ── Per-layer hidden state normalization ──
-    # Compute mean/std per layer from training data (fixes layer 40 dead neurons)
     norm_stats = {}
     unique_layers = sorted(set(int(x) for x in np.unique(np.array(layer_indices))))
     print(f"  Computing per-layer normalization stats...")
@@ -955,7 +1195,6 @@ if is_master:
         norm_stats[f"layer_{layer}_std"] = std
         print(f"    Layer {layer}: mean_norm={np.linalg.norm(mean):.2f}, "
               f"mean_std={np.mean(std):.4f}, min_std={np.min(std):.6f}")
-        # Apply normalization in-place
         hidden_states = hidden_states.at[mask].set(
             (hidden_states[mask] - jnp.array(mean)) / (jnp.array(std) + 1e-8)
         )
@@ -975,6 +1214,23 @@ if is_master:
         print(f"  Entropy: mean={ent_mean:.3f}, std={ent_std:.3f}")
         print(f"  Margin:  mean={mar_mean:.3f}, std={mar_std:.3f}")
 
+    # V2: normalize extra features (z-score per feature)
+    v2_extra_norm = None
+    if has_v2_features:
+        v2_feature_names = ["agreement", "confidence", "kl_div", "int_entropy",
+                            "cos_sim", "rel_change", "proj_final",
+                            "is_syntax", "is_whitespace"]
+        v2_extra_norm = v2_extra_raw.copy()
+        for i, fname in enumerate(v2_feature_names):
+            col = v2_extra_raw[:, i]
+            col_mean = float(jnp.mean(col))
+            col_std = float(jnp.std(col))
+            norm_stats[f"v2_{fname}_mean"] = col_mean
+            norm_stats[f"v2_{fname}_std"] = col_std
+            if col_std > 1e-6:
+                v2_extra_norm = v2_extra_norm.at[:, i].set((col - col_mean) / (col_std + 1e-8))
+            print(f"    V2 {fname}: mean={col_mean:.4f}, std={col_std:.4f}")
+
     # Normalize layer index and position to [0, 1]
     num_layers = max(int(jnp.max(layer_indices)) + 1, 1)
     max_pos = max(int(jnp.max(positions)) + 1, 1)
@@ -983,8 +1239,8 @@ if is_master:
 
     # Stratified train/val split: preserve fragile/safe ratio in both sets
     perm = np.random.RandomState(42).permutation(N)
-    fragile_idx = perm[np.array(binary_targets[perm]) > 0]
-    safe_idx = perm[np.array(binary_targets[perm]) == 0]
+    fragile_idx = perm[np.array(training_targets[perm]) > (0.5 if has_v2_features else 0)]
+    safe_idx = perm[np.array(training_targets[perm]) <= (0.5 if has_v2_features else 0)]
     f_split = int(len(fragile_idx) * TRAIN_SPLIT)
     s_split = int(len(safe_idx) * TRAIN_SPLIT)
     train_idx = np.concatenate([fragile_idx[:f_split], safe_idx[:s_split]])
@@ -995,7 +1251,8 @@ if is_master:
     print(f"  Train: {len(train_idx)} (fragile: {f_split}), Val: {len(val_idx)} (fragile: {len(fragile_idx)-f_split})")
 
     # Create model and optimizer
-    model = create_estimator(hidden_dim, seed=42, dropout_rate=ESTIMATOR_DROPOUT)
+    model = create_estimator(hidden_dim, seed=42, dropout_rate=ESTIMATOR_DROPOUT,
+                             num_meta_features=num_meta)
 
     # Cosine LR schedule with warmup
     warmup_steps = 50
@@ -1014,12 +1271,10 @@ if is_master:
     print(f"  BCE pos_weight: {pos_weight:.3f} (balancing {nonzero_frac:.1%} positives)")
 
     # Layer weights: earlier layers get higher weight to improve early-exit predictions
-    # Layer 4 → weight 2.0, Layer 44 → weight 1.0 (linear interpolation)
     max_target_layer = max(TARGET_LAYERS)
     min_target_layer = min(TARGET_LAYERS)
     layer_weight_map = {}
     for tl in TARGET_LAYERS:
-        # Linear from 2.0 (earliest) to 1.0 (latest)
         frac = (tl - min_target_layer) / max(max_target_layer - min_target_layer, 1)
         layer_weight_map[tl] = 2.0 - frac
     print(f"  Layer weights: {min_target_layer}→{layer_weight_map[min_target_layer]:.1f}, "
@@ -1031,22 +1286,23 @@ if is_master:
         mask = layer_indices == tl
         sample_layer_weights = sample_layer_weights.at[mask].set(w)
 
-    def loss_fn(model, h, l, p, ent, mar, targets, weights):
-        preds = model(h, l, p, ent, mar, deterministic=False).squeeze(-1)
-        # Weighted BCE loss with per-sample layer weights
+    def loss_fn(model, h, l, p, ent, mar, ef, targets, weights):
+        preds = model(h, l, p, ent, mar, extra_features=ef, deterministic=False).squeeze(-1)
         eps = 1e-7
         preds = jnp.clip(preds, eps, 1 - eps)
         bce = -(pos_weight * targets * jnp.log(preds) + (1 - targets) * jnp.log(1 - preds))
         return jnp.mean(bce * weights)
 
-    def train_step(model, optimizer, h, l, p, ent, mar, targets, weights):
-        loss, grads = nnx.value_and_grad(loss_fn)(model, h, l, p, ent, mar, targets, weights)
+    def train_step(model, optimizer, h, l, p, ent, mar, ef, targets, weights):
+        loss, grads = nnx.value_and_grad(loss_fn)(model, h, l, p, ent, mar, ef, targets, weights)
         optimizer.update(model, grads)
         return loss
 
     print(f"  Training for up to {ESTIMATOR_EPOCHS} epochs (patience={ESTIMATOR_PATIENCE})")
     print(f"  LR: cosine decay from {ESTIMATOR_LR} with {warmup_steps}-step warmup")
     print(f"  Dropout: {ESTIMATOR_DROPOUT}, Weight decay: {ESTIMATOR_WEIGHT_DECAY}")
+    if has_v2_features:
+        print(f"  V2 MODE: training on soft KL targets with {num_meta} metadata features")
 
     best_val_loss = float("inf")
     patience_counter = 0
@@ -1060,23 +1316,27 @@ if is_master:
             batch_end = min(batch_start + ESTIMATOR_BATCH, len(shuffled))
             idx = shuffled[batch_start:batch_end]
 
+            ef_batch = v2_extra_norm[idx] if v2_extra_norm is not None else None
             loss = train_step(
                 model, optimizer,
                 hidden_states[idx], layer_norm[idx], pos_norm[idx],
                 entropies_norm[idx], margins_norm[idx],
-                binary_targets[idx], sample_layer_weights[idx],
+                ef_batch,
+                training_targets[idx], sample_layer_weights[idx],
             )
             epoch_losses.append(float(loss))
 
         train_loss = np.mean(epoch_losses)
 
         # Validation: BCE loss + accuracy (deterministic mode = no dropout)
+        ef_val = v2_extra_norm[val_idx] if v2_extra_norm is not None else None
         val_preds = model(hidden_states[val_idx], layer_norm[val_idx], pos_norm[val_idx],
                           entropies_norm[val_idx], margins_norm[val_idx],
+                          extra_features=ef_val,
                           deterministic=True).squeeze(-1)
         val_bce = float(jnp.mean(
-            -(binary_targets[val_idx] * jnp.log(jnp.clip(val_preds, 1e-7, 1-1e-7))
-              + (1 - binary_targets[val_idx]) * jnp.log(jnp.clip(1 - val_preds, 1e-7, 1-1e-7)))
+            -(training_targets[val_idx] * jnp.log(jnp.clip(val_preds, 1e-7, 1-1e-7))
+              + (1 - training_targets[val_idx]) * jnp.log(jnp.clip(1 - val_preds, 1e-7, 1-1e-7)))
         ))
         val_acc = float(jnp.mean((val_preds > 0.5) == binary_raw[val_idx]))
 

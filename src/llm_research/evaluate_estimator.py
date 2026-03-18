@@ -24,7 +24,8 @@ from scipy import special  # for GELU
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (TARGET_LAYERS, TRAIN_SPLIT,
                     REGRET_DATA_PATH as _REGRET_DATA_PATH,
-                    ESTIMATOR_PATH as _ESTIMATOR_PATH)
+                    ESTIMATOR_PATH as _ESTIMATOR_PATH,
+                    V2_NUM_EXTRA_FEATURES)
 
 # ── PATHS ────────────────────────────────────────────────────────────
 PROJECT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
@@ -39,6 +40,11 @@ def gelu(x):
 
 def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+
+
+V2_FEATURE_NAMES = ["agreement", "confidence", "kl_div", "int_entropy",
+                     "cos_sim", "rel_change", "proj_final",
+                     "is_syntax", "is_whitespace"]
 
 
 class NumpyEstimator:
@@ -67,18 +73,30 @@ class NumpyEstimator:
         kernel = self._get("linear1/kernel")
         in_dim = kernel.shape[0]
         out_dim = kernel.shape[1]
-        self.is_v2 = out_dim == 512  # v2/v3 = 512, v1 = 256
+        self.is_v2 = out_dim == 512  # v2+ = 512, v1 = 256
         self.has_logit_inputs = "entropy_mean" in self.norm_stats
+        self.has_v2_features = "v2_agreement_mean" in self.norm_stats
+
+        # Detect num_meta from input dim
+        # hidden_dim is in_dim minus metadata features
+        if self.has_v2_features:
+            self.num_meta = 4 + V2_NUM_EXTRA_FEATURES  # 13
+        elif self.has_logit_inputs:
+            self.num_meta = 4
+        else:
+            self.num_meta = 2  # just layer_idx + position
 
         n_norm_layers = sum(1 for k in self.norm_stats if k.startswith("layer_") and k.endswith("_mean"))
         if self.norm_stats:
             print(f"  Per-layer normalization stats loaded ({n_norm_layers} layers)")
-        if self.has_logit_inputs:
-            print(f"  Model v3 detected (logit features, 512→128→1, sigmoid)")
+        if self.has_v2_features:
+            print(f"  Model v5 detected (V2 features, {V2_NUM_EXTRA_FEATURES} extra, 512->128->1, sigmoid)")
+        elif self.has_logit_inputs:
+            print(f"  Model v3/v4 detected (logit features, 512->128->1, sigmoid)")
         elif self.is_v2:
-            print(f"  Model v2 detected (512→128→1, sigmoid)")
+            print(f"  Model v2 detected (512->128->1, sigmoid)")
         else:
-            print(f"  Model v1 detected (256→64→1, ReLU)")
+            print(f"  Model v1 detected (256->64->1, ReLU)")
         print(f"  Input dim: {in_dim}, first hidden: {out_dim}")
 
     def _get(self, name):
@@ -110,11 +128,23 @@ class NumpyEstimator:
             mar = (mar - float(self.norm_stats["margin_mean"])) / (float(self.norm_stats["margin_std"]) + 1e-8)
         return ent, mar
 
+    def normalize_v2_features(self, v2_features):
+        """Apply z-score normalization to V2 extra features using saved stats."""
+        v2f = v2_features.copy()
+        for i, fname in enumerate(V2_FEATURE_NAMES):
+            mean_key = f"v2_{fname}_mean"
+            std_key = f"v2_{fname}_std"
+            if mean_key in self.norm_stats:
+                m = float(self.norm_stats[mean_key])
+                s = float(self.norm_stats[std_key])
+                if s > 1e-6:
+                    v2f[:, i] = (v2f[:, i] - m) / (s + 1e-8)
+        return v2f
+
     def _layer_norm(self, x, name):
         """Apply LayerNorm if weights exist."""
         scale_key = f"{name}/scale"
         bias_key = f"{name}/bias"
-        # Check both formats
         try:
             scale = self._get(scale_key)
             bias = self._get(bias_key)
@@ -124,11 +154,14 @@ class NumpyEstimator:
         var = np.var(x, axis=-1, keepdims=True)
         return scale * (x - mean) / np.sqrt(var + 1e-5) + bias
 
-    def __call__(self, hidden_state, layer_idx, position, entropy=None, margin=None):
+    def __call__(self, hidden_state, layer_idx, position, entropy=None, margin=None,
+                 v2_features=None):
+        parts = [hidden_state, layer_idx, position]
         if entropy is not None and margin is not None:
-            x = np.concatenate([hidden_state, layer_idx, position, entropy, margin], axis=-1)
-        else:
-            x = np.concatenate([hidden_state, layer_idx, position], axis=-1)
+            parts.extend([entropy, margin])
+        if v2_features is not None:
+            parts.append(v2_features)
+        x = np.concatenate(parts, axis=-1)
         x = self._layer_norm(gelu(x @ self._get("linear1/kernel") + self._get("linear1/bias")), "ln1")
         x = self._layer_norm(gelu(x @ self._get("linear2/kernel") + self._get("linear2/bias")), "ln2")
         x = x @ self._get("linear3/kernel") + self._get("linear3/bias")
@@ -142,9 +175,7 @@ def load_data():
     hs = data["hidden_states"]
     # Handle bfloat16 saved as raw bytes
     if hs.dtype.kind not in ('f', 'i', 'u'):
-        # bfloat16 as uint16 → float32 conversion
         hs_u16 = hs.view(np.uint16)
-        # bfloat16 to float32: shift left 16 bits
         hs_f32 = np.zeros(hs_u16.shape, dtype=np.float32)
         for i in range(hs_u16.shape[0]):
             hs_f32[i] = np.frombuffer(
@@ -161,6 +192,9 @@ def load_data():
     if "entropies" in data:
         result["entropies"] = data["entropies"].astype(np.float32)
         result["margins"] = data["margins"].astype(np.float32)
+    # Load V2 features if available
+    if "v2_features" in data:
+        result["v2_features"] = data["v2_features"].astype(np.float32)
     return result
 
 
@@ -178,11 +212,18 @@ def predict_all(model, data):
     pos_norm = positions.astype(np.float32).reshape(-1, 1) / (max_pos - 1)
 
     # Use logit features if available
+    ent, mar, v2f = None, None, None
     if "entropies" in data:
         ent = data["entropies"].reshape(-1, 1)
         mar = data["margins"].reshape(-1, 1)
         ent, mar = model.normalize_logit_features(ent, mar)
-        preds = model(hs, layer_norm, pos_norm, ent, mar)
+
+    # Use V2 features if available
+    if "v2_features" in data and model.has_v2_features:
+        v2f = model.normalize_v2_features(data["v2_features"])
+
+    if ent is not None:
+        preds = model(hs, layer_norm, pos_norm, ent, mar, v2_features=v2f)
     else:
         preds = model(hs, layer_norm, pos_norm)
     return preds.squeeze(-1)
@@ -316,38 +357,53 @@ def eval_per_position(preds, targets, positions):
               f"{mse:>10.6f} {np.mean(t):>10.4f} {np.mean(p):>10.4f} {nz:>7.1f}%")
 
 
-def eval_regret_distribution(targets):
-    section("5. REGRET DISTRIBUTION")
+def eval_regret_distribution(targets, is_v2=False):
+    section("5. TARGET DISTRIBUTION" if is_v2 else "5. REGRET DISTRIBUTION")
 
     print(f"  Total samples:    {len(targets)}")
-    print(f"  Zero regret:      {np.sum(targets == 0)} ({100*np.mean(targets == 0):.1f}%)")
-    print(f"  Non-zero regret:  {np.sum(targets > 0)} ({100*np.mean(targets > 0):.1f}%)")
+    if is_v2:
+        print(f"  Converged (< 0.1):   {np.sum(targets < 0.1)} ({100*np.mean(targets < 0.1):.1f}%)")
+        print(f"  Divergent (>= 0.5):  {np.sum(targets >= 0.5)} ({100*np.mean(targets >= 0.5):.1f}%)")
+        print(f"  Mean: {np.mean(targets):.4f}, Std: {np.std(targets):.4f}")
 
-    nonzero = targets[targets > 0]
-    if len(nonzero) > 0:
-        print(f"\n  Non-zero regret histogram:")
-        bins = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.01]
-        counts, _ = np.histogram(nonzero, bins=bins)
+        # Histogram of continuous target values
+        print(f"\n  Target value histogram:")
+        bins = np.linspace(0, 1, 11)
+        counts, _ = np.histogram(targets, bins=bins)
         for i, count in enumerate(counts):
             bar = '#' * int(40 * count / max(max(counts), 1))
-            print(f"    ({bins[i]:.1f}, {bins[i+1]:.1f}]: {count:>5} {bar}")
-
-    unique_vals = np.unique(np.round(targets, 4))
-    if len(unique_vals) <= 30:
-        print(f"\n  Unique regret values ({len(unique_vals)}):")
-        for v in unique_vals:
-            c = np.sum(np.abs(targets - v) < 1e-4)
-            pct = 100 * c / len(targets)
-            bar = '#' * int(30 * c / len(targets) * (100 / max(np.max(np.bincount(np.round(targets * 100).astype(int))), 1)))
-            print(f"    {v:.4f}: {c:>5} ({pct:.1f}%)")
+            print(f"    [{bins[i]:.1f}, {bins[i+1]:.1f}): {count:>5} {bar}")
     else:
-        print(f"\n  {len(unique_vals)} unique regret values (continuous distribution)")
+        print(f"  Zero regret:      {np.sum(targets == 0)} ({100*np.mean(targets == 0):.1f}%)")
+        print(f"  Non-zero regret:  {np.sum(targets > 0)} ({100*np.mean(targets > 0):.1f}%)")
+
+        nonzero = targets[targets > 0]
+        if len(nonzero) > 0:
+            print(f"\n  Non-zero regret histogram:")
+            bins = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.01]
+            counts, _ = np.histogram(nonzero, bins=bins)
+            for i, count in enumerate(counts):
+                bar = '#' * int(40 * count / max(max(counts), 1))
+                print(f"    ({bins[i]:.1f}, {bins[i+1]:.1f}]: {count:>5} {bar}")
+
+        unique_vals = np.unique(np.round(targets, 4))
+        if len(unique_vals) <= 30:
+            print(f"\n  Unique regret values ({len(unique_vals)}):")
+            for v in unique_vals:
+                c = np.sum(np.abs(targets - v) < 1e-4)
+                pct = 100 * c / len(targets)
+                print(f"    {v:.4f}: {c:>5} ({pct:.1f}%)")
+        else:
+            print(f"\n  {len(unique_vals)} unique regret values (continuous distribution)")
 
 
-def eval_early_exit_simulation(preds, targets, layer_indices):
+def eval_early_exit_simulation(preds, targets, layer_indices, is_v2=False):
     section("6. EARLY-EXIT SIMULATION")
-    print("  At each layer (early->late), if predicted regret < threshold -> exit early")
-    print("  'Safe exit' = true regret was 0, 'Unsafe exit' = true regret > 0")
+    if is_v2:
+        print("  V2: prediction = P(not converged). Exit when prediction < threshold.")
+    else:
+        print("  At each layer (early->late), if predicted regret < threshold -> exit early")
+    print("  'Safe exit' = true target was 0 (converged/safe), 'Unsafe exit' = true target > 0")
 
     n_layers = len(TARGET_LAYERS)
 
@@ -365,6 +421,9 @@ def eval_early_exit_simulation(preds, targets, layer_indices):
         n_perturbations = len(targets) // n_layers
 
     print(f"\n  Perturbations: {n_perturbations}, Layers: {TARGET_LAYERS}")
+
+    # V2: use different safe/unsafe threshold since targets are continuous
+    safe_thresh = 0.1 if is_v2 else 0.0
 
     print(f"\n  {'Thresh':>8} {'ExitRate':>9} {'SafeExit%':>10} {'UnsafeExit%':>12} "
           f"{'AvgLayer':>9} {'Compute%':>9}")
@@ -384,7 +443,7 @@ def eval_early_exit_simulation(preds, targets, layer_indices):
                 if preds[idx] < thresh:
                     exits += 1
                     total_layers_used += TARGET_LAYERS[l_offset]
-                    if targets[idx] == 0:
+                    if targets[idx] <= safe_thresh:
                         safe_exits += 1
                     else:
                         unsafe_exits += 1
@@ -404,7 +463,7 @@ def eval_early_exit_simulation(preds, targets, layer_indices):
 
 
 def eval_calibration(preds, targets):
-    section("7. CALIBRATION: PREDICTED vs ACTUAL REGRET")
+    section("7. CALIBRATION: PREDICTED vs ACTUAL")
 
     n_bins = 10
     pred_min, pred_max = np.min(preds), np.max(preds)
@@ -440,24 +499,57 @@ def eval_error_analysis(preds, targets, layer_indices, positions):
               f"{preds[idx]:>10.4f} {targets[idx]:>10.4f} {errors[idx]:>10.4f}")
 
     # Dangerous misses
-    print(f"\n  DANGEROUS MISSES (high regret predicted as safe):")
+    print(f"\n  DANGEROUS MISSES (high target predicted as safe):")
     for regret_thresh, pred_thresh in [(0.5, 0.1), (0.3, 0.1), (0.5, 0.2)]:
         high_regret = targets > regret_thresh
         low_pred = preds < pred_thresh
         dangerous = high_regret & low_pred
         n_d = np.sum(dangerous)
-        print(f"    regret>{regret_thresh} but pred<{pred_thresh}: "
+        print(f"    target>{regret_thresh} but pred<{pred_thresh}: "
               f"{n_d}/{np.sum(high_regret)} ({100*n_d/max(np.sum(high_regret),1):.1f}%)")
 
     # False alarms
-    print(f"\n  FALSE ALARMS (zero regret predicted as risky):")
+    print(f"\n  FALSE ALARMS (zero/low target predicted as risky):")
     for pred_thresh in [0.3, 0.5, 0.7]:
-        zero_regret = targets == 0
+        zero_regret = targets < 0.05  # near-zero target
         high_pred = preds > pred_thresh
         false_alarm = zero_regret & high_pred
         n_f = np.sum(false_alarm)
-        print(f"    regret=0 but pred>{pred_thresh}: "
+        print(f"    target<0.05 but pred>{pred_thresh}: "
               f"{n_f}/{np.sum(zero_regret)} ({100*n_f/max(np.sum(zero_regret),1):.1f}%)")
+
+
+def eval_v2_features(data):
+    """V2-specific: analyze the extra features and their correlation with targets."""
+    if "v2_features" not in data:
+        return
+
+    section("10. V2 FEATURE ANALYSIS")
+
+    v2f = data["v2_features"]
+    targets = data["regret_values"]
+
+    print(f"\n  {'Feature':>16} {'Mean':>10} {'Std':>10} {'Corr w/ Target':>15}")
+    print(f"  {'─'*52}")
+
+    for i, fname in enumerate(V2_FEATURE_NAMES):
+        col = v2f[:, i]
+        corr = np.corrcoef(col, targets)[0, 1] if np.std(col) > 0 else 0.0
+        print(f"  {fname:>16} {np.mean(col):>10.4f} {np.std(col):>10.4f} {corr:>15.4f}")
+
+    # Per-layer agreement rates
+    layers = data["layer_indices"]
+    unique_layers = sorted(np.unique(layers))
+    agreement_col = v2f[:, 0]  # agreement is first V2 feature
+
+    print(f"\n  Per-layer agreement rate (argmax match with final layer):")
+    print(f"  {'Layer':>6} {'Agreement%':>12} {'Mean KL Target':>15}")
+    print(f"  {'─'*35}")
+    for layer in unique_layers:
+        mask = layers == layer
+        agree_rate = 100 * np.mean(agreement_col[mask])
+        mean_tgt = np.mean(targets[mask])
+        print(f"  {layer:>6} {agree_rate:>11.1f}% {mean_tgt:>15.4f}")
 
 
 def eval_train_val(model, data):
@@ -465,12 +557,14 @@ def eval_train_val(model, data):
 
     N = len(data["regret_values"])
     targets = data["regret_values"]
-    binary = (targets > 0).astype(float)
+    is_v2 = "v2_features" in data
+    binary = (targets > (0.5 if is_v2 else 0)).astype(float)
 
     # Stratified split matching training code
     perm = np.random.RandomState(42).permutation(N)
-    fragile_idx = perm[binary[perm] > 0]
-    safe_idx = perm[binary[perm] == 0]
+    split_thresh = 0.5 if is_v2 else 0
+    fragile_idx = perm[targets[perm] > split_thresh]
+    safe_idx = perm[targets[perm] <= split_thresh]
     f_split = int(len(fragile_idx) * TRAIN_SPLIT)
     s_split = int(len(safe_idx) * TRAIN_SPLIT)
     train_idx = np.concatenate([fragile_idx[:f_split], safe_idx[:s_split]])
@@ -495,9 +589,16 @@ def eval_train_val(model, data):
         mar = data["margins"].reshape(-1, 1)
         ent, mar = model.normalize_logit_features(ent, mar)
 
+    # Normalize V2 features if available
+    v2f = None
+    if "v2_features" in data and model.has_v2_features:
+        v2f = model.normalize_v2_features(data["v2_features"])
+
     for name, idx in [("Train", train_idx), ("Val", val_idx)]:
+        v2f_batch = v2f[idx] if v2f is not None else None
         if has_logit:
-            p = model(hs[idx], layer_norm[idx], pos_norm[idx], ent[idx], mar[idx]).squeeze(-1)
+            p = model(hs[idx], layer_norm[idx], pos_norm[idx], ent[idx], mar[idx],
+                      v2_features=v2f_batch).squeeze(-1)
         else:
             p = model(hs[idx], layer_norm[idx], pos_norm[idx]).squeeze(-1)
         t = targets[idx]
@@ -510,10 +611,9 @@ def eval_train_val(model, data):
 
 
 def print_improvements(preds, targets):
-    section("10. IMPROVEMENT SUGGESTIONS")
+    section("11. IMPROVEMENT SUGGESTIONS")
 
     corr = np.corrcoef(preds, targets)[0, 1] if np.std(preds) > 0 else 0
-    unique_regrets = len(np.unique(np.round(targets, 2)))
     pred_std = np.std(preds)
     tgt_std = np.std(targets)
 
@@ -521,17 +621,9 @@ def print_improvements(preds, targets):
 
     if corr < 0.3:
         suggestions.append(
-            "LOW CORRELATION (r={:.3f}): MLP struggles with regret magnitude.\n"
+            "LOW CORRELATION (r={:.3f}): MLP struggles with target prediction.\n"
             "  -> Deeper network: add residual connections.\n"
             "  -> Consider attention-based architecture for layer interactions.".format(corr)
-        )
-
-    if unique_regrets < 20:
-        suggestions.append(
-            "COARSE REGRET ({} unique values): partial reward may be too discrete.\n"
-            "  -> Weight test assertions by difficulty/coverage.\n"
-            "  -> Use log-probability regret: KL divergence between baseline & perturbed.\n"
-            "  -> Run multiple rollouts per perturbation (3-5) and average.".format(unique_regrets)
         )
 
     if np.mean(preds) > np.mean(targets) * 1.5:
@@ -547,13 +639,6 @@ def print_improvements(preds, targets):
             "LOW VARIANCE: pred_std={:.4f} vs target_std={:.4f}.\n"
             "  -> Model may be underfitting. Add layers or increase capacity.".format(pred_std, tgt_std)
         )
-
-    suggestions.append(
-        "DATA:\n"
-        "  -> Multiple perturbations per position (different competitor tokens).\n"
-        "  -> Focus sampling on high-entropy positions (uncertain = more informative).\n"
-        "  -> Cross-task generalization: train on HumanEval, test on MBPP."
-    )
 
     suggestions.append(
         "NEXT STEPS:\n"
@@ -576,11 +661,16 @@ def main():
     data = load_data()
     N = len(data["regret_values"])
     hdim = data["hidden_states"].shape[1]
+    is_v2 = "v2_features" in data
     print(f"  Samples: {N}, Hidden dim: {hdim}")
     print(f"  Layers: {sorted(np.unique(data['layer_indices']))}")
     if "entropies" in data:
         print(f"  Logit features: entropy [{data['entropies'].min():.2f}, {data['entropies'].max():.2f}], "
               f"margin [{data['margins'].min():.2f}, {data['margins'].max():.2f}]")
+    if is_v2:
+        print(f"  V2 features: {data['v2_features'].shape[1]} extra features")
+        print(f"  V2 KL targets: mean={data['regret_values'].mean():.4f}, "
+              f"std={data['regret_values'].std():.4f}")
 
     print("Loading model...")
     model = NumpyEstimator(ESTIMATOR_PATH)
@@ -597,11 +687,13 @@ def main():
     eval_classification(preds, targets)
     eval_per_layer(preds, targets, layers)
     eval_per_position(preds, targets, positions)
-    eval_regret_distribution(targets)
-    eval_early_exit_simulation(preds, targets, layers)
+    eval_regret_distribution(targets, is_v2=is_v2)
+    eval_early_exit_simulation(preds, targets, layers, is_v2=is_v2)
     eval_calibration(preds, targets)
     eval_error_analysis(preds, targets, layers, positions)
     eval_train_val(model, data)
+    if is_v2:
+        eval_v2_features(data)
     print_improvements(preds, targets)
 
     print(f"\n{'='*70}")
