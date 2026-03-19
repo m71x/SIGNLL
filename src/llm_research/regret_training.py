@@ -499,13 +499,14 @@ if not phase2_complete and not phase2a_complete:
             # lm_head.kernel: (hidden_dim, vocab_size)
             _lm_k = elm._model.lm_head.kernel
             lm_head_kernel_jax = multihost_utils.process_allgather(_lm_k, tiled=True)
-            lm_head_kernel = np.array(lm_head_kernel_jax, dtype=np.float32)
+            # Cast bf16 → f32 in JAX before converting to numpy (numpy can't handle bf16)
+            lm_head_kernel = np.array(lm_head_kernel_jax.astype(jnp.float32))
             del lm_head_kernel_jax
 
             # Final RMSNorm weight: (hidden_dim,)
             _norm_w = elm._model.model.norm.kernel
             norm_w_jax = multihost_utils.process_allgather(_norm_w, tiled=True)
-            final_norm_weight = np.array(norm_w_jax, dtype=np.float32)
+            final_norm_weight = np.array(norm_w_jax.astype(jnp.float32))
             del norm_w_jax
 
         if is_master:
