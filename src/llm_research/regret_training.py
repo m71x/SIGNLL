@@ -37,6 +37,8 @@ from config import (  # noqa: E402
     REGRET_DATA_PATH, PHASE2A_FAILING_PATH, ESTIMATOR_PATH,
     PHASE2B_CHECKPOINT_PATH, PHASE2B_CHECKPOINT_INTERVAL, BATCH_SIZE,
     V2_MODE, V2_SKIP_PHASE2B, V2_NUM_EXTRA_FEATURES, SYNTAX_TOKENS,
+    V3_PROGRESSIVE, V3_KEEP_FEATURES, V3_NUM_KEPT_FEATURES,
+    V3_PROJ_DIM, V3_CONV_DIM, V3_CONV_KERNEL,
 )
 
 # Training-specific (not shared)
@@ -1122,7 +1124,8 @@ multihost_utils.sync_global_devices("model_freed")
 # Only master trains the estimator (it's a small MLP, no need for multi-host)
 if is_master:
     import optax
-    from regret_estimator import create_estimator, save_estimator
+    from regret_estimator import (create_estimator, create_progressive_estimator,
+                                  save_estimator)
     from flax import nnx
 
     # Load regret dataset
@@ -1167,10 +1170,7 @@ if is_master:
     # V2: use soft KL targets directly (continuous [0,1], already layer-dependent)
     # Non-V2: binary targets with label smoothing
     if has_v2_features:
-        # regret_targets are actually soft KL targets in V2 mode (stored as regret_values)
-        # Threshold for binary classification: converged (< 0.5) vs not converged (>= 0.5)
         binary_raw = (regret_targets > 0.5).astype(jnp.float32)
-        # Use the continuous KL target directly (no label smoothing needed — already soft)
         training_targets = regret_targets
         nonzero_frac = float(jnp.mean(binary_raw))
         print(f"  V2 KL targets: mean={float(jnp.mean(regret_targets)):.4f}, "
@@ -1235,130 +1235,299 @@ if is_master:
     # Normalize layer index and position to [0, 1]
     num_layers = max(int(jnp.max(layer_indices)) + 1, 1)
     max_pos = max(int(jnp.max(positions)) + 1, 1)
-    layer_norm = layer_indices.astype(jnp.float32).reshape(-1, 1) / (num_layers - 1)
+    layer_norm_feat = layer_indices.astype(jnp.float32).reshape(-1, 1) / (num_layers - 1)
     pos_norm = positions.astype(jnp.float32).reshape(-1, 1) / (max_pos - 1)
 
-    # Stratified train/val split: preserve fragile/safe ratio in both sets
-    perm = np.random.RandomState(42).permutation(N)
-    fragile_idx = perm[np.array(training_targets[perm]) > (0.5 if has_v2_features else 0)]
-    safe_idx = perm[np.array(training_targets[perm]) <= (0.5 if has_v2_features else 0)]
-    f_split = int(len(fragile_idx) * TRAIN_SPLIT)
-    s_split = int(len(safe_idx) * TRAIN_SPLIT)
-    train_idx = np.concatenate([fragile_idx[:f_split], safe_idx[:s_split]])
-    val_idx = np.concatenate([fragile_idx[f_split:], safe_idx[s_split:]])
-    np.random.RandomState(42).shuffle(train_idx)
-    np.random.RandomState(42).shuffle(val_idx)
+    # ── V3: Progressive architecture — group data by position ──
+    use_progressive = V3_PROGRESSIVE and has_v2_features
+    if use_progressive:
+        num_target_layers = len(TARGET_LAYERS)
+        print(f"\n  V3 PROGRESSIVE MODE: Conv1D over {num_target_layers} layers")
 
-    print(f"  Train: {len(train_idx)} (fragile: {f_split}), Val: {len(val_idx)} (fragile: {len(fragile_idx)-f_split})")
+        # Group flat samples into (position, layers) sequences.
+        # Data is stored in order: for each (prompt, position), num_target_layers consecutive
+        # samples with ascending layer indices.
+        assert N % num_target_layers == 0, \
+            f"Dataset size {N} not divisible by {num_target_layers} target layers"
+        num_groups = N // num_target_layers
 
-    # Create model and optimizer
-    model = create_estimator(hidden_dim, seed=42, dropout_rate=ESTIMATOR_DROPOUT,
-                             num_meta_features=num_meta)
+        # Verify grouping: within each group, layers should be ascending
+        layer_arr = np.array(layer_indices)
+        layer_groups = layer_arr.reshape(num_groups, num_target_layers)
+        for g in range(min(10, num_groups)):
+            assert np.all(np.diff(layer_groups[g]) > 0), \
+                f"Group {g} layers not ascending: {layer_groups[g]}"
+        print(f"  Verified {num_groups} position groups x {num_target_layers} layers")
 
-    # Cosine LR schedule with warmup
-    warmup_steps = 50
-    total_steps = ESTIMATOR_EPOCHS * (len(train_idx) // ESTIMATOR_BATCH + 1)
-    schedule = optax.join_schedules(
-        schedules=[
-            optax.linear_schedule(0.0, ESTIMATOR_LR, warmup_steps),
-            optax.cosine_decay_schedule(ESTIMATOR_LR, total_steps - warmup_steps),
-        ],
-        boundaries=[warmup_steps],
-    )
-    optimizer = nnx.Optimizer(model, optax.adamw(schedule, weight_decay=ESTIMATOR_WEIGHT_DECAY), wrt=nnx.Param)
+        # Select kept V2 features (drop useless ones)
+        v2_kept = v2_extra_norm[:, V3_KEEP_FEATURES]
+        print(f"  Keeping {V3_NUM_KEPT_FEATURES} V2 features: "
+              f"{[v2_feature_names[i] for i in V3_KEEP_FEATURES]}")
 
-    # Positive weight for BCE loss (balance classes)
-    pos_weight = (1.0 - nonzero_frac) / max(nonzero_frac, 1e-6)
-    print(f"  BCE pos_weight: {pos_weight:.3f} (balancing {nonzero_frac:.1%} positives)")
+        # Build per-layer feature tensor: hidden_state + [layer_idx, position, entropy, margin, kept_v2]
+        # meta_per_layer = 4 (layer, pos, ent, mar) + V3_NUM_KEPT_FEATURES
+        meta_per_layer = 4 + V3_NUM_KEPT_FEATURES
+        feat_dim = hidden_dim + meta_per_layer
+        print(f"  Feature dim per layer: {hidden_dim} (hidden) + {meta_per_layer} (meta) = {feat_dim}")
 
-    # Layer weights: earlier layers get higher weight to improve early-exit predictions
-    max_target_layer = max(TARGET_LAYERS)
-    min_target_layer = min(TARGET_LAYERS)
-    layer_weight_map = {}
-    for tl in TARGET_LAYERS:
-        frac = (tl - min_target_layer) / max(max_target_layer - min_target_layer, 1)
-        layer_weight_map[tl] = 2.0 - frac
-    print(f"  Layer weights: {min_target_layer}→{layer_weight_map[min_target_layer]:.1f}, "
-          f"{max_target_layer}→{layer_weight_map[max_target_layer]:.1f}")
+        # Assemble into (num_groups, num_target_layers, feat_dim)
+        all_feats_flat = jnp.concatenate([
+            hidden_states,        # (N, hidden_dim)
+            layer_norm_feat,      # (N, 1)
+            pos_norm,             # (N, 1)
+            entropies_norm,       # (N, 1)
+            margins_norm,         # (N, 1)
+            v2_kept,              # (N, V3_NUM_KEPT_FEATURES)
+        ], axis=-1)  # (N, feat_dim)
 
-    # Pre-compute per-sample layer weights
-    sample_layer_weights = jnp.ones(N)
-    for tl, w in layer_weight_map.items():
-        mask = layer_indices == tl
-        sample_layer_weights = sample_layer_weights.at[mask].set(w)
+        seq_features = all_feats_flat.reshape(num_groups, num_target_layers, feat_dim)
+        seq_targets = training_targets.reshape(num_groups, num_target_layers)
+        seq_binary = binary_raw.reshape(num_groups, num_target_layers)
 
-    def loss_fn(model, h, l, p, ent, mar, ef, targets, weights):
-        preds = model(h, l, p, ent, mar, extra_features=ef, deterministic=False).squeeze(-1)
-        eps = 1e-7
-        preds = jnp.clip(preds, eps, 1 - eps)
-        bce = -(pos_weight * targets * jnp.log(preds) + (1 - targets) * jnp.log(1 - preds))
-        return jnp.mean(bce * weights)
+        # Layer weights for progressive: weight earlier layers higher
+        max_target_layer = max(TARGET_LAYERS)
+        min_target_layer = min(TARGET_LAYERS)
+        prog_layer_weights = jnp.array([
+            2.0 - (tl - min_target_layer) / max(max_target_layer - min_target_layer, 1)
+            for tl in TARGET_LAYERS
+        ])  # (num_target_layers,)
+        print(f"  Layer weights: {TARGET_LAYERS[0]}→{float(prog_layer_weights[0]):.1f}, "
+              f"{TARGET_LAYERS[-1]}→{float(prog_layer_weights[-1]):.1f}")
 
-    def train_step(model, optimizer, h, l, p, ent, mar, ef, targets, weights):
-        loss, grads = nnx.value_and_grad(loss_fn)(model, h, l, p, ent, mar, ef, targets, weights)
-        optimizer.update(model, grads)
-        return loss
+        # Stratified train/val split on position groups
+        group_max_target = jnp.max(seq_targets, axis=1)  # max target across layers per group
+        perm = np.random.RandomState(42).permutation(num_groups)
+        fragile_idx = perm[np.array(group_max_target[perm]) > 0.5]
+        safe_idx = perm[np.array(group_max_target[perm]) <= 0.5]
+        f_split = int(len(fragile_idx) * TRAIN_SPLIT)
+        s_split = int(len(safe_idx) * TRAIN_SPLIT)
+        train_idx = np.concatenate([fragile_idx[:f_split], safe_idx[:s_split]])
+        val_idx = np.concatenate([fragile_idx[f_split:], safe_idx[s_split:]])
+        np.random.RandomState(42).shuffle(train_idx)
+        np.random.RandomState(42).shuffle(val_idx)
+        print(f"  Train: {len(train_idx)} groups (fragile: {f_split}), "
+              f"Val: {len(val_idx)} groups (fragile: {len(fragile_idx)-f_split})")
 
-    print(f"  Training for up to {ESTIMATOR_EPOCHS} epochs (patience={ESTIMATOR_PATIENCE})")
-    print(f"  LR: cosine decay from {ESTIMATOR_LR} with {warmup_steps}-step warmup")
-    print(f"  Dropout: {ESTIMATOR_DROPOUT}, Weight decay: {ESTIMATOR_WEIGHT_DECAY}")
-    if has_v2_features:
-        print(f"  V2 MODE: training on soft KL targets with {num_meta} metadata features")
+        # Create progressive model
+        model = create_progressive_estimator(
+            hidden_dim, num_target_layers, seed=42,
+            num_meta_per_layer=meta_per_layer,
+            proj_dim=V3_PROJ_DIM, conv_dim=V3_CONV_DIM,
+            kernel_size=V3_CONV_KERNEL, dropout_rate=ESTIMATOR_DROPOUT,
+        )
 
-    best_val_loss = float("inf")
-    patience_counter = 0
+        # Save metadata for loading
+        save_meta = {
+            "arch": "progressive",
+            "num_layers": num_target_layers,
+            "num_meta_per_layer": meta_per_layer,
+            "proj_dim": V3_PROJ_DIM,
+            "conv_dim": V3_CONV_DIM,
+            "kernel_size": V3_CONV_KERNEL,
+        }
 
-    for epoch in range(ESTIMATOR_EPOCHS):
-        epoch_perm = np.random.RandomState(epoch).permutation(len(train_idx))
-        shuffled = train_idx[epoch_perm]
+        # Optimizer
+        warmup_steps = 50
+        batch_size = max(ESTIMATOR_BATCH // num_target_layers, 16)  # groups per batch
+        total_steps = ESTIMATOR_EPOCHS * (len(train_idx) // batch_size + 1)
+        schedule = optax.join_schedules(
+            schedules=[
+                optax.linear_schedule(0.0, ESTIMATOR_LR, warmup_steps),
+                optax.cosine_decay_schedule(ESTIMATOR_LR, total_steps - warmup_steps),
+            ],
+            boundaries=[warmup_steps],
+        )
+        optimizer = nnx.Optimizer(model, optax.adamw(schedule, weight_decay=ESTIMATOR_WEIGHT_DECAY),
+                                  wrt=nnx.Param)
 
-        epoch_losses = []
-        for batch_start in range(0, len(shuffled), ESTIMATOR_BATCH):
-            batch_end = min(batch_start + ESTIMATOR_BATCH, len(shuffled))
-            idx = shuffled[batch_start:batch_end]
+        # MSE loss with layer weights (continuous targets → MSE for calibration)
+        def loss_fn(model, features, targets, layer_weights):
+            # features: (batch, num_layers, feat_dim), targets: (batch, num_layers)
+            preds = model(features, deterministic=False).squeeze(-1)  # (batch, num_layers)
+            mse = (preds - targets) ** 2  # (batch, num_layers)
+            weighted = mse * layer_weights[None, :]  # broadcast layer weights
+            return jnp.mean(weighted)
 
-            ef_batch = v2_extra_norm[idx] if v2_extra_norm is not None else None
-            loss = train_step(
-                model, optimizer,
-                hidden_states[idx], layer_norm[idx], pos_norm[idx],
-                entropies_norm[idx], margins_norm[idx],
-                ef_batch,
-                training_targets[idx], sample_layer_weights[idx],
-            )
-            epoch_losses.append(float(loss))
+        def train_step(model, optimizer, features, targets, layer_weights):
+            loss, grads = nnx.value_and_grad(loss_fn)(model, features, targets, layer_weights)
+            optimizer.update(model, grads)
+            return loss
 
-        train_loss = np.mean(epoch_losses)
+        print(f"\n  Training PROGRESSIVE for up to {ESTIMATOR_EPOCHS} epochs (patience={ESTIMATOR_PATIENCE})")
+        print(f"  Batch size: {batch_size} groups, LR: cosine from {ESTIMATOR_LR}")
+        print(f"  Loss: MSE with layer weights, Dropout: {ESTIMATOR_DROPOUT}")
 
-        # Validation: BCE loss + accuracy (deterministic mode = no dropout)
-        ef_val = v2_extra_norm[val_idx] if v2_extra_norm is not None else None
-        val_preds = model(hidden_states[val_idx], layer_norm[val_idx], pos_norm[val_idx],
-                          entropies_norm[val_idx], margins_norm[val_idx],
-                          extra_features=ef_val,
-                          deterministic=True).squeeze(-1)
-        val_bce = float(jnp.mean(
-            -(training_targets[val_idx] * jnp.log(jnp.clip(val_preds, 1e-7, 1-1e-7))
-              + (1 - training_targets[val_idx]) * jnp.log(jnp.clip(1 - val_preds, 1e-7, 1-1e-7)))
-        ))
-        val_acc = float(jnp.mean((val_preds > 0.5) == binary_raw[val_idx]))
+        best_val_loss = float("inf")
+        best_val_acc = 0.0
+        patience_counter = 0
 
-        if val_bce < best_val_loss:
-            best_val_loss = val_bce
-            best_val_acc = val_acc
-            patience_counter = 0
-            save_estimator(model, ESTIMATOR_PATH, norm_stats=norm_stats)
-        else:
-            patience_counter += 1
+        for epoch in range(ESTIMATOR_EPOCHS):
+            epoch_perm = np.random.RandomState(epoch).permutation(len(train_idx))
+            shuffled = train_idx[epoch_perm]
 
-        if (epoch + 1) % 10 == 0 or epoch == 0 or patience_counter == 0:
-            print(f"  Epoch {epoch+1:3d}: train_bce={train_loss:.6f}, val_bce={val_bce:.6f}, "
-                  f"val_acc={val_acc:.3f}{' *best*' if patience_counter == 0 else ''}")
+            epoch_losses = []
+            for batch_start in range(0, len(shuffled), batch_size):
+                batch_end = min(batch_start + batch_size, len(shuffled))
+                idx = shuffled[batch_start:batch_end]
+                loss = train_step(
+                    model, optimizer,
+                    seq_features[idx], seq_targets[idx], prog_layer_weights,
+                )
+                epoch_losses.append(float(loss))
 
-        if patience_counter >= ESTIMATOR_PATIENCE:
-            print(f"  Early stopping at epoch {epoch+1} (no improvement for {ESTIMATOR_PATIENCE} epochs)")
-            break
+            train_loss = np.mean(epoch_losses)
 
-    print(f"\n  Training complete. Best val BCE: {best_val_loss:.6f}, Best val acc: {best_val_acc:.3f}")
-    print(f"  Model saved to {ESTIMATOR_PATH}.npz (with per-layer norm stats)")
+            # Validation
+            val_preds = model(seq_features[val_idx], deterministic=True).squeeze(-1)
+            val_mse = float(jnp.mean(
+                (val_preds - seq_targets[val_idx]) ** 2 * prog_layer_weights[None, :]
+            ))
+            val_acc = float(jnp.mean((val_preds > 0.5) == seq_binary[val_idx]))
+
+            if val_mse < best_val_loss:
+                best_val_loss = val_mse
+                best_val_acc = val_acc
+                patience_counter = 0
+                save_estimator(model, ESTIMATOR_PATH, norm_stats=norm_stats, meta=save_meta)
+            else:
+                patience_counter += 1
+
+            if (epoch + 1) % 10 == 0 or epoch == 0 or patience_counter == 0:
+                print(f"  Epoch {epoch+1:3d}: train_mse={train_loss:.6f}, val_mse={val_mse:.6f}, "
+                      f"val_acc={val_acc:.3f}{' *best*' if patience_counter == 0 else ''}")
+
+            if patience_counter >= ESTIMATOR_PATIENCE:
+                print(f"  Early stopping at epoch {epoch+1} (no improvement for {ESTIMATOR_PATIENCE} epochs)")
+                break
+
+        print(f"\n  Progressive training complete. Best val MSE: {best_val_loss:.6f}, "
+              f"Best val acc: {best_val_acc:.3f}")
+        print(f"  Model saved to {ESTIMATOR_PATH}.npz")
+
+    else:
+        # ── Flat MLP training (v5 fallback) ──
+        # Stratified train/val split: preserve fragile/safe ratio in both sets
+        perm = np.random.RandomState(42).permutation(N)
+        fragile_idx = perm[np.array(training_targets[perm]) > (0.5 if has_v2_features else 0)]
+        safe_idx = perm[np.array(training_targets[perm]) <= (0.5 if has_v2_features else 0)]
+        f_split = int(len(fragile_idx) * TRAIN_SPLIT)
+        s_split = int(len(safe_idx) * TRAIN_SPLIT)
+        train_idx = np.concatenate([fragile_idx[:f_split], safe_idx[:s_split]])
+        val_idx = np.concatenate([fragile_idx[f_split:], safe_idx[s_split:]])
+        np.random.RandomState(42).shuffle(train_idx)
+        np.random.RandomState(42).shuffle(val_idx)
+
+        print(f"  Train: {len(train_idx)} (fragile: {f_split}), Val: {len(val_idx)} (fragile: {len(fragile_idx)-f_split})")
+
+        # Create model and optimizer
+        model = create_estimator(hidden_dim, seed=42, dropout_rate=ESTIMATOR_DROPOUT,
+                                 num_meta_features=num_meta)
+
+        # Cosine LR schedule with warmup
+        warmup_steps = 50
+        total_steps = ESTIMATOR_EPOCHS * (len(train_idx) // ESTIMATOR_BATCH + 1)
+        schedule = optax.join_schedules(
+            schedules=[
+                optax.linear_schedule(0.0, ESTIMATOR_LR, warmup_steps),
+                optax.cosine_decay_schedule(ESTIMATOR_LR, total_steps - warmup_steps),
+            ],
+            boundaries=[warmup_steps],
+        )
+        optimizer = nnx.Optimizer(model, optax.adamw(schedule, weight_decay=ESTIMATOR_WEIGHT_DECAY), wrt=nnx.Param)
+
+        # Positive weight for BCE loss (balance classes)
+        pos_weight = (1.0 - nonzero_frac) / max(nonzero_frac, 1e-6)
+        print(f"  BCE pos_weight: {pos_weight:.3f} (balancing {nonzero_frac:.1%} positives)")
+
+        # Layer weights: earlier layers get higher weight to improve early-exit predictions
+        max_target_layer = max(TARGET_LAYERS)
+        min_target_layer = min(TARGET_LAYERS)
+        layer_weight_map = {}
+        for tl in TARGET_LAYERS:
+            frac = (tl - min_target_layer) / max(max_target_layer - min_target_layer, 1)
+            layer_weight_map[tl] = 2.0 - frac
+        print(f"  Layer weights: {min_target_layer}→{layer_weight_map[min_target_layer]:.1f}, "
+              f"{max_target_layer}→{layer_weight_map[max_target_layer]:.1f}")
+
+        # Pre-compute per-sample layer weights
+        sample_layer_weights = jnp.ones(N)
+        for tl, w in layer_weight_map.items():
+            mask = layer_indices == tl
+            sample_layer_weights = sample_layer_weights.at[mask].set(w)
+
+        def loss_fn(model, h, l, p, ent, mar, ef, targets, weights):
+            preds = model(h, l, p, ent, mar, extra_features=ef, deterministic=False).squeeze(-1)
+            eps = 1e-7
+            preds = jnp.clip(preds, eps, 1 - eps)
+            bce = -(pos_weight * targets * jnp.log(preds) + (1 - targets) * jnp.log(1 - preds))
+            return jnp.mean(bce * weights)
+
+        def train_step(model, optimizer, h, l, p, ent, mar, ef, targets, weights):
+            loss, grads = nnx.value_and_grad(loss_fn)(model, h, l, p, ent, mar, ef, targets, weights)
+            optimizer.update(model, grads)
+            return loss
+
+        print(f"  Training for up to {ESTIMATOR_EPOCHS} epochs (patience={ESTIMATOR_PATIENCE})")
+        print(f"  LR: cosine decay from {ESTIMATOR_LR} with {warmup_steps}-step warmup")
+        print(f"  Dropout: {ESTIMATOR_DROPOUT}, Weight decay: {ESTIMATOR_WEIGHT_DECAY}")
+        if has_v2_features:
+            print(f"  V2 MODE: training on soft KL targets with {num_meta} metadata features")
+
+        best_val_loss = float("inf")
+        best_val_acc = 0.0
+        patience_counter = 0
+
+        for epoch in range(ESTIMATOR_EPOCHS):
+            epoch_perm = np.random.RandomState(epoch).permutation(len(train_idx))
+            shuffled = train_idx[epoch_perm]
+
+            epoch_losses = []
+            for batch_start in range(0, len(shuffled), ESTIMATOR_BATCH):
+                batch_end = min(batch_start + ESTIMATOR_BATCH, len(shuffled))
+                idx = shuffled[batch_start:batch_end]
+
+                ef_batch = v2_extra_norm[idx] if v2_extra_norm is not None else None
+                loss = train_step(
+                    model, optimizer,
+                    hidden_states[idx], layer_norm_feat[idx], pos_norm[idx],
+                    entropies_norm[idx], margins_norm[idx],
+                    ef_batch,
+                    training_targets[idx], sample_layer_weights[idx],
+                )
+                epoch_losses.append(float(loss))
+
+            train_loss = np.mean(epoch_losses)
+
+            # Validation: BCE loss + accuracy (deterministic mode = no dropout)
+            ef_val = v2_extra_norm[val_idx] if v2_extra_norm is not None else None
+            val_preds = model(hidden_states[val_idx], layer_norm_feat[val_idx], pos_norm[val_idx],
+                              entropies_norm[val_idx], margins_norm[val_idx],
+                              extra_features=ef_val,
+                              deterministic=True).squeeze(-1)
+            val_bce = float(jnp.mean(
+                -(training_targets[val_idx] * jnp.log(jnp.clip(val_preds, 1e-7, 1-1e-7))
+                  + (1 - training_targets[val_idx]) * jnp.log(jnp.clip(1 - val_preds, 1e-7, 1-1e-7)))
+            ))
+            val_acc = float(jnp.mean((val_preds > 0.5) == binary_raw[val_idx]))
+
+            if val_bce < best_val_loss:
+                best_val_loss = val_bce
+                best_val_acc = val_acc
+                patience_counter = 0
+                save_estimator(model, ESTIMATOR_PATH, norm_stats=norm_stats)
+            else:
+                patience_counter += 1
+
+            if (epoch + 1) % 10 == 0 or epoch == 0 or patience_counter == 0:
+                print(f"  Epoch {epoch+1:3d}: train_bce={train_loss:.6f}, val_bce={val_bce:.6f}, "
+                      f"val_acc={val_acc:.3f}{' *best*' if patience_counter == 0 else ''}")
+
+            if patience_counter >= ESTIMATOR_PATIENCE:
+                print(f"  Early stopping at epoch {epoch+1} (no improvement for {ESTIMATOR_PATIENCE} epochs)")
+                break
+
+        print(f"\n  Training complete. Best val BCE: {best_val_loss:.6f}, Best val acc: {best_val_acc:.3f}")
+        print(f"  Model saved to {ESTIMATOR_PATH}.npz (with per-layer norm stats)")
 
 multihost_utils.sync_global_devices("training_complete")
 

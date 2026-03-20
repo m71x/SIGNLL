@@ -25,7 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (TARGET_LAYERS, TRAIN_SPLIT,
                     REGRET_DATA_PATH as _REGRET_DATA_PATH,
                     ESTIMATOR_PATH as _ESTIMATOR_PATH,
-                    V2_NUM_EXTRA_FEATURES)
+                    V2_NUM_EXTRA_FEATURES,
+                    V3_KEEP_FEATURES, V3_NUM_KEPT_FEATURES)
 
 # ── PATHS ────────────────────────────────────────────────────────────
 PROJECT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
@@ -170,6 +171,126 @@ class NumpyEstimator:
         return np.maximum(x, 0)  # v1: ReLU
 
 
+class NumpyProgressiveEstimator:
+    """Load progressive Conv1D weights and run inference in pure numpy."""
+
+    def __init__(self, path):
+        data = np.load(path)
+        keys = list(data.keys())
+        self.weights = {}
+        self.norm_stats = {}
+        self.meta = {}
+        for k in keys:
+            if k.startswith("_norm/"):
+                self.norm_stats[k[len("_norm/"):]] = data[k]
+            elif k.startswith("_meta/"):
+                val = data[k]
+                if val.dtype.kind == 'S':
+                    self.meta[k[len("_meta/"):]] = val.item().decode()
+                else:
+                    self.meta[k[len("_meta/"):]] = val.item() if val.ndim == 0 else val
+            else:
+                self.weights[k] = data[k]
+
+        self.num_layers = int(self.meta["num_layers"])
+        self.num_meta_per_layer = int(self.meta["num_meta_per_layer"])
+        self.kernel_size = int(self.meta.get("kernel_size", 3))
+        self.is_progressive = True
+        self.has_v2_features = True  # progressive always uses V2 features
+
+        n_norm_layers = sum(1 for k in self.norm_stats if k.startswith("layer_") and k.endswith("_mean"))
+        print(f"  Progressive model v6 detected (Conv1D, {self.num_layers} layers, kernel={self.kernel_size})")
+        print(f"  Per-layer normalization stats loaded ({n_norm_layers} layers)")
+        print(f"  Meta features per layer: {self.num_meta_per_layer}")
+
+    def _get(self, name):
+        if f"{name}/value" in self.weights:
+            return self.weights[f"{name}/value"]
+        return self.weights[name]
+
+    def normalize_hidden_states(self, hidden_states, layer_indices):
+        if not self.norm_stats:
+            return hidden_states
+        hs = hidden_states.copy()
+        for layer in np.unique(layer_indices):
+            layer = int(layer)
+            mean_key = f"layer_{layer}_mean"
+            std_key = f"layer_{layer}_std"
+            if mean_key in self.norm_stats:
+                mask = layer_indices == layer
+                hs[mask] = (hs[mask] - self.norm_stats[mean_key]) / (self.norm_stats[std_key] + 1e-8)
+        return hs
+
+    def normalize_logit_features(self, entropies, margins):
+        ent = entropies.copy()
+        mar = margins.copy()
+        if "entropy_mean" in self.norm_stats:
+            ent = (ent - float(self.norm_stats["entropy_mean"])) / (float(self.norm_stats["entropy_std"]) + 1e-8)
+        if "margin_mean" in self.norm_stats:
+            mar = (mar - float(self.norm_stats["margin_mean"])) / (float(self.norm_stats["margin_std"]) + 1e-8)
+        return ent, mar
+
+    def normalize_v2_features(self, v2_features):
+        v2f = v2_features.copy()
+        for i, fname in enumerate(V2_FEATURE_NAMES):
+            mean_key = f"v2_{fname}_mean"
+            std_key = f"v2_{fname}_std"
+            if mean_key in self.norm_stats:
+                m = float(self.norm_stats[mean_key])
+                s = float(self.norm_stats[std_key])
+                if s > 1e-6:
+                    v2f[:, i] = (v2f[:, i] - m) / (s + 1e-8)
+        return v2f
+
+    def _layer_norm(self, x, name):
+        scale_key = f"{name}/scale"
+        bias_key = f"{name}/bias"
+        try:
+            scale = self._get(scale_key)
+            bias = self._get(bias_key)
+        except KeyError:
+            return x
+        mean = np.mean(x, axis=-1, keepdims=True)
+        var = np.var(x, axis=-1, keepdims=True)
+        return scale * (x - mean) / np.sqrt(var + 1e-5) + bias
+
+    def _causal_conv1d(self, x, conv_name):
+        """Causal 1D convolution: left-pad then VALID conv."""
+        kernel = self._get(f"{conv_name}/kernel")  # (kernel_size, in_ch, out_ch)
+        bias = self._get(f"{conv_name}/bias")       # (out_ch,)
+        ks = kernel.shape[0]
+        # Left-pad
+        pad = np.zeros((*x.shape[:1], ks - 1, x.shape[2]))
+        x_padded = np.concatenate([pad, x], axis=1)
+        # Conv via sliding window
+        batch, padded_len, in_ch = x_padded.shape
+        out_ch = kernel.shape[2]
+        seq_len = padded_len - ks + 1
+        out = np.zeros((batch, seq_len, out_ch))
+        for t in range(seq_len):
+            window = x_padded[:, t:t+ks, :]  # (batch, ks, in_ch)
+            out[:, t, :] = np.einsum('bki,kio->bo', window, kernel) + bias
+        return out
+
+    def __call__(self, layer_sequence):
+        """Forward pass on pre-assembled (batch, num_layers, features) tensor."""
+        # Feature projection
+        x = gelu(layer_sequence @ self._get("feature_proj/kernel") + self._get("feature_proj/bias"))
+        x = self._layer_norm(x, "ln_proj")
+
+        # Causal conv block 1
+        x = gelu(self._causal_conv1d(x, "conv1"))
+        x = self._layer_norm(x, "ln_conv1")
+
+        # Causal conv block 2
+        x = gelu(self._causal_conv1d(x, "conv2"))
+        x = self._layer_norm(x, "ln_conv2")
+
+        # Exit head
+        x = x @ self._get("exit_head/kernel") + self._get("exit_head/bias")
+        return sigmoid(x)
+
+
 def load_data():
     data = np.load(REGRET_DATA_PATH, allow_pickle=False)
     hs = data["hidden_states"]
@@ -202,6 +323,7 @@ def predict_all(model, data):
     hs = data["hidden_states"].copy()
     layers = data["layer_indices"]
     positions = data["positions"]
+    N = len(layers)
 
     # Apply per-layer normalization
     hs = model.normalize_hidden_states(hs, layers)
@@ -222,6 +344,36 @@ def predict_all(model, data):
     if "v2_features" in data and model.has_v2_features:
         v2f = model.normalize_v2_features(data["v2_features"])
 
+    # Progressive model: assemble into (groups, num_layers, features) sequences
+    if isinstance(model, NumpyProgressiveEstimator):
+        num_target_layers = model.num_layers
+        assert N % num_target_layers == 0, \
+            f"Dataset size {N} not divisible by {num_target_layers}"
+        num_groups = N // num_target_layers
+
+        # Select kept V2 features
+        v2_kept = v2f[:, V3_KEEP_FEATURES] if v2f is not None else np.zeros((N, V3_NUM_KEPT_FEATURES))
+
+        all_feats = np.concatenate([
+            hs, layer_norm, pos_norm,
+            ent if ent is not None else np.zeros((N, 1)),
+            mar if mar is not None else np.zeros((N, 1)),
+            v2_kept,
+        ], axis=-1)
+
+        seq_features = all_feats.reshape(num_groups, num_target_layers, -1)
+
+        # Batch inference (process in chunks to limit memory)
+        batch_size = 256
+        all_preds = []
+        for i in range(0, num_groups, batch_size):
+            batch = seq_features[i:i+batch_size]
+            preds = model(batch).squeeze(-1)  # (batch, num_layers)
+            all_preds.append(preds)
+        preds = np.concatenate(all_preds, axis=0)  # (num_groups, num_layers)
+        return preds.reshape(-1)  # flatten back to (N,)
+
+    # Flat MLP model
     if ent is not None:
         preds = model(hs, layer_norm, pos_norm, ent, mar, v2_features=v2f)
     else:
@@ -560,54 +712,88 @@ def eval_train_val(model, data):
     is_v2 = "v2_features" in data
     binary = (targets > (0.5 if is_v2 else 0)).astype(float)
 
-    # Stratified split matching training code
-    perm = np.random.RandomState(42).permutation(N)
-    split_thresh = 0.5 if is_v2 else 0
-    fragile_idx = perm[targets[perm] > split_thresh]
-    safe_idx = perm[targets[perm] <= split_thresh]
-    f_split = int(len(fragile_idx) * TRAIN_SPLIT)
-    s_split = int(len(safe_idx) * TRAIN_SPLIT)
-    train_idx = np.concatenate([fragile_idx[:f_split], safe_idx[:s_split]])
-    val_idx = np.concatenate([fragile_idx[f_split:], safe_idx[s_split:]])
+    is_prog = isinstance(model, NumpyProgressiveEstimator)
 
-    hs = model.normalize_hidden_states(data["hidden_states"].copy(), data["layer_indices"])
-    layers = data["layer_indices"]
-    positions = data["positions"]
+    if is_prog:
+        # Progressive: stratified split on position groups
+        num_target_layers = model.num_layers
+        num_groups = N // num_target_layers
+        seq_targets = targets.reshape(num_groups, num_target_layers)
+        group_max = np.max(seq_targets, axis=1)
 
-    num_layers = max(int(np.max(layers)) + 1, 1)
-    max_pos = max(int(np.max(positions)) + 1, 1)
-    layer_norm = layers.astype(np.float32).reshape(-1, 1) / (num_layers - 1)
-    pos_norm = positions.astype(np.float32).reshape(-1, 1) / (max_pos - 1)
+        perm = np.random.RandomState(42).permutation(num_groups)
+        fragile_idx = perm[group_max[perm] > 0.5]
+        safe_idx = perm[group_max[perm] <= 0.5]
+        f_split = int(len(fragile_idx) * TRAIN_SPLIT)
+        s_split = int(len(safe_idx) * TRAIN_SPLIT)
+        train_grp = np.concatenate([fragile_idx[:f_split], safe_idx[:s_split]])
+        val_grp = np.concatenate([fragile_idx[f_split:], safe_idx[s_split:]])
 
-    print(f"\n  {'Split':>6} {'N':>6} {'MSE':>10} {'MAE':>10} {'Corr':>10} {'Acc':>8}")
-    print(f"  {'─'*52}")
+        # Get flat predictions for all data
+        all_preds = predict_all(model, data)
 
-    # Normalize logit features if available
-    has_logit = "entropies" in data
-    if has_logit:
-        ent = data["entropies"].reshape(-1, 1)
-        mar = data["margins"].reshape(-1, 1)
-        ent, mar = model.normalize_logit_features(ent, mar)
+        print(f"\n  {'Split':>6} {'N_grp':>7} {'MSE':>10} {'MAE':>10} {'Corr':>10} {'Acc':>8}")
+        print(f"  {'─'*52}")
 
-    # Normalize V2 features if available
-    v2f = None
-    if "v2_features" in data and model.has_v2_features:
-        v2f = model.normalize_v2_features(data["v2_features"])
+        for name, grp_idx in [("Train", train_grp), ("Val", val_grp)]:
+            # Expand group indices to flat indices
+            flat_idx = np.concatenate([np.arange(g * num_target_layers, (g+1) * num_target_layers)
+                                       for g in grp_idx])
+            p = all_preds[flat_idx]
+            t = targets[flat_idx]
+            b = binary[flat_idx]
+            mse = np.mean((p - t) ** 2)
+            mae = np.mean(np.abs(p - t))
+            corr = np.corrcoef(p, t)[0, 1] if np.std(p) > 0 and np.std(t) > 0 else 0.0
+            acc = np.mean((p > 0.5) == b)
+            print(f"  {name:>6} {len(grp_idx):>7} {mse:>10.6f} {mae:>10.6f} {corr:>10.4f} {acc:>7.3f}")
+    else:
+        # Flat MLP: stratified split on individual samples
+        perm = np.random.RandomState(42).permutation(N)
+        split_thresh = 0.5 if is_v2 else 0
+        fragile_idx = perm[targets[perm] > split_thresh]
+        safe_idx = perm[targets[perm] <= split_thresh]
+        f_split = int(len(fragile_idx) * TRAIN_SPLIT)
+        s_split = int(len(safe_idx) * TRAIN_SPLIT)
+        train_idx = np.concatenate([fragile_idx[:f_split], safe_idx[:s_split]])
+        val_idx = np.concatenate([fragile_idx[f_split:], safe_idx[s_split:]])
 
-    for name, idx in [("Train", train_idx), ("Val", val_idx)]:
-        v2f_batch = v2f[idx] if v2f is not None else None
+        hs = model.normalize_hidden_states(data["hidden_states"].copy(), data["layer_indices"])
+        layers = data["layer_indices"]
+        positions = data["positions"]
+
+        num_layers = max(int(np.max(layers)) + 1, 1)
+        max_pos = max(int(np.max(positions)) + 1, 1)
+        layer_norm = layers.astype(np.float32).reshape(-1, 1) / (num_layers - 1)
+        pos_norm = positions.astype(np.float32).reshape(-1, 1) / (max_pos - 1)
+
+        print(f"\n  {'Split':>6} {'N':>6} {'MSE':>10} {'MAE':>10} {'Corr':>10} {'Acc':>8}")
+        print(f"  {'─'*52}")
+
+        has_logit = "entropies" in data
         if has_logit:
-            p = model(hs[idx], layer_norm[idx], pos_norm[idx], ent[idx], mar[idx],
-                      v2_features=v2f_batch).squeeze(-1)
-        else:
-            p = model(hs[idx], layer_norm[idx], pos_norm[idx]).squeeze(-1)
-        t = targets[idx]
-        b = binary[idx]
-        mse = np.mean((p - t) ** 2)
-        mae = np.mean(np.abs(p - t))
-        corr = np.corrcoef(p, t)[0, 1] if np.std(p) > 0 and np.std(t) > 0 else 0.0
-        acc = np.mean((p > 0.5) == b)
-        print(f"  {name:>6} {len(idx):>6} {mse:>10.6f} {mae:>10.6f} {corr:>10.4f} {acc:>7.3f}")
+            ent = data["entropies"].reshape(-1, 1)
+            mar = data["margins"].reshape(-1, 1)
+            ent, mar = model.normalize_logit_features(ent, mar)
+
+        v2f = None
+        if "v2_features" in data and model.has_v2_features:
+            v2f = model.normalize_v2_features(data["v2_features"])
+
+        for name, idx in [("Train", train_idx), ("Val", val_idx)]:
+            v2f_batch = v2f[idx] if v2f is not None else None
+            if has_logit:
+                p = model(hs[idx], layer_norm[idx], pos_norm[idx], ent[idx], mar[idx],
+                          v2_features=v2f_batch).squeeze(-1)
+            else:
+                p = model(hs[idx], layer_norm[idx], pos_norm[idx]).squeeze(-1)
+            t = targets[idx]
+            b = binary[idx]
+            mse = np.mean((p - t) ** 2)
+            mae = np.mean(np.abs(p - t))
+            corr = np.corrcoef(p, t)[0, 1] if np.std(p) > 0 and np.std(t) > 0 else 0.0
+            acc = np.mean((p > 0.5) == b)
+            print(f"  {name:>6} {len(idx):>6} {mse:>10.6f} {mae:>10.6f} {corr:>10.4f} {acc:>7.3f}")
 
 
 def print_improvements(preds, targets):
@@ -673,7 +859,22 @@ def main():
               f"std={data['regret_values'].std():.4f}")
 
     print("Loading model...")
-    model = NumpyEstimator(ESTIMATOR_PATH)
+    # Auto-detect architecture from saved metadata
+    _tmp_data = np.load(ESTIMATOR_PATH)
+    _is_progressive = any(k.startswith("_meta/") for k in _tmp_data.files)
+    if _is_progressive:
+        _meta_arch = None
+        for k in _tmp_data.files:
+            if k == "_meta/arch":
+                val = _tmp_data[k]
+                _meta_arch = val.item().decode() if val.dtype.kind == 'S' else str(val.item())
+        if _meta_arch == "progressive":
+            model = NumpyProgressiveEstimator(ESTIMATOR_PATH)
+        else:
+            model = NumpyEstimator(ESTIMATOR_PATH)
+    else:
+        model = NumpyEstimator(ESTIMATOR_PATH)
+    del _tmp_data
     print(f"  Loaded from {ESTIMATOR_PATH}")
 
     print("Running inference...")

@@ -1,26 +1,24 @@
 """
-Regret Estimator — Flax MLP Model
-===================================
-Lightweight MLP that predicts whether a token position is "fragile"
-(perturbation causes regret) from hidden states, layer index, position,
-and logit features (entropy, margin).
+Regret Estimator — Flax Models
+================================
+Two architectures for predicting exit safety from hidden states:
 
-Architecture (v5 — V2 logit probing + convergence features):
-    Input: normalized hidden_state (hidden_dim) + metadata features (num_meta)
-           v4 num_meta=4:  [layer_idx, position, entropy, margin]
-           v5 num_meta=13: [layer_idx, position, entropy, margin,
-                            agreement, confidence, kl_div, int_entropy,
-                            cos_sim, rel_change, proj_final,
-                            is_syntax, is_whitespace]
-    → Linear(hidden_dim+num_meta, 512) → LayerNorm → GELU → Dropout(0.2)
-    → Linear(512, 128) → LayerNorm → GELU → Dropout(0.2)
-    → Linear(128, 1) → Sigmoid
-    Output: P(fragile / not converged) ∈ [0, 1]
+1. RegretEstimator (v5, flat MLP):
+    Processes each (position, layer) independently.
+    Input: hidden_state + [layer_idx, pos, entropy, margin, v2_features]
+    → Linear → LN → GELU → Linear → LN → GELU → Linear → Sigmoid
 
-Key changes from v4:
-    - Flexible num_meta_features for V2 extra features
-    - __call__ accepts optional extra_features tensor
-    - Backward compatible with v4 callers (extra_features=None)
+2. LayerProgressiveEstimator (v6, Conv1D over layers):
+    Processes all layers for a position as a sequence via causal Conv1D.
+    Input: (batch, num_layers, hidden_dim + meta_per_layer)
+    → feature_proj → causal Conv1D × 2 → exit_head → Sigmoid
+    Output: (batch, num_layers, 1) per-layer exit scores
+
+v6 key design:
+    - Causal conv: layer L's prediction only sees layers ≤ L
+    - Drops useless V2 features (cos_sim, rel_change, is_syntax, is_whitespace)
+    - MSE loss on continuous KL targets (better calibration than BCE)
+    - Groups data by position so the model sees the full layer trajectory
 """
 
 import jax
@@ -72,12 +70,96 @@ class RegretEstimator(nnx.Module):
         return jax.nn.sigmoid(x)
 
 
+class LayerProgressiveEstimator(nnx.Module):
+    """Conv1D over layer dimension — sees trajectory of hidden states across layers.
+
+    Instead of treating each (position, layer) independently, this model processes
+    all layers for a position as a causal sequence. Layer L's exit decision is
+    informed by the hidden state trajectory at layers ≤ L.
+
+    Input: (batch, num_layers, hidden_dim + num_meta_per_layer)
+    Output: (batch, num_layers, 1) exit safety scores ∈ [0, 1]
+    """
+
+    def __init__(self, hidden_dim: int, num_layers: int, rngs: nnx.Rngs,
+                 num_meta_per_layer: int = 9, proj_dim: int = 128,
+                 conv_dim: int = 128, kernel_size: int = 3,
+                 dropout_rate: float = 0.2):
+        self.num_layers = num_layers
+        self.num_meta_per_layer = num_meta_per_layer
+        self.proj_dim = proj_dim
+        self.kernel_size = kernel_size
+
+        # Project high-dim hidden states to manageable size
+        in_features = hidden_dim + num_meta_per_layer
+        self.feature_proj = nnx.Linear(in_features, proj_dim, rngs=rngs)
+        self.ln_proj = nnx.LayerNorm(proj_dim, rngs=rngs)
+
+        # Causal Conv1D layers over the layer dimension
+        # Manual left-padding for causal: pad (kernel_size-1) on left, 0 on right
+        self.conv1 = nnx.Conv(proj_dim, conv_dim, kernel_size=(kernel_size,),
+                              padding='VALID', rngs=rngs)
+        self.ln_conv1 = nnx.LayerNorm(conv_dim, rngs=rngs)
+
+        self.conv2 = nnx.Conv(conv_dim, conv_dim, kernel_size=(kernel_size,),
+                              padding='VALID', rngs=rngs)
+        self.ln_conv2 = nnx.LayerNorm(conv_dim, rngs=rngs)
+
+        self.exit_head = nnx.Linear(conv_dim, 1, rngs=rngs)
+        self.dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
+
+    def _causal_pad(self, x):
+        """Left-pad the layer dimension by (kernel_size - 1) for causal convolution."""
+        pad_width = self.kernel_size - 1
+        return jnp.pad(x, ((0, 0), (pad_width, 0), (0, 0)))
+
+    def __call__(self, layer_sequence, *, deterministic: bool = True):
+        """Forward pass.
+
+        Args:
+            layer_sequence: (batch, num_layers, hidden_dim + num_meta_per_layer)
+            deterministic: If True, disable dropout.
+
+        Returns:
+            (batch, num_layers, 1) per-layer exit safety scores ∈ [0, 1].
+        """
+        # Project features: (batch, num_layers, proj_dim)
+        x = self.ln_proj(nnx.gelu(self.feature_proj(layer_sequence)))
+        x = self.dropout(x, deterministic=deterministic)
+
+        # Causal conv block 1
+        x = self._causal_pad(x)
+        x = self.ln_conv1(nnx.gelu(self.conv1(x)))
+        x = self.dropout(x, deterministic=deterministic)
+
+        # Causal conv block 2
+        x = self._causal_pad(x)
+        x = self.ln_conv2(nnx.gelu(self.conv2(x)))
+        x = self.dropout(x, deterministic=deterministic)
+
+        # Exit head: (batch, num_layers, 1)
+        return jax.nn.sigmoid(self.exit_head(x))
+
+
 def create_estimator(hidden_dim: int, seed: int = 0, dropout_rate: float = 0.1,
                      num_meta_features: int = 4):
     """Create a fresh RegretEstimator with random weights."""
     rngs = nnx.Rngs(seed)
     return RegretEstimator(hidden_dim=hidden_dim, rngs=rngs, dropout_rate=dropout_rate,
                            num_meta_features=num_meta_features)
+
+
+def create_progressive_estimator(hidden_dim: int, num_layers: int, seed: int = 0,
+                                 num_meta_per_layer: int = 9, proj_dim: int = 128,
+                                 conv_dim: int = 128, kernel_size: int = 3,
+                                 dropout_rate: float = 0.2):
+    """Create a fresh LayerProgressiveEstimator."""
+    rngs = nnx.Rngs(seed)
+    return LayerProgressiveEstimator(
+        hidden_dim=hidden_dim, num_layers=num_layers, rngs=rngs,
+        num_meta_per_layer=num_meta_per_layer, proj_dim=proj_dim,
+        conv_dim=conv_dim, kernel_size=kernel_size, dropout_rate=dropout_rate,
+    )
 
 
 def predict_regret(model: RegretEstimator, hidden_states, layer_indices,
@@ -160,8 +242,17 @@ def predict_regret(model: RegretEstimator, hidden_states, layer_indices,
     return predictions.squeeze(-1)
 
 
-def save_estimator(model: RegretEstimator, path: str, norm_stats: dict = None):
-    """Save estimator weights and optional normalization stats to disk."""
+def save_estimator(model, path: str, norm_stats: dict = None, meta: dict = None):
+    """Save estimator weights and optional normalization stats to disk.
+
+    Works for both RegretEstimator and LayerProgressiveEstimator.
+
+    Args:
+        model: Any nnx.Module (RegretEstimator or LayerProgressiveEstimator).
+        path: Output path (without .npz extension).
+        norm_stats: Optional normalization statistics dict.
+        meta: Optional metadata dict (e.g., {"arch": "progressive", "num_layers": 11}).
+    """
     state = nnx.state(model)
     flat_state = state.flat_state()
     np_dict = {}
@@ -178,29 +269,16 @@ def save_estimator(model: RegretEstimator, path: str, norm_stats: dict = None):
         for k, v in norm_stats.items():
             np_dict[f"_norm/{k}"] = np.array(v)
 
+    # Save architecture metadata
+    if meta is not None:
+        for k, v in meta.items():
+            np_dict[f"_meta/{k}"] = np.array(v) if not isinstance(v, str) else np.array(v.encode())
+
     np.savez(file=path, **np_dict)
 
 
-def load_estimator(path: str, hidden_dim: int, num_meta_features: int = None):
-    """Load estimator weights and normalization stats from disk.
-
-    Args:
-        path: Path to .npz weights file.
-        hidden_dim: Hidden state dimension.
-        num_meta_features: Number of metadata features. If None, auto-detected from weights.
-
-    Returns:
-        (model, norm_stats) tuple. norm_stats is None if not saved.
-    """
-    data = np.load(path)
-
-    # Auto-detect num_meta_features from linear1 input dim
-    if num_meta_features is None:
-        key = "linear1/kernel" if "linear1/kernel" in data else "linear1/kernel/value"
-        input_dim = data[key].shape[0]
-        num_meta_features = input_dim - hidden_dim
-
-    model = create_estimator(hidden_dim, num_meta_features=num_meta_features)
+def _load_weights_into_model(model, data):
+    """Load .npz weights into an nnx model (works for any architecture)."""
     state = nnx.state(model)
     flat_state = state.flat_state()
     new_entries = []
@@ -215,10 +293,68 @@ def load_estimator(path: str, hidden_dim: int, num_meta_features: int = None):
     new_state = new_flat.to_nested_state()
     nnx.update(model, new_state)
 
-    # Load normalization stats
+
+def _load_norm_stats(data):
+    """Extract normalization stats from .npz data."""
     norm_stats = {}
     for key in data.files:
         if key.startswith("_norm/"):
             norm_stats[key[len("_norm/"):]] = data[key]
+    return norm_stats if norm_stats else None
 
-    return model, norm_stats if norm_stats else None
+
+def _load_meta(data):
+    """Extract architecture metadata from .npz data."""
+    meta = {}
+    for key in data.files:
+        if key.startswith("_meta/"):
+            val = data[key]
+            # Decode string values
+            if val.dtype.kind == 'S':
+                meta[key[len("_meta/"):]] = val.item().decode()
+            else:
+                meta[key[len("_meta/"):]] = val.item() if val.ndim == 0 else val
+    return meta if meta else None
+
+
+def load_estimator(path: str, hidden_dim: int, num_meta_features: int = None):
+    """Load estimator weights and normalization stats from disk.
+
+    Auto-detects architecture (flat MLP vs progressive Conv1D) from saved metadata.
+
+    Args:
+        path: Path to .npz weights file.
+        hidden_dim: Hidden state dimension.
+        num_meta_features: Number of metadata features. If None, auto-detected from weights.
+
+    Returns:
+        (model, norm_stats) tuple. norm_stats is None if not saved.
+    """
+    data = np.load(path)
+    meta = _load_meta(data)
+
+    # Check if this is a progressive model
+    if meta and meta.get("arch") == "progressive":
+        num_layers = int(meta["num_layers"])
+        num_meta_per_layer = int(meta["num_meta_per_layer"])
+        proj_dim = int(meta.get("proj_dim", 128))
+        conv_dim = int(meta.get("conv_dim", 128))
+        kernel_size = int(meta.get("kernel_size", 3))
+        model = create_progressive_estimator(
+            hidden_dim, num_layers, num_meta_per_layer=num_meta_per_layer,
+            proj_dim=proj_dim, conv_dim=conv_dim, kernel_size=kernel_size,
+        )
+        _load_weights_into_model(model, data)
+        norm_stats = _load_norm_stats(data)
+        return model, norm_stats
+
+    # Flat MLP: auto-detect num_meta_features from linear1 input dim
+    if num_meta_features is None:
+        key = "linear1/kernel" if "linear1/kernel" in data else "linear1/kernel/value"
+        input_dim = data[key].shape[0]
+        num_meta_features = input_dim - hidden_dim
+
+    model = create_estimator(hidden_dim, num_meta_features=num_meta_features)
+    _load_weights_into_model(model, data)
+    norm_stats = _load_norm_stats(data)
+    return model, norm_stats

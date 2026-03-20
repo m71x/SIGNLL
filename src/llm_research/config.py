@@ -63,6 +63,16 @@ V2_SKIP_PHASE2B = True  # Skip Phase 2b rollouts (train on logit targets only)
 #   8: is_whitespace   — 1.0 if token is whitespace/indentation
 V2_NUM_EXTRA_FEATURES = 9
 
+# V3: Progressive layer estimator — Conv1D over layer sequence
+# Drops useless V2 features (cos_sim, rel_change, is_syntax, is_whitespace)
+# and uses a layer-progressive architecture instead of independent MLP
+V3_PROGRESSIVE = True  # Use LayerProgressiveEstimator instead of flat MLP
+V3_KEEP_FEATURES = [0, 1, 2, 3, 6]  # agreement, confidence, kl_div, int_entropy, proj_final
+V3_NUM_KEPT_FEATURES = 5  # len(V3_KEEP_FEATURES)
+V3_PROJ_DIM = 128  # Project hidden_dim down to this before conv
+V3_CONV_DIM = 128  # Conv1D output channels
+V3_CONV_KERNEL = 3  # Causal conv kernel size over layer dimension
+
 # Syntax/boilerplate tokens (safe to exit early)
 SYNTAX_TOKENS = frozenset({
     'def', 'return', 'if', 'else', 'elif', 'for', 'while', 'in', 'not',
