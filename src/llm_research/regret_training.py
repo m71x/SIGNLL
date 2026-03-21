@@ -1348,6 +1348,7 @@ if is_master:
             weighted = mse * layer_weights[None, :]  # broadcast layer weights
             return jnp.mean(weighted)
 
+        @nnx.jit
         def train_step(model, optimizer, features, targets, layer_weights):
             loss, grads = nnx.value_and_grad(loss_fn)(model, features, targets, layer_weights)
             optimizer.update(model, grads)
@@ -1462,6 +1463,7 @@ if is_master:
             bce = -(pos_weight * targets * jnp.log(preds) + (1 - targets) * jnp.log(1 - preds))
             return jnp.mean(bce * weights)
 
+        @nnx.jit
         def train_step(model, optimizer, h, l, p, ent, mar, ef, targets, weights):
             loss, grads = nnx.value_and_grad(loss_fn)(model, h, l, p, ent, mar, ef, targets, weights)
             optimizer.update(model, grads)
