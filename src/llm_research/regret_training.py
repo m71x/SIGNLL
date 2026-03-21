@@ -1308,14 +1308,6 @@ if is_master:
         print(f"  Train: {len(train_idx)} groups (fragile: {f_split}), "
               f"Val: {len(val_idx)} groups (fragile: {len(fragile_idx)-f_split})")
 
-        # Create progressive model
-        model = create_progressive_estimator(
-            hidden_dim, num_target_layers, seed=42,
-            num_meta_per_layer=meta_per_layer,
-            proj_dim=V3_PROJ_DIM, conv_dim=V3_CONV_DIM,
-            kernel_size=V3_CONV_KERNEL, dropout_rate=ESTIMATOR_DROPOUT,
-        )
-
         # Save metadata for loading
         save_meta = {
             "arch": "progressive",
@@ -1326,7 +1318,23 @@ if is_master:
             "kernel_size": V3_CONV_KERNEL,
         }
 
-        # Optimizer
+        # Move training data to CPU — estimator is tiny (~700K params), CPU eager mode
+        # is much faster than TPU eager mode (no TPU dispatch overhead per op)
+        cpu = jax.devices('cpu')[0]
+        seq_features = jax.device_put(seq_features, cpu)
+        seq_targets = jax.device_put(seq_targets, cpu)
+        seq_binary = jax.device_put(seq_binary, cpu)
+        prog_layer_weights = jax.device_put(prog_layer_weights, cpu)
+
+        # Re-create model on CPU
+        model = create_progressive_estimator(
+            hidden_dim, num_target_layers, seed=42,
+            num_meta_per_layer=meta_per_layer,
+            proj_dim=V3_PROJ_DIM, conv_dim=V3_CONV_DIM,
+            kernel_size=V3_CONV_KERNEL, dropout_rate=ESTIMATOR_DROPOUT,
+        )
+
+        # Optimizer (re-create on CPU)
         warmup_steps = 50
         batch_size = max(ESTIMATOR_BATCH // num_target_layers, 16)  # groups per batch
         total_steps = ESTIMATOR_EPOCHS * (len(train_idx) // batch_size + 1)
@@ -1348,7 +1356,6 @@ if is_master:
             weighted = mse * layer_weights[None, :]  # broadcast layer weights
             return jnp.mean(weighted)
 
-        @nnx.jit
         def train_step(model, optimizer, features, targets, layer_weights):
             loss, grads = nnx.value_and_grad(loss_fn)(model, features, targets, layer_weights)
             optimizer.update(model, grads)
@@ -1357,6 +1364,7 @@ if is_master:
         print(f"\n  Training PROGRESSIVE for up to {ESTIMATOR_EPOCHS} epochs (patience={ESTIMATOR_PATIENCE})")
         print(f"  Batch size: {batch_size} groups, LR: cosine from {ESTIMATOR_LR}")
         print(f"  Loss: MSE with layer weights, Dropout: {ESTIMATOR_DROPOUT}")
+        print(f"  Device: CPU (eager mode, no JIT needed for small model)")
 
         best_val_loss = float("inf")
         best_val_acc = 0.0
@@ -1463,7 +1471,6 @@ if is_master:
             bce = -(pos_weight * targets * jnp.log(preds) + (1 - targets) * jnp.log(1 - preds))
             return jnp.mean(bce * weights)
 
-        @nnx.jit
         def train_step(model, optimizer, h, l, p, ent, mar, ef, targets, weights):
             loss, grads = nnx.value_and_grad(loss_fn)(model, h, l, p, ent, mar, ef, targets, weights)
             optimizer.update(model, grads)
