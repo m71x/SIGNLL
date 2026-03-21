@@ -1318,15 +1318,14 @@ if is_master:
             "kernel_size": V3_CONV_KERNEL,
         }
 
-        # Move training data to CPU — estimator is tiny (~700K params), CPU eager mode
-        # is much faster than TPU eager mode (no TPU dispatch overhead per op)
-        cpu = jax.devices('cpu')[0]
-        seq_features = jax.device_put(seq_features, cpu)
-        seq_targets = jax.device_put(seq_targets, cpu)
-        seq_binary = jax.device_put(seq_binary, cpu)
-        prog_layer_weights = jax.device_put(prog_layer_weights, cpu)
+        # Convert training data to numpy to avoid TPU dispatch overhead per batch.
+        # Data will be auto-placed on default device when passed to model.
+        seq_features = np.array(seq_features)
+        seq_targets = np.array(seq_targets)
+        seq_binary = np.array(seq_binary)
+        prog_layer_weights_np = np.array(prog_layer_weights)
 
-        # Re-create model on CPU
+        # Create progressive model
         model = create_progressive_estimator(
             hidden_dim, num_target_layers, seed=42,
             num_meta_per_layer=meta_per_layer,
@@ -1334,7 +1333,7 @@ if is_master:
             kernel_size=V3_CONV_KERNEL, dropout_rate=ESTIMATOR_DROPOUT,
         )
 
-        # Optimizer (re-create on CPU)
+        # Optimizer
         warmup_steps = 50
         batch_size = max(ESTIMATOR_BATCH // num_target_layers, 16)  # groups per batch
         total_steps = ESTIMATOR_EPOCHS * (len(train_idx) // batch_size + 1)
@@ -1364,7 +1363,7 @@ if is_master:
         print(f"\n  Training PROGRESSIVE for up to {ESTIMATOR_EPOCHS} epochs (patience={ESTIMATOR_PATIENCE})")
         print(f"  Batch size: {batch_size} groups, LR: cosine from {ESTIMATOR_LR}")
         print(f"  Loss: MSE with layer weights, Dropout: {ESTIMATOR_DROPOUT}")
-        print(f"  Device: CPU (eager mode, no JIT needed for small model)")
+        print(f"  Training in eager mode (numpy data, auto-placed on device)")
 
         best_val_loss = float("inf")
         best_val_acc = 0.0
@@ -1380,7 +1379,7 @@ if is_master:
                 idx = shuffled[batch_start:batch_end]
                 loss = train_step(
                     model, optimizer,
-                    seq_features[idx], seq_targets[idx], prog_layer_weights,
+                    seq_features[idx], seq_targets[idx], prog_layer_weights_np,
                 )
                 epoch_losses.append(float(loss))
 
@@ -1389,7 +1388,7 @@ if is_master:
             # Validation
             val_preds = model(seq_features[val_idx], deterministic=True).squeeze(-1)
             val_mse = float(jnp.mean(
-                (val_preds - seq_targets[val_idx]) ** 2 * prog_layer_weights[None, :]
+                (val_preds - seq_targets[val_idx]) ** 2 * prog_layer_weights_np[None, :]
             ))
             val_acc = float(jnp.mean((val_preds > 0.5) == seq_binary[val_idx]))
 
