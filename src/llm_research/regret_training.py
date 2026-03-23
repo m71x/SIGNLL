@@ -39,6 +39,7 @@ from config import (  # noqa: E402
     V2_MODE, V2_SKIP_PHASE2B, V2_NUM_EXTRA_FEATURES, SYNTAX_TOKENS,
     V3_PROGRESSIVE, V3_KEEP_FEATURES, V3_NUM_KEPT_FEATURES,
     V3_PROJ_DIM, V3_CONV_DIM, V3_CONV_KERNEL,
+    ASYM_OVER_PENALTY, ASYM_UNDER_PENALTY,
 )
 
 # Training-specific (not shared)
@@ -1347,11 +1348,14 @@ if is_master:
         optimizer = nnx.Optimizer(model, optax.adamw(schedule, weight_decay=ESTIMATOR_WEIGHT_DECAY),
                                   wrt=nnx.Param)
 
-        # MSE loss with layer weights (continuous targets → MSE for calibration)
+        # Asymmetric MSE loss: penalize under-estimating regret (pred < target) more heavily
+        # This makes the estimator conservative — preferring to flag tokens as risky
         def loss_fn(model, features, targets, layer_weights):
             # features: (batch, num_layers, feat_dim), targets: (batch, num_layers)
             preds = model(features, deterministic=False).squeeze(-1)  # (batch, num_layers)
-            mse = (preds - targets) ** 2  # (batch, num_layers)
+            residuals = targets - preds  # positive = under-estimated regret (dangerous)
+            asym_weights = jnp.where(residuals > 0, ASYM_OVER_PENALTY, ASYM_UNDER_PENALTY)
+            mse = residuals ** 2 * asym_weights  # (batch, num_layers)
             weighted = mse * layer_weights[None, :]  # broadcast layer weights
             return jnp.mean(weighted)
 
@@ -1362,7 +1366,7 @@ if is_master:
 
         print(f"\n  Training PROGRESSIVE for up to {ESTIMATOR_EPOCHS} epochs (patience={ESTIMATOR_PATIENCE})")
         print(f"  Batch size: {batch_size} groups, LR: cosine from {ESTIMATOR_LR}")
-        print(f"  Loss: MSE with layer weights, Dropout: {ESTIMATOR_DROPOUT}")
+        print(f"  Loss: Asymmetric MSE (over={ASYM_OVER_PENALTY}x, under={ASYM_UNDER_PENALTY}x), Dropout: {ESTIMATOR_DROPOUT}")
         print(f"  Training in eager mode (numpy data, auto-placed on device)")
 
         best_val_loss = float("inf")
@@ -1387,8 +1391,10 @@ if is_master:
 
             # Validation
             val_preds = model(seq_features[val_idx], deterministic=True).squeeze(-1)
+            val_residuals = seq_targets[val_idx] - val_preds
+            val_asym_w = jnp.where(val_residuals > 0, ASYM_OVER_PENALTY, ASYM_UNDER_PENALTY)
             val_mse = float(jnp.mean(
-                (val_preds - seq_targets[val_idx]) ** 2 * prog_layer_weights_np[None, :]
+                val_residuals ** 2 * val_asym_w * prog_layer_weights_np[None, :]
             ))
             val_acc = float(jnp.mean((val_preds > 0.5) == seq_binary[val_idx]))
 

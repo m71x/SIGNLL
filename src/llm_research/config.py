@@ -73,6 +73,10 @@ V3_PROJ_DIM = 128  # Project hidden_dim down to this before conv
 V3_CONV_DIM = 128  # Conv1D output channels
 V3_CONV_KERNEL = 3  # Causal conv kernel size over layer dimension
 
+# V4: Asymmetric loss — penalize over-prediction (predicting safe when not) more
+ASYM_OVER_PENALTY = 3.0   # Weight for residual > 0 (pred < target, i.e. under-estimates regret)
+ASYM_UNDER_PENALTY = 1.0  # Weight for residual <= 0 (pred >= target, i.e. over-estimates regret)
+
 # Syntax/boilerplate tokens (safe to exit early)
 SYNTAX_TOKENS = frozenset({
     'def', 'return', 'if', 'else', 'elif', 'for', 'while', 'in', 'not',

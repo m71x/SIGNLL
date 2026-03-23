@@ -838,6 +838,166 @@ def print_improvements(preds, targets):
         print(f"\n  {i}. {s}")
 
 
+def eval_early_exit_with_momentum(preds, targets, layer_indices, is_v2=False):
+    """Strategy D: Exit Momentum — EMA-based threshold biasing."""
+    section("12. EARLY-EXIT WITH MOMENTUM")
+    print("  Track running average of exit layers. If recent exits were early,")
+    print("  boost threshold (be more conservative). If late, lower threshold.")
+
+    n_layers = len(TARGET_LAYERS)
+    safe_thresh = 0.1 if is_v2 else 0.0
+
+    # Determine perturbation count
+    perturb_path = os.path.join(PROJECT_ROOT, "phase2a_perturbations.json")
+    if os.path.exists(perturb_path):
+        import json
+        with open(perturb_path) as f:
+            n_perturbations = len(json.load(f))
+        n_pert_samples = n_perturbations * n_layers
+        preds = preds[:n_pert_samples]
+        targets = targets[:n_pert_samples]
+    else:
+        n_perturbations = len(targets) // n_layers
+
+    max_layer = TARGET_LAYERS[-1]
+
+    print(f"\n  Perturbations: {n_perturbations}, Layers: {TARGET_LAYERS}")
+    print(f"\n  Alpha=EMA decay, Boost=how much EMA shifts threshold")
+
+    for alpha in [0.1, 0.3, 0.5]:
+        for boost in [0.3, 0.5, 0.7]:
+            for base_thresh in [0.1, 0.2, 0.3]:
+                ema_exit_layer = float(max_layer // 2)  # start at midpoint
+                exits = 0
+                safe_exits = 0
+                unsafe_exits = 0
+                total_layers_used = 0
+
+                for p in range(n_perturbations):
+                    # Adaptive threshold: shift based on recent exit depth
+                    norm_ema = ema_exit_layer / max_layer  # 0=early, 1=late
+                    # If exiting early (low norm_ema), raise threshold to be more conservative
+                    # If exiting late (high norm_ema), lower threshold to be more aggressive
+                    thresh = base_thresh + boost * (0.5 - norm_ema)
+
+                    exited = False
+                    for l_offset in range(n_layers):
+                        idx = p * n_layers + l_offset
+                        if preds[idx] < thresh:
+                            exit_layer = TARGET_LAYERS[l_offset]
+                            ema_exit_layer = alpha * exit_layer + (1 - alpha) * ema_exit_layer
+                            exits += 1
+                            total_layers_used += exit_layer
+                            if targets[idx] <= safe_thresh:
+                                safe_exits += 1
+                            else:
+                                unsafe_exits += 1
+                            exited = True
+                            break
+                    if not exited:
+                        ema_exit_layer = alpha * max_layer + (1 - alpha) * ema_exit_layer
+                        total_layers_used += max_layer
+
+                exit_rate = exits / n_perturbations
+                safe_pct = 100 * safe_exits / max(exits, 1)
+                unsafe_pct = 100 * unsafe_exits / max(exits, 1)
+                avg_layers = total_layers_used / n_perturbations
+                compute_pct = 100 * avg_layers / max_layer
+
+                # Only print interesting configs (exit rate > 10% and unsafe < 5%)
+                if exit_rate > 0.1 and unsafe_pct < 5.0:
+                    print(f"  α={alpha:.1f} boost={boost:.1f} base={base_thresh:.1f}: "
+                          f"exit={exit_rate:.1%} safe={safe_pct:.1f}% unsafe={unsafe_pct:.1f}% "
+                          f"avg_layer={avg_layers:.1f} compute={compute_pct:.1f}%")
+
+    # Compare best momentum result against static threshold
+    print(f"\n  (Compare with Section 6 static thresholds above)")
+
+
+def eval_self_speculative_simulation(preds, targets, layer_indices, is_v2=False):
+    """Self-speculative simulation: draft K tokens with early exit, verify with full depth."""
+    section("13. SELF-SPECULATIVE SIMULATION")
+    print("  Draft K tokens using early exit, then verify all K at once with full model.")
+    print("  Zero quality loss if verification rejects bad drafts.")
+
+    n_layers = len(TARGET_LAYERS)
+    safe_thresh = 0.1 if is_v2 else 0.0
+
+    # Determine perturbation count
+    perturb_path = os.path.join(PROJECT_ROOT, "phase2a_perturbations.json")
+    if os.path.exists(perturb_path):
+        import json
+        with open(perturb_path) as f:
+            n_perturbations = len(json.load(f))
+        n_pert_samples = n_perturbations * n_layers
+        preds = preds[:n_pert_samples]
+        targets = targets[:n_pert_samples]
+    else:
+        n_perturbations = len(targets) // n_layers
+
+    max_layer = TARGET_LAYERS[-1]
+
+    print(f"\n  Perturbations: {n_perturbations}")
+    print(f"\n  K=draft length, thresh=exit threshold for drafting")
+    print(f"  Accept rate = fraction of draft tokens that would be accepted")
+    print(f"  Effective speedup = tokens_produced / full_model_equivalent_cost")
+
+    print(f"\n  {'K':>4} {'Thresh':>7} {'AcceptRate':>11} {'AvgDraftDepth':>14} "
+          f"{'Speedup':>8} {'QualityLoss':>12}")
+    print(f"  {'─'*60}")
+
+    for K in [4, 8, 16]:
+        for thresh in [0.05, 0.1, 0.2, 0.3, 0.5]:
+            # Simulate drafting: for each position, find the exit layer
+            draft_depths = []  # layer at which each token was drafted
+            accepted = []  # whether the draft would be accepted (target is safe)
+
+            for p in range(n_perturbations):
+                draft_layer = max_layer  # default: no early exit
+                for l_offset in range(n_layers):
+                    idx = p * n_layers + l_offset
+                    if preds[idx] < thresh:
+                        draft_layer = TARGET_LAYERS[l_offset]
+                        break
+                draft_depths.append(draft_layer)
+                # A draft is "accepted" if the earliest exit layer had safe target
+                # (simulates: full model would have produced the same token)
+                is_safe = all(
+                    targets[p * n_layers + l] <= safe_thresh
+                    for l in range(n_layers)
+                    if TARGET_LAYERS[l] >= draft_layer
+                )
+                accepted.append(is_safe)
+
+            draft_depths = np.array(draft_depths)
+            accepted = np.array(accepted)
+
+            accept_rate = np.mean(accepted)
+            avg_draft_depth = np.mean(draft_depths)
+
+            # Cost model for self-speculative decoding:
+            # Draft K tokens at avg_draft_depth cost each, then verify all K at full depth
+            # If accept_rate tokens are accepted, we get accept_rate*K tokens for:
+            #   K * (avg_draft_depth/max_layer) + 1 full-depth passes
+            # Compare to K * 1.0 full-depth passes for standard decoding
+            draft_cost_per_token = avg_draft_depth / max_layer
+            # One draft round: K drafts + 1 verification
+            total_cost = K * draft_cost_per_token + 1.0  # in units of full-depth passes
+            # Expected accepted tokens per round (at least 1 from verification)
+            expected_tokens = accept_rate * K + (1.0 - accept_rate)
+            # But minimum 1 token per round (verification always produces 1 correct token)
+            expected_tokens = max(expected_tokens, 1.0)
+            speedup = expected_tokens / total_cost
+
+            # Quality loss: in true self-speculative, there's zero quality loss
+            # because rejected drafts are replaced by full-model output.
+            # But we can measure how often we'd need to reject (overhead)
+            quality_loss = 0.0  # by construction
+
+            print(f"  {K:>4} {thresh:>7.2f} {accept_rate:>10.1%} {avg_draft_depth:>14.1f} "
+                  f"{speedup:>7.2f}x {quality_loss:>11.1%}")
+
+
 def main():
     print("=" * 70)
     print("  REGRET ESTIMATOR EVALUATION SUITE")
@@ -890,6 +1050,8 @@ def main():
     eval_per_position(preds, targets, positions)
     eval_regret_distribution(targets, is_v2=is_v2)
     eval_early_exit_simulation(preds, targets, layers, is_v2=is_v2)
+    eval_early_exit_with_momentum(preds, targets, layers, is_v2=is_v2)
+    eval_self_speculative_simulation(preds, targets, layers, is_v2=is_v2)
     eval_calibration(preds, targets)
     eval_error_analysis(preds, targets, layers, positions)
     eval_train_val(model, data)
