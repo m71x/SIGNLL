@@ -6,9 +6,9 @@ import sys
 import os
 sys.stdout.reconfigure(line_buffering=True)
 
-# Force CPU-only JAX — no TPU coordination needed for estimator training
-os.environ["JAX_PLATFORMS"] = "cpu"
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+# Force single-host TPU — use only local chips, no multi-host coordination
+os.environ["TPU_CHIPS_PER_HOST_BOUNDS"] = "2,2,1"
+os.environ["TPU_HOST_BOUNDS"] = "1,1,1"
 
 import jax
 import jax.numpy as jnp
