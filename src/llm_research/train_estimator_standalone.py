@@ -46,6 +46,30 @@ layer_indices = jnp.array(data["layer_indices"])
 positions = jnp.array(data["positions"])
 regret_targets = jnp.array(data["regret_values"])
 
+# ── Apply Wormhole Projections (Strategy II) ──────────────────────────
+# Transform each layer's hidden states via closed-form affine projection
+# so that h_L_projected ≈ h_44, dramatically improving early-layer agreement.
+WORMHOLE_PATH = "wormhole_projections.npz"
+if os.path.exists(WORMHOLE_PATH):
+    print(f"\n  Applying wormhole projections from {WORMHOLE_PATH}...")
+    wormhole = np.load(WORMHOLE_PATH)
+    layer_arr = np.array(layer_indices)
+    hs_np = np.array(hidden_states)
+    final_layer = max(TARGET_LAYERS)
+    for layer in TARGET_LAYERS[:-1]:  # skip final layer 44
+        W_key = f"W_{layer}"
+        b_key = f"b_{layer}"
+        if W_key in wormhole:
+            mask = layer_arr == layer
+            n_masked = int(np.sum(mask))
+            hs_np[mask] = hs_np[mask] @ wormhole[W_key] + wormhole[b_key]
+            print(f"    Layer {layer}: projected {n_masked} samples")
+    hidden_states = jnp.array(hs_np, dtype=jnp.float32)
+    print(f"  Wormhole projection applied to all non-final layers")
+    del wormhole, hs_np
+else:
+    print(f"\n  WARNING: {WORMHOLE_PATH} not found, training without wormhole projection")
+
 # Load logit features
 if "entropies" in data:
     entropies_raw = jnp.array(data["entropies"], dtype=jnp.float32)
