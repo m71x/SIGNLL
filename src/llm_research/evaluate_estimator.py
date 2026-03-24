@@ -1151,10 +1151,8 @@ def eval_semantic_acceptance(preds, targets, layer_indices, is_v2=False):
                 expected_tokens = max(expected_tokens, 1.0)
                 speedup = expected_tokens / total_cost
 
-                # Only print interesting configs
-                if speedup > 0.8 or (accept_rate > 0.5 and quality_risk < 0.05):
-                    print(f"  {K:>4} L{draft_layer:<5} {accept_thresh:>8.2f} "
-                          f"{accept_rate:>10.1%} {speedup:>7.2f}x {quality_risk:>8.1%}")
+                print(f"  {K:>4} L{draft_layer:<5} {accept_thresh:>8.2f} "
+                      f"{accept_rate:>10.1%} {speedup:>7.2f}x {quality_risk:>8.1%}")
 
     print(f"\n  Note: speedup > 1.0x means faster than standard decoding.")
     print(f"  Quality risk shows fraction of semantically-accepted tokens")
