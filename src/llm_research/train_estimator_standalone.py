@@ -3,7 +3,12 @@ Standalone Phase 3: Train regret estimator WITHOUT distributed JAX.
 Runs on a single worker — no TPU coordination needed.
 """
 import sys
+import os
 sys.stdout.reconfigure(line_buffering=True)
+
+# Force CPU-only JAX — no TPU coordination needed for estimator training
+os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import jax
 import jax.numpy as jnp
