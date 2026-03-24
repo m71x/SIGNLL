@@ -998,6 +998,169 @@ def eval_self_speculative_simulation(preds, targets, layer_indices, is_v2=False)
                   f"{speedup:>7.2f}x {quality_loss:>11.1%}")
 
 
+def eval_wormhole_agreement(data):
+    """Strategy II: Measure argmax agreement improvement with wormhole projections."""
+    section("14. WORMHOLE PROJECTION: AGREEMENT IMPROVEMENT")
+
+    wormhole_path = os.path.join(PROJECT_ROOT, "wormhole_projections.npz")
+    lm_head_path = os.path.join(PROJECT_ROOT, "lm_head_weights.npz")
+
+    if not os.path.exists(wormhole_path):
+        print(f"  Wormhole projections not found at {wormhole_path}")
+        print(f"  Run compute_wormhole.py first.")
+        return
+    if not os.path.exists(lm_head_path):
+        print(f"  lm_head weights not found at {lm_head_path}")
+        print(f"  Run extract_lm_head.py first.")
+        return
+
+    # Load phase2a hidden states (raw, un-normalized)
+    hidden_path = os.path.join(PROJECT_ROOT, "phase2a_hidden_states.npz")
+    if not os.path.exists(hidden_path):
+        print(f"  phase2a_hidden_states.npz not found")
+        return
+
+    h_data = np.load(hidden_path, allow_pickle=False)
+    hidden_states = h_data["hidden_states"]
+    layer_indices = h_data["layer_indices"]
+
+    n_layers = len(TARGET_LAYERS)
+    n_groups = len(layer_indices) // n_layers
+    hidden_dim = hidden_states.shape[1]
+
+    hs_grouped = hidden_states.reshape(n_groups, n_layers, hidden_dim)
+    h_final = hs_grouped[:, -1, :]  # layer 44
+
+    # Load wormhole projections
+    wormhole = np.load(wormhole_path)
+
+    # Load lm_head
+    lm_head_data = np.load(lm_head_path)
+    lm_head_w = lm_head_data["weight"]  # (vocab_size, hidden_dim)
+    has_norm = "norm_weight" in lm_head_data
+
+    if has_norm:
+        norm_weight = lm_head_data["norm_weight"]
+        norm_bias = lm_head_data.get("norm_bias", None)
+
+    def apply_rms_norm(x, weight, eps=1e-6):
+        """RMSNorm as used in Qwen2.5."""
+        rms = np.sqrt(np.mean(x ** 2, axis=-1, keepdims=True) + eps)
+        return (x / rms) * weight
+
+    def compute_logits(h):
+        """Apply optional LayerNorm then lm_head."""
+        if has_norm:
+            h = apply_rms_norm(h, norm_weight)
+        return h @ lm_head_w.T
+
+    print(f"  Groups: {n_groups}, Hidden dim: {hidden_dim}")
+    print(f"  lm_head: {lm_head_w.shape}, LayerNorm: {'yes' if has_norm else 'no'}")
+
+    # Final layer tokens (ground truth)
+    final_logits = compute_logits(h_final)
+    final_tokens = np.argmax(final_logits, axis=1)
+
+    print(f"\n  {'Layer':>6} {'Baseline':>10} {'Wormhole':>10} {'Improvement':>12}")
+    print(f"  {'─'*40}")
+
+    for l_idx, layer in enumerate(TARGET_LAYERS[:-1]):
+        X = hs_grouped[:, l_idx, :]
+
+        # Baseline: raw h_L → logits
+        baseline_logits = compute_logits(X)
+        baseline_tokens = np.argmax(baseline_logits, axis=1)
+        baseline_agree = np.mean(baseline_tokens == final_tokens) * 100
+
+        # Wormhole: h_L @ W_L + b_L → logits
+        W_key = f"W_{layer}"
+        b_key = f"b_{layer}"
+        if W_key in wormhole:
+            projected = X @ wormhole[W_key] + wormhole[b_key]
+            wormhole_logits = compute_logits(projected)
+            wormhole_tokens = np.argmax(wormhole_logits, axis=1)
+            wormhole_agree = np.mean(wormhole_tokens == final_tokens) * 100
+            improvement = wormhole_agree - baseline_agree
+            print(f"  {layer:>6} {baseline_agree:>9.1f}% {wormhole_agree:>9.1f}% {improvement:>+11.1f}%")
+        else:
+            print(f"  {layer:>6} {baseline_agree:>9.1f}%  (no projection)")
+
+
+def eval_semantic_acceptance(preds, targets, layer_indices, is_v2=False):
+    """Strategy I: Regret-Relaxed Speculative Decoding with semantic acceptance."""
+    section("15. REGRET-RELAXED SPECULATIVE DECODING")
+    print("  Standard speculation rejects any token mismatch.")
+    print("  Semantic acceptance: accept mismatched drafts if Regret Estimator")
+    print("  predicts regret < threshold (token difference is structurally harmless).")
+
+    n_layers = len(TARGET_LAYERS)
+    safe_thresh = 0.1 if is_v2 else 0.0
+
+    # Determine perturbation count
+    perturb_path = os.path.join(PROJECT_ROOT, "phase2a_perturbations.json")
+    if os.path.exists(perturb_path):
+        import json
+        with open(perturb_path) as f:
+            n_perturbations = len(json.load(f))
+        n_pert_samples = n_perturbations * n_layers
+        preds = preds[:n_pert_samples]
+        targets = targets[:n_pert_samples]
+    else:
+        n_perturbations = len(targets) // n_layers
+
+    max_layer = TARGET_LAYERS[-1]
+
+    print(f"\n  Perturbations: {n_perturbations}")
+    print(f"  For each draft token, if pred_regret < accept_thresh, accept even on mismatch.")
+    print(f"  Quality risk = fraction of accepted tokens that actually had high regret.")
+
+    print(f"\n  {'K':>4} {'Draft@':>7} {'AcceptTh':>9} {'AcceptRate':>11} "
+          f"{'Speedup':>8} {'QualRisk':>9}")
+    print(f"  {'─'*52}")
+
+    for K in [4, 8, 16]:
+        for draft_layer_idx in [4, 6, 8]:  # layers 20, 28, 36
+            if draft_layer_idx >= n_layers:
+                continue
+            draft_layer = TARGET_LAYERS[draft_layer_idx]
+            draft_cost = draft_layer / max_layer
+
+            for accept_thresh in [0.05, 0.1, 0.2, 0.3]:
+                # For each position, check if the regret at the draft layer is below threshold
+                accepted = 0
+                accepted_bad = 0  # accepted but actually had high regret
+                total = n_perturbations
+
+                for p in range(n_perturbations):
+                    idx = p * n_layers + draft_layer_idx
+                    pred_regret = preds[idx]
+                    true_regret = targets[idx]
+
+                    if pred_regret < accept_thresh:
+                        accepted += 1
+                        if true_regret > 0.3:  # actually risky
+                            accepted_bad += 1
+
+                accept_rate = accepted / total
+                quality_risk = accepted_bad / max(accepted, 1)
+
+                # Cost model: draft K tokens at draft_cost each, verify once at full cost
+                # With semantic acceptance, more drafts are accepted
+                total_cost = K * draft_cost + 1.0
+                expected_tokens = accept_rate * K + (1.0 - accept_rate)
+                expected_tokens = max(expected_tokens, 1.0)
+                speedup = expected_tokens / total_cost
+
+                # Only print interesting configs
+                if speedup > 0.8 or (accept_rate > 0.5 and quality_risk < 0.05):
+                    print(f"  {K:>4} L{draft_layer:<5} {accept_thresh:>8.2f} "
+                          f"{accept_rate:>10.1%} {speedup:>7.2f}x {quality_risk:>8.1%}")
+
+    print(f"\n  Note: speedup > 1.0x means faster than standard decoding.")
+    print(f"  Quality risk shows fraction of semantically-accepted tokens")
+    print(f"  that actually had regret > 0.3 (potential test failures).")
+
+
 def main():
     print("=" * 70)
     print("  REGRET ESTIMATOR EVALUATION SUITE")
@@ -1052,6 +1215,8 @@ def main():
     eval_early_exit_simulation(preds, targets, layers, is_v2=is_v2)
     eval_early_exit_with_momentum(preds, targets, layers, is_v2=is_v2)
     eval_self_speculative_simulation(preds, targets, layers, is_v2=is_v2)
+    eval_wormhole_agreement(data)
+    eval_semantic_acceptance(preds, targets, layers, is_v2=is_v2)
     eval_calibration(preds, targets)
     eval_error_analysis(preds, targets, layers, positions)
     eval_train_val(model, data)
