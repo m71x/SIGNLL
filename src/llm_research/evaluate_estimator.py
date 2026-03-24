@@ -325,6 +325,18 @@ def predict_all(model, data):
     positions = data["positions"]
     N = len(layers)
 
+    # Apply wormhole projections if available (must be before normalization)
+    wormhole_path = os.path.join(PROJECT_ROOT, "wormhole_projections.npz")
+    if os.path.exists(wormhole_path):
+        wormhole = np.load(wormhole_path)
+        for layer in TARGET_LAYERS[:-1]:
+            W_key = f"W_{layer}"
+            b_key = f"b_{layer}"
+            if W_key in wormhole:
+                mask = layers == layer
+                hs[mask] = hs[mask] @ wormhole[W_key] + wormhole[b_key]
+        del wormhole
+
     # Apply per-layer normalization
     hs = model.normalize_hidden_states(hs, layers)
 
